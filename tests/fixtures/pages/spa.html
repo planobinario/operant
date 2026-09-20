@@ -1,0 +1,26 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>spa</title></head><body>
+    <h1>SPA de prueba</h1>
+    <div id="feed"></div>
+    <button id="route">cambiar ruta</button>
+    <script>
+      const feed = document.getElementById("feed");
+      let n = 0;
+      function inject(k) {
+        for (let i = 0; i < 15; i++) {
+          const d = document.createElement("div");
+          d.innerHTML = '<img data-src="/img/200x120?g=spa' + k + '_' + (n++) + '" alt="s">';
+          feed.appendChild(d.firstChild);
+        }
+      }
+      for (let i = 0; i < 4; i++) inject("init");
+      window.addEventListener("scroll", () => {
+        if (innerHeight + scrollY >= document.body.scrollHeight - 300) inject("scroll");
+      });
+      document.getElementById("route").addEventListener("click", () => {
+        feed.replaceChildren();
+        inject("route");
+        const v = document.createElement("video");
+        v.src = "/media/sample.mp4";
+        document.body.appendChild(v);
+      });
+    </script></body></html>

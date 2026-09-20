@@ -1,0 +1,7 @@
+{
+  "name": "com.operant.native_host",
+  "description": "Host nativo de Operant para yt-dlp/ffmpeg",
+  "path": "C:\\RUTA\\ABSOLUTA\\A\\operant_host.bat",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://TU_ID_DE_EXTENSION/"]
+}

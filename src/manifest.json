@@ -1,0 +1,62 @@
+{
+  "manifest_version": 3,
+  "name": "Operant — Media Engine & Browser Agent",
+  "version": "0.4.0",
+  "description": "Panel lateral avanzado para inspección, extracción y procesado de medios con ffmpeg, yt-dlp y Native Messaging.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "sidePanel",
+    "downloads",
+    "webRequest",
+    "webNavigation",
+    "nativeMessaging",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "panel/panel.html"
+  },
+  "action": {
+    "default_title": "Operant — Abrir panel lateral",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "shared/dl-indicator.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "operant@operant.dev",
+      "strict_min_version": "121.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  }
+}

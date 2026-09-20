@@ -1,0 +1,1652 @@
+/* panel.css — Side panel de Operant.
+   Sistema de diseño neutro claro/oscuro, sincronizado con la web:
+   tokens monocromos, acento = color de texto, sin degradados ni neón.
+   El tema sigue prefers-color-scheme del sistema (no cabe un toggle).
+   Una sola barra inferior (estado + selección + descarga), controles
+   secundarios bajo demanda. Los scrims sobre imágenes/vídeos son
+   deliberadamente oscuros en ambos temas (legibilidad sobre media). */
+
+:root {
+  color-scheme: light dark;
+
+  /* Tema claro (por defecto). */
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --surface-2: #f4f4f5;
+  --border: #e4e4e7;
+  --border-strong: #d4d4d8;
+  --text: #18181b;
+  --muted: #55555e;
+  --muted-2: #8e8e98;
+  --accent: #18181b;        /* monocromo: mismo color que el texto */
+  --danger: #c6413a;
+  --ok: #3d8a5f;
+  --scrim: rgba(17, 17, 19, 0.78);        /* constante: sobre imágenes */
+  --scrim-strong: rgba(17, 17, 19, 0.92); /* constante: sobre imágenes */
+  --shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+  --radius: 6px;
+  --fs: 12px;
+  --fs-sm: 11px;
+  --fs-xs: 10px;
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111113;
+    --surface: #18181b;
+    --surface-2: #1d1d21;
+    --border: #2a2a30;
+    --border-strong: #3a3a42;
+    --text: #ececee;
+    --muted: #a2a2ab;
+    --muted-2: #6e6e78;
+    --accent: #ececee;
+    --danger: #e0685f;
+    --ok: #58b98a;
+    --shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Los atributos hidden NUNCA pueden ser machacados por reglas display del
+   autor (p.ej. .popover { display:flex } anula [hidden] del UA stylesheet).
+   Bug real v0.4: el popover y los overlays de error de preview quedaban
+   siempre visibles por esto. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-ui);
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  font-size: var(--fs);
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+}
+
+button {
+  font-family: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
+}
+
+/* --- Cabecera fina: marca + contador + buscador + acciones --- */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  color: var(--text);
+}
+
+.brand svg {
+  display: block;
+}
+
+.counter {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+  display: inline-block;
+  flex: 0 0 auto;
+}
+
+.dot.ok {
+  background: var(--ok);
+}
+
+.search {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  outline: none;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.search:focus {
+  border-color: var(--text);
+  background: var(--surface-2);
+}
+
+.search::placeholder {
+  color: var(--muted-2);
+}
+
+/* --- Fila de controles compactos (estilo ImageEye) --- */
+.controlbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.ctl {
+  height: 22px;
+  padding: 1px 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 10px;
+  outline: none;
+  flex: 1;
+  min-width: 0;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.ctl:hover {
+  color: var(--text);
+}
+
+.ctl:focus {
+  border-color: var(--text);
+  color: var(--text);
+}
+
+.ctl.domain {
+  flex: 1.2;
+}
+
+.ctl.sort {
+  flex: 0 0 auto;
+  max-width: 108px;
+}
+
+.ctl option {
+  background: var(--surface);
+  color: var(--text);
+}
+
+/* --- Iconos / botones --- */
+.icon-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.icon-btn:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.icon-btn.active {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+
+.chip-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.1s ease, color 0.15s ease;
+}
+
+.chip-btn:hover {
+  border-color: var(--border-strong);
+}
+
+.chip-btn:active {
+  transform: scale(0.97);
+}
+
+.chip-btn.on {
+  border-color: var(--text);
+  color: var(--text);
+}
+
+.chip-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+.chip-btn.primary:hover {
+  opacity: 0.85;
+}
+
+.chip-btn.accent {
+  background: transparent;
+  border-color: var(--border-strong);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.chip-btn.accent:hover {
+  background: var(--surface-2);
+}
+
+.chip-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.chip-btn.mini {
+  padding: 3px 8px;
+  font-size: var(--fs-xs);
+}
+
+.mini-btn {
+  width: 24px;
+  padding: 3px 0;
+  font-size: var(--fs-sm);
+}
+
+/* --- Popover de filtros y vista --- */
+.popover {
+  position: absolute;
+  top: 40px;
+  right: 8px;
+  z-index: 40;
+  width: 250px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.pop-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pop-section.row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.pop-label {
+  font-size: var(--fs-xs);
+  color: var(--muted-2);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  flex: 0 0 auto;
+}
+
+.pop-section.row .pop-label {
+  width: 66px;
+}
+
+.pop-section.row select,
+.pop-section.row input[type="text"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.pop-hint {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  min-width: 28px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.pop-section input[type="range"] {
+  flex: 1;
+  accent-color: var(--text);
+}
+
+.pop-section.checks {
+  gap: 3px;
+  padding: 6px 2px 2px;
+  border-top: 1px solid var(--border);
+}
+
+.pop-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+.pop-actions .chip-btn {
+  padding: 5px 6px;
+  font-size: var(--fs-xs);
+}
+
+/* --- Controles compartidos --- */
+select,
+input[type="text"] {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+select:focus,
+input[type="text"]:focus {
+  border-color: var(--text);
+}
+
+/* --- Navegación del lightbox (anterior/siguiente) --- */
+.lb-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  width: 30px;
+  height: 34px;
+  font-size: 18px;
+  background: var(--scrim);
+  border-color: rgba(255, 255, 255, 0.35);
+  color: #fff;
+}
+
+#lbPrev {
+  left: 8px;
+}
+
+#lbNext {
+  right: 8px;
+}
+
+.lb-nav:hover {
+  border-color: rgba(255, 255, 255, 0.6);
+  color: #fff;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  user-select: none;
+}
+
+.check input {
+  accent-color: var(--text);
+  margin: 0;
+}
+
+/* --- Barra de progreso de escaneo --- */
+.scanbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 10px 0;
+  flex: 0 0 auto;
+}
+
+.scanbar-track {
+  flex: 1;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.scanbar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--text);
+  transition: width 0.2s ease;
+}
+
+.scanbar-text {
+  font-size: 9px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* --- Pestañas --- */
+.tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  padding: 0 6px;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.tab {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 2px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted-2);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab.active {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+
+.count {
+  display: inline-block;
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 14px;
+  margin-left: 2px;
+  vertical-align: 1px;
+  font-family: var(--font-mono);
+}
+
+.tab.active .count {
+  background: var(--text);
+  color: var(--bg);
+}
+
+/* --- Grid de resultados (contenedor; las vistas setean su propio layout) --- */
+.grid {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 8px 10px;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  --thumb: 120px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.grid::-webkit-scrollbar {
+  width: 8px;
+}
+
+.grid::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 4px;
+}
+
+/* --- Vista lista (POR DEFECTO): una imagen por fila, ancho completo ---
+   Estilo ImageEye: metadata arriba (formato · dimensiones · peso, a la
+   derecha), imagen a su aspect ratio real (max-height 420px, contain),
+   URL de origen debajo en gris tenue, toolbar flotante al hover. */
+.grid.list-view {
+  /* Flujo en bloque: cada .list-card una debajo de otra con su altura real
+     de contenido. No usar grid aquí: el auto-sizing de filas grid colapsa la
+     card a ~46px (overflow:hidden + flex) y recorta la imagen; con block la
+     card crece con su contenido y respira. */
+  display: block;
+}
+
+.grid.list-view .list-card {
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  /* El .card base hereda align-self:start (necesario en masonry/grid de
+     thumbs, donde una fila colapsada estira la card a 0). En list-view eso
+     es un bug: cada card se alinea al inicio de su fila grid colapsada
+     (~46px) y las cards se SUPERONPEN entre sí. Con stretch cada card ocupa
+     su fila completa (altura auto = contenido) y respira. Especificidad
+     mayor que .card para que gane sobre el align-self:start heredado. */
+  align-self: stretch;
+  /* Espaciado propio: independiente del gap del grid. El gap del contenedor
+     puede perderse si la card colapsa su altura real (flex + overflow), así
+     que cada card aporta su separación vertical explícitamente. */
+  margin-bottom: 14px;
+}
+
+.grid.list-view .list-card:last-child {
+  margin-bottom: 0;
+}
+
+.grid.list-view .list-card:hover {
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.grid.list-view .list-card.selected {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 6px;
+  background: var(--surface-2);
+}
+
+.grid.list-view .list-card .lc-meta {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 4px;
+  padding: 0 2px 4px;
+  flex-wrap: wrap;
+}
+
+.lc-badge {
+  font-size: 9px;
+  line-height: 15px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+.lc-badge.fmt {
+  color: var(--text);
+  border-color: var(--border-strong);
+  font-weight: 600;
+}
+
+.lc-badge.size {
+  color: var(--text);
+}
+
+/* Número de tarjeta: discreto, monoespaciado, para ordenar los archivos.
+   En la vista lista vive dentro de .lc-meta (en línea); en masonry es un
+   badge absoluto en la esquina inferior derecha del thumbnail. */
+.card-number {
+  font-size: 9px;
+  line-height: 15px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--scrim);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.85);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.grid.list-view .card-number {
+  margin-right: auto; /* separa el número del resto de badges (grupo a la derecha) */
+  color: var(--muted-2);
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+
+.grid.masonry-view .card-number {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  z-index: 7;
+  background: var(--scrim-strong);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.lc-stage {
+  position: relative;
+  min-height: 120px; /* vídeo/audio/archivo sin imagen: el placeholder no colapsa */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+/* Vídeos con dimensiones conocidas: respetar el aspect ratio real del vídeo
+   (no forzar 16:9 ni el mínimo de 120px si el vídeo es más alto/bajo). */
+.lc-stage.has-ratio {
+  width: 100%;
+  aspect-ratio: var(--video-ratio, 16 / 9);
+  min-height: 0;
+  max-height: min(560px, 65vh);
+}
+
+.lc-stage img {
+  width: 100%;
+  max-height: min(560px, 65vh); /* imagen entera, grande pero sin dominar el panel */
+  height: auto;
+  object-fit: contain;
+  display: block;
+}
+
+/* Primer fotograma capturado del vídeo: rellena el stage. */
+.lc-stage img.vid-frame {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  object-fit: cover;
+}
+
+.lc-stage > video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: var(--bg);
+}
+
+.lc-url {
+  font-size: 10px;
+  color: var(--muted-2);
+  padding: 4px 2px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lc-url:hover {
+  color: var(--muted);
+}
+
+.lc-toolbar {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 6;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.list-card:hover .lc-toolbar,
+.list-card:focus-within .lc-toolbar,
+.list-card.selected .lc-toolbar {
+  opacity: 1;
+}
+
+.lc-toolbar .icon-btn {
+  width: 26px;
+  height: 24px;
+  font-size: 12px;
+  background: var(--scrim-strong);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+
+.lc-toolbar .icon-btn:hover {
+  border-color: rgba(255, 255, 255, 0.6);
+  color: #fff;
+}
+
+.lc-toolbar .icon-btn.sel-on {
+  color: #fff;
+  border-color: #fff;
+}
+
+.grid.masonry-view {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.grid.masonry-view .masonry-col {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.grid.masonry-view .card-thumb {
+  height: auto;
+  min-height: 0;
+}
+
+.grid.masonry-view .card-thumb img {
+  height: auto;
+  position: static;
+}
+
+/* --- Skeletons --- */
+.card.skeleton .card-thumb {
+  background: linear-gradient(90deg, var(--surface-2) 25%, var(--surface) 50%, var(--surface-2) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.2s infinite;
+}
+
+.card.skeleton .card-body {
+  height: 34px;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* --- Card --- */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  cursor: pointer;
+  /* CRÍTICO: como grid item el valor por defecto es align-self:stretch, y en
+     un grid con altura definida (flex:1 dentro de body overflow:hidden) el
+     auto-sizing del row se resolvía a 0 => card estirada a 0 => thumb e img
+     con height:0px aunque el inline fuera 120px (bug real v0.4, confirmado
+     por inspección DOM + probe: align-self:start => 120px). */
+  align-self: start;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.card:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow);
+}
+
+.card.selected {
+  border-color: var(--text);
+}
+
+.card.dup {
+  border-style: dashed;
+  border-color: var(--border-strong);
+  opacity: 0.85;
+}
+
+.card-thumb {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: var(--surface-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+/* Vídeos con dimensiones conocidas (masonry): aspect ratio real, no 16:9. */
+.card-thumb.has-ratio {
+  aspect-ratio: var(--video-ratio, 16 / 9);
+  max-height: min(560px, 65vh);
+}
+
+.card-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.card-thumb > video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: var(--bg);
+}
+
+.card-thumb .placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  color: var(--muted-2);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  text-align: center;
+  padding: 0 6px;
+  word-break: break-all;
+}
+
+/* Badges sobre thumbnails: scrim oscuro constante (van encima de media). */
+.badge {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--scrim);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 15px;
+  pointer-events: none;
+  font-family: var(--font-mono);
+}
+
+.badge.network {
+  background: var(--scrim-strong);
+  color: #fff;
+}
+
+.badge.dup {
+  background: var(--scrim-strong);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+}
+
+/* Badge de método de detección (jerarquía de vídeo): bajo el badge de tipo.
+   Diferenciación por texto, no por color (paleta monocroma). */
+.badge.method {
+  top: 22px;
+  background: var(--scrim);
+  color: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.badge.method-manifest,
+.badge.method-embed,
+.badge.method-network {
+  color: rgba(255, 255, 255, 0.85);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.lc-badge.method {
+  color: var(--muted-2);
+  border-color: var(--border);
+  font-weight: 400;
+}
+
+.badge.media-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--scrim);
+  color: #fff;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  pointer-events: none;
+}
+
+/* Hover preview (imagen ampliada / vídeo en loop) */
+.card-hover {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: none;
+  background: var(--bg);
+}
+
+.card:hover .card-hover,
+.card:focus-within .card-hover {
+  display: block;
+}
+
+.hover-box {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.hover-box img,
+.hover-box video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.hover-meta {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 14px 6px 4px;
+  font-size: 9px;
+  color: #fff;
+  background: linear-gradient(0deg, rgba(0, 0, 0, 0.75), transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card-body {
+  padding: 5px 6px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.card-name {
+  font-size: var(--fs-sm);
+  color: var(--text);
+  word-break: break-all;
+  line-height: 1.25;
+  max-height: 2.5em;
+  overflow: hidden;
+}
+
+.card-meta {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.card-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.card-actions .icon-btn {
+  width: 24px;
+  height: 22px;
+  font-size: 11px;
+}
+
+.card-actions .chip-btn {
+  flex: 1;
+  font-size: var(--fs-xs);
+  padding: 3px 4px;
+}
+
+/* Acciones rápidas por card (grid/masonry): esquina superior izquierda,
+   ligeramente hacia el centro (10px del borde), visible al hover/focus o
+   si la card está seleccionada. Transición suave de aparición. */
+.card-actions-overlay {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 6;
+  display: none;
+  gap: 4px;
+  opacity: 0;
+  transform: translateY(-3px) scale(0.96);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.card:hover .card-actions-overlay,
+.card:focus-within .card-actions-overlay,
+.card.selected .card-actions-overlay {
+  display: flex;
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+.card-actions-overlay .icon-btn,
+.lc-toolbar .quick-btn {
+  width: 26px;
+  height: 24px;
+  font-size: 12px;
+  background: var(--scrim-strong);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+  position: relative;
+  overflow: visible;
+}
+
+.card-actions-overlay .icon-btn:hover,
+.lc-toolbar .quick-btn:hover {
+  border-color: rgba(255, 255, 255, 0.6);
+  color: #fff;
+}
+
+.card-actions-overlay .icon-btn.sel-on {
+  color: #fff;
+  border-color: #fff;
+}
+
+/* Distinción visual: descarga = texto pleno; frame = atenuado.
+   La acción la comunica el icono, no el color. */
+.quick-btn.act-dl {
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.45);
+}
+
+.quick-btn.act-frame {
+  color: rgba(255, 255, 255, 0.72);
+}
+
+/* Anillo de progreso del hover sostenido (modo "hold"). */
+.hold-ring {
+  position: absolute;
+  inset: -1px;
+  border-radius: var(--radius);
+  border: 2px solid transparent;
+  border-top-color: #fff;
+  pointer-events: none;
+  opacity: 0;
+}
+
+.quick-btn:hover .hold-ring {
+  opacity: 1;
+}
+
+@keyframes hold-fill {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* Toast breve de confirmación. */
+#operantToast {
+  position: fixed;
+  bottom: 40px;
+  left: 50%;
+  transform: translateX(-50%) translateY(8px);
+  z-index: 100;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  box-shadow: var(--shadow);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+#operantToast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* --- Estado vacío --- */
+.empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  text-align: center;
+  padding: 20px;
+  gap: 4px;
+}
+
+.empty p {
+  margin: 2px 0;
+  max-width: 300px;
+}
+
+.empty p:first-child {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.empty .chip-btn {
+  margin-top: 6px;
+}
+
+/* --- Barra inferior única --- */
+.statusbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+#statusText {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sel-info {
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.selcheck {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.chip {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 9px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-family: var(--font-mono);
+}
+
+.chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.chip.off {
+  color: var(--muted-2);
+}
+
+.sentinel {
+  height: 1px;
+  grid-column: 1 / -1;
+}
+
+/* --- Lightbox --- */
+.lightbox {
+  width: min(94vw, 900px);
+  max-height: 94vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 0;
+  box-shadow: var(--shadow);
+}
+
+.lightbox::backdrop,
+.player::backdrop,
+.proc::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.lightbox-head,
+.player-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.lb-title {
+  font-size: var(--fs-sm);
+  color: var(--text);
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lb-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.lightbox-stage {
+  height: min(70vh, 560px);
+  overflow: auto;
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  touch-action: manipulation;
+}
+
+#lbImg {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  cursor: zoom-in;
+  user-select: none;
+  transition: transform 0.12s ease;
+  transform-origin: center center;
+}
+
+.lightbox-foot {
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.preview-err {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  text-align: center;
+  padding: 12px;
+}
+
+.preview-err b {
+  color: var(--danger);
+}
+
+/* --- Reproductores (vídeo / audio) --- */
+.player {
+  width: min(94vw, 820px);
+  max-height: 94vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 0;
+  box-shadow: var(--shadow);
+}
+
+.player-stage {
+  position: relative;
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.player-stage video {
+  width: 100%;
+  max-height: 66vh;
+  background: #000;
+}
+
+/* Preview de embeds (YouTube/Vimeo/Dailymotion): iframe a pantalla del modal. */
+#vdEmbed {
+  width: 100%;
+}
+
+#vdEmbed iframe {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  max-height: 66vh;
+  border: none;
+  display: block;
+  background: #000;
+}
+
+/* Preview de PDF embebido: iframe alto a pantalla del modal. */
+.player-stage.pdf {
+  height: 66vh;
+}
+
+#pdfFrame {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #fff;
+}
+
+.player-stage.audio {
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px 14px;
+}
+
+.audio-art {
+  width: 88px;
+  height: 88px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.player-stage audio {
+  width: 100%;
+}
+
+/* --- Diálogos comunes --- */
+.proc {
+  width: min(92vw, 360px);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 0;
+  box-shadow: var(--shadow);
+}
+
+.proc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.proc-head h2 {
+  font-size: var(--fs-sm);
+  margin: 0;
+}
+
+.proc-body {
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.proc-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.proc-field input[type="file"] {
+  font-size: var(--fs-xs);
+  color: var(--text);
+}
+
+.proc-status {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  min-height: 26px;
+  line-height: 1.35;
+}
+
+.proc-status.busy {
+  color: var(--text);
+}
+
+.proc-status.err {
+  color: var(--danger);
+}
+
+.proc-status.ok {
+  color: var(--ok);
+}
+
+progress {
+  width: 100%;
+  height: 6px;
+  border: none;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+  appearance: none;
+}
+
+progress::-webkit-progress-bar {
+  background: var(--surface-2);
+}
+
+progress::-webkit-progress-value {
+  background: var(--text);
+  border-radius: 999px;
+}
+
+/* --- Herramientas --- */
+.tool-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.tool-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tool-name {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+
+.tool-state {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  text-align: right;
+}
+
+.tool-state.ok {
+  color: var(--ok);
+}
+
+.tool-state.warn {
+  color: var(--text);
+}
+
+.tool-state.err {
+  color: var(--danger);
+}
+
+.tool-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tool-note {
+  font-size: 9px;
+  color: var(--muted);
+}
+
+.tool-bar {
+  height: 5px;
+}
+
+.tool-phase {
+  font-size: 9px;
+  color: var(--muted);
+  min-height: 11px;
+}
+
+.tool-info {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  line-height: 1.4;
+  margin: 2px 0 0;
+}
+
+.tool-info code {
+  color: var(--text);
+  font-size: 9px;
+  font-family: var(--font-mono);
+}
+
+/* --- Descargas --- */
+.dl-jobs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.dl-job {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.dl-job-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--fs-xs);
+}
+
+.dl-job-name {
+  color: var(--text);
+  word-break: break-all;
+  max-height: 2.4em;
+  overflow: hidden;
+}
+
+.dl-job-status {
+  color: var(--muted);
+  white-space: nowrap;
+  font-size: 9px;
+}
+
+.dl-job-status.done {
+  color: var(--ok);
+}
+
+.dl-job-status.error {
+  color: var(--danger);
+}
+
+/* --- Selector de calidad --- */
+.fmt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.fmt-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: var(--fs-xs);
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  word-break: break-all;
+}
+
+.fmt-row:hover {
+  border-color: var(--border-strong);
+}
+
+/* --- Historial --- */
+.hist-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.hist-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: var(--fs-xs);
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.hist-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.hist-name {
+  color: var(--text);
+  word-break: break-all;
+}
+
+.hist-page {
+  color: var(--muted);
+  font-size: 9px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}

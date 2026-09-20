@@ -1,0 +1,15 @@
+node_modules/
+web-ext-artifacts/
+dist-firefox/
+*.zip
+.DS_Store
+
+__pycache__/
+*.pyc
+
+tests/results/
+tests/.chrome/
+
+# Configuración local de la herramienta (no es parte del proyecto)
+.commandcode/
+scratchpad/

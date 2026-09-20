@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Operant</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <!-- Fila 1: marca + contador dinámico + buscador + seleccionar todo + acciones -->
+    <header class="topbar">
+      <div class="brand" title="Operant — Browser Agent & Media Engine">
+        <svg width="16" height="16" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="15" fill="currentColor" /><path d="M 10.55 9.64 L 17.14 16 L 10.55 22.36" fill="none" stroke="var(--bg)" stroke-width="3.64" stroke-linecap="round" stroke-linejoin="round" /><circle cx="23.27" cy="16" r="2.6" fill="#ef4444" /></svg>
+        <span id="connDot" class="dot" title="Página escaneable"></span>
+      </div>
+      <span id="counterText" class="counter" title="Medios detectados en la pestaña activa">…</span>
+      <input
+        id="search"
+        class="search"
+        type="search"
+        placeholder="Buscar por nombre o URL…"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <label class="check selcheck" title="Seleccionar todos los visibles (con filtros activos)">
+        <input type="checkbox" id="chkSelectAll" /> Todo
+      </label>
+      <button id="btnRefresh" class="icon-btn" title="Re-escaneo manual (muestra progreso)" aria-label="Actualizar">⟳</button>
+      <button
+        id="btnFilter"
+        class="icon-btn"
+        title="Opciones"
+        aria-label="Opciones"
+        aria-expanded="false"
+      >
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <path
+            d="M2 3h12l-4.2 5.2v4.1L6.2 14V8.2L2 3z"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+    </header>
+
+    <!-- Fila 2: controles compactos en línea (estilo ImageEye) -->
+    <section class="controlbar">
+      <select id="fMinSize" class="ctl" title="Tamaño mínimo">
+        <option value="0">Tamaño: todo</option>
+        <option value="10">&gt;10 KB</option>
+        <option value="100">&gt;100 KB</option>
+        <option value="1024">&gt;1 MB</option>
+        <option value="5120">&gt;5 MB</option>
+      </select>
+      <select id="fExt" class="ctl" title="Tipo (extensión)">
+        <option value="">Tipo: todo</option>
+      </select>
+      <select id="layoutSel" class="ctl" title="Vista">
+        <option value="full">☰ Full</option>
+        <option value="masonry">▤ Masonry</option>
+      </select>
+      <input id="fDomain" class="ctl domain" type="text" placeholder="dominio…" list="domainList" autocomplete="off" spellcheck="false" />
+      <datalist id="domainList"></datalist>
+      <select id="sortBy" class="ctl sort" title="Ordenar">
+        <option value="detect">Orden: detección</option>
+        <option value="size">Orden: tamaño</option>
+        <option value="dims">Orden: dimensiones</option>
+        <option value="domain">Orden: dominio</option>
+      </select>
+    </section>
+
+    <!-- Fila 3: pestañas independientes con contador propio -->
+    <nav class="tabs" role="tablist">
+      <button data-tab="image" class="tab active" role="tab" aria-selected="true">
+        Imágenes <span class="count" id="countImage">0</span>
+      </button>
+      <button data-tab="video" class="tab" role="tab" aria-selected="false">
+        Vídeos <span class="count" id="countVideo">0</span>
+      </button>
+      <button data-tab="audio" class="tab" role="tab" aria-selected="false">
+        Audio <span class="count" id="countAudio">0</span>
+      </button>
+      <button data-tab="file" class="tab" role="tab" aria-selected="false">
+        Archivos <span class="count" id="countFile">0</span>
+      </button>
+    </nav>
+
+    <!-- Progreso real de escaneo (gradiente violeta->cian) -->
+    <div id="scanBar" class="scanbar" hidden>
+      <div class="scanbar-track"><div id="scanFill" class="scanbar-fill" style="width: 0%"></div></div>
+      <span id="scanText" class="scanbar-text">Analizando…</span>
+      <button id="btnStopScan" class="chip-btn mini" title="Detener escaneo" hidden>✕</button>
+    </div>
+
+    <!-- Popover de opciones: thumbnail, checks y acciones secundarias -->
+    <div id="filterPop" class="popover" hidden>
+      <div class="pop-section row">
+        <label class="pop-label" for="thumbSize">Tamaño</label>
+        <input type="range" id="thumbSize" min="64" max="240" value="120" title="Tamaño de thumbnail (masonry)" />
+        <span id="thumbVal" class="pop-hint">120</span>
+      </div>
+      <div class="pop-section row">
+        <label class="pop-label" for="dlMode">Descarga</label>
+        <select id="dlMode" title="Cómo se dispara la descarga desde las cards">
+          <option value="click">click en el botón (recomendado)</option>
+          <option value="hold">hover sostenido ~700 ms</option>
+        </select>
+        <span class="pop-hint"></span>
+      </div>
+      <div class="pop-section checks">
+        <label class="check" title="Ocultar imágenes conocidas <10 KB (iconos/trackers)">
+          <input type="checkbox" id="chkHideSmall" /> ocultar &lt;10 KB
+        </label>
+        <label class="check" title="Resaltar posibles duplicados (mismo recurso, distinto CDN)">
+          <input type="checkbox" id="chkDupes" checked /> resaltar duplicados
+        </label>
+        <label class="check" title="Auto-detectar cambios (SPAs)">
+          <input type="checkbox" id="btnAuto" checked /> auto-detect
+        </label>
+        <label class="check" title="Botón flotante sobre las imágenes/vídeos en la página real (sin abrir el panel)">
+          <input type="checkbox" id="chkOverlay" checked /> overlay en la página
+        </label>
+        <label class="check" title="Ignorar imágenes SVG en el overlay (iconos/logos)">
+          <input type="checkbox" id="chkOverlayIgnoreSvg" checked /> overlay: ignorar SVG
+        </label>
+      </div>
+      <div class="pop-section row">
+        <label class="pop-label" for="overlayMinSize">Overlay: tamaño mín.</label>
+        <input type="number" id="overlayMinSize" min="0" max="500" step="8" value="0" title="Tamaño mínimo (px del lado menor) para mostrar el overlay; 0 = sin mínimo" />
+        <span class="pop-hint">px</span>
+      </div>
+      <div class="pop-actions">
+        <button id="btnExport" class="chip-btn" title="Exportar URLs filtradas (.txt)">Exportar URLs</button>
+        <button id="btnHistory" class="chip-btn" title="Historial de descargas">Historial</button>
+        <button id="btnProcess" class="chip-btn" title="Procesar con ffmpeg (host nativo)">Procesar</button>
+        <button id="btnClearFilters" class="chip-btn" title="Quitar búsqueda y filtros">Limpiar filtros</button>
+      </div>
+    </div>
+
+    <main id="grid" class="grid"><div id="sentinel"></div></main>
+
+    <div id="empty" class="empty" hidden>
+      <p id="emptyTitle">Sin resultados</p>
+      <p id="emptyHint">Pulsa «Actualizar» para re-escaneo. Los streams (m3u8/mpd) se capturan solos vía webRequest.</p>
+      <button id="btnEmptyReset" class="chip-btn" hidden>Limpiar filtros</button>
+    </div>
+
+    <!-- Barra inferior ÚNICA: estado + selección + descarga -->
+    <footer class="statusbar">
+      <span id="statusText">Escaneando…</span>
+      <span id="selInfo" class="sel-info" hidden></span>
+      <button id="btnClearSel" class="chip-btn mini" hidden>Limpiar</button>
+      <button id="btnZip" class="chip-btn primary" disabled>Descargar (zip)</button>
+      <button id="btnYtdl" class="chip-btn accent" hidden title="yt-dlp (máx. calidad)">yt-dlp</button>
+      <button id="btnDl" class="chip-btn mini" hidden title="Cola de descargas">Descargas (0)</button>
+      <button id="nativeChip" class="chip" hidden title="Herramientas: yt-dlp / ffmpeg">yt-dlp: —</button>
+    </footer>
+
+    <!-- Lightbox: preview ampliado de imágenes con zoom -->
+    <dialog id="lightboxDialog" class="lightbox">
+      <div class="lightbox-head">
+        <div class="lb-title" id="lbTitle"></div>
+        <div class="lb-tools">
+          <button id="lbZoomOut" class="icon-btn" title="Alejar">−</button>
+          <span id="lbZoomVal" class="pop-hint">100%</span>
+          <button id="lbZoomIn" class="icon-btn" title="Acercar">+</button>
+          <button id="lbReset" class="icon-btn" title="Restablecer zoom">⟲</button>
+          <button id="lbDownload" class="chip-btn" title="Descargar">↓</button>
+          <button id="lbOpen" class="chip-btn" title="Abrir en pestaña nueva">↗</button>
+          <button id="lbClose" class="icon-btn" title="Cerrar (Esc)">✕</button>
+        </div>
+      </div>
+      <div id="lbStage" class="lightbox-stage">
+        <button id="lbPrev" class="icon-btn lb-nav" title="Anterior (←)" aria-label="Anterior" hidden>‹</button>
+        <button id="lbNext" class="icon-btn lb-nav" title="Siguiente (→)" aria-label="Siguiente" hidden>›</button>
+        <img id="lbImg" alt="" draggable="false" />
+        <div id="lbErr" class="preview-err" hidden></div>
+      </div>
+      <div class="lightbox-foot" id="lbMeta"></div>
+    </dialog>
+
+    <!-- Reproductor de vídeo (modal, controles completos) -->
+    <dialog id="videoDialog" class="player">
+      <div class="player-head">
+        <div class="lb-title" id="vdTitle"></div>
+        <div class="lb-tools">
+          <button id="vdDownload" class="chip-btn" title="Descargar">↓</button>
+          <button id="vdOpen" class="chip-btn" title="Abrir en pestaña nueva">↗</button>
+          <button id="vdClose" class="icon-btn" title="Cerrar (Esc)">✕</button>
+        </div>
+      </div>
+      <div class="player-stage">
+        <video id="vdEl" controls playsinline preload="metadata"></video>
+        <div id="vdEmbed" hidden></div>
+        <div id="vdErr" class="preview-err" hidden></div>
+      </div>
+      <div class="lightbox-foot" id="vdMeta"></div>
+    </dialog>
+
+    <!-- Reproductor de audio (modal) -->
+    <dialog id="audioDialog" class="player">
+      <div class="player-head">
+        <div class="lb-title" id="adTitle"></div>
+        <div class="lb-tools">
+          <button id="adDownload" class="chip-btn" title="Descargar">↓</button>
+          <button id="adOpen" class="chip-btn" title="Abrir en pestaña nueva">↗</button>
+          <button id="adClose" class="icon-btn" title="Cerrar (Esc)">✕</button>
+        </div>
+      </div>
+      <div class="player-stage audio">
+        <div class="audio-art" id="adArt">♪</div>
+        <audio id="adEl" controls preload="metadata"></audio>
+        <div id="adErr" class="preview-err" hidden></div>
+      </div>
+      <div class="lightbox-foot" id="adMeta"></div>
+    </dialog>
+
+    <!-- Preview de PDF (embebido en el panel) -->
+    <dialog id="pdfDialog" class="player">
+      <div class="player-head">
+        <div class="lb-title" id="pdfTitle"></div>
+        <div class="lb-tools">
+          <button id="pdfDownload" class="chip-btn" title="Descargar">↓</button>
+          <button id="pdfOpen" class="chip-btn" title="Abrir en pestaña nueva">↗</button>
+          <button id="pdfClose" class="icon-btn" title="Cerrar (Esc)">✕</button>
+        </div>
+      </div>
+      <div class="player-stage pdf">
+        <iframe id="pdfFrame" title="Vista previa del PDF"></iframe>
+        <div id="pdfErr" class="preview-err" hidden></div>
+      </div>
+    </dialog>
+
+    <dialog id="procDialog" class="proc">
+      <form method="dialog" class="proc-head">
+        <h2>Procesar con ffmpeg (nativo)</h2>
+        <button value="cancel" class="chip-btn mini-btn" title="Cerrar">✕</button>
+      </form>
+      <div class="proc-body">
+        <label class="proc-field">
+          <span>Archivo detectado en la página</span>
+          <select id="procSource"></select>
+        </label>
+        <label class="proc-field">
+          <span>Operación</span>
+          <select id="procOp">
+            <option value="extract-mp3">Extraer audio (mp3, 192 kbps)</option>
+            <option value="remux-mp4">Remux a mp4 (sin recodificar)</option>
+            <option value="convert-webm">Convertir a webm</option>
+            <option value="compress">Comprimir (h264 + aac)</option>
+            <option value="resize-50">Reescalar vídeo al 50%</option>
+            <option value="img-jpg">Imagen → jpg</option>
+            <option value="img-webp">Imagen → webp</option>
+          </select>
+        </label>
+        <label class="proc-field" id="procQualityField">
+          <span>Calidad (CRF: menor = mejor calidad/más peso)</span>
+          <select id="procQuality">
+            <option value="23">Alta (23)</option>
+            <option value="28" selected>Media (28)</option>
+            <option value="34">Baja (34)</option>
+          </select>
+        </label>
+        <progress id="procBar" value="0" max="100"></progress>
+        <p id="procStatus" class="proc-status">El procesado ocurre en tu PC con el ffmpeg del host nativo (rápido, todos los codecs). El resultado se guarda en ~/Downloads/Operant/.</p>
+        <button id="procRun" class="chip-btn primary">Procesar</button>
+      </div>
+    </dialog>
+
+    <dialog id="dlDialog" class="proc">
+      <form method="dialog" class="proc-head">
+        <h2>Descargas</h2>
+        <button value="cancel" class="chip-btn mini-btn" title="Cerrar">✕</button>
+      </form>
+      <div class="proc-body">
+        <label class="proc-field">
+          <span>Descargas simultáneas (cola):</span>
+          <input id="dlConcurrency" type="number" min="1" max="8" value="3" />
+        </label>
+        <progress id="dlTotalBar" value="0" max="100"></progress>
+        <p id="dlTotalText" class="proc-status"></p>
+        <div id="dlJobs" class="dl-jobs"></div>
+      </div>
+    </dialog>
+
+    <dialog id="toolsDialog" class="proc">
+      <form method="dialog" class="proc-head">
+        <h2>Herramientas (yt-dlp / ffmpeg)</h2>
+        <button value="cancel" class="chip-btn mini-btn" title="Cerrar">✕</button>
+      </form>
+      <div class="proc-body">
+        <div class="tool-row" id="tool-yt-dlp">
+          <div class="tool-head">
+            <span class="tool-name">yt-dlp</span>
+            <span class="tool-state" id="state-yt-dlp">comprobando…</span>
+          </div>
+          <div class="tool-actions">
+            <button class="chip-btn primary tool-btn" id="btn-yt-dlp" hidden>Instalar</button>
+            <span class="tool-note" id="note-yt-dlp"></span>
+          </div>
+          <progress class="tool-bar" id="bar-yt-dlp" value="0" max="100" hidden></progress>
+          <span class="tool-phase" id="phase-yt-dlp"></span>
+        </div>
+        <div class="tool-row" id="tool-ffmpeg">
+          <div class="tool-head">
+            <span class="tool-name">ffmpeg</span>
+            <span class="tool-state" id="state-ffmpeg">comprobando…</span>
+          </div>
+          <div class="tool-actions">
+            <button class="chip-btn primary tool-btn" id="btn-ffmpeg" hidden>Instalar</button>
+            <span class="tool-note" id="note-ffmpeg"></span>
+          </div>
+          <progress class="tool-bar" id="bar-ffmpeg" value="0" max="100" hidden></progress>
+          <span class="tool-phase" id="phase-ffmpeg"></span>
+        </div>
+        <p class="tool-info">
+          Se instalan en <code id="toolsPath">~/Operant/bin/</code> sin tocar tus instalaciones del sistema.
+          La primera instalación de ffmpeg descarga ~100 MB y puede tardar un poco.
+        </p>
+      </div>
+    </dialog>
+
+    <dialog id="qualityDialog" class="proc">
+      <form method="dialog" class="proc-head">
+        <h2>Calidades disponibles (yt-dlp -F)</h2>
+        <button value="cancel" class="chip-btn mini-btn" title="Cerrar">✕</button>
+      </form>
+      <div class="proc-body">
+        <div id="qualityList" class="fmt-list"></div>
+        <p id="qualityStatus" class="proc-status"></p>
+        <button id="qualityRun" class="chip-btn primary">Descargar</button>
+      </div>
+    </dialog>
+
+    <dialog id="historyDialog" class="proc">
+      <form method="dialog" class="proc-head">
+        <h2>Historial de descargas</h2>
+        <button value="cancel" class="chip-btn mini-btn" title="Cerrar">✕</button>
+      </form>
+      <div class="proc-body">
+        <input id="historySearch" type="search" placeholder="Buscar por nombre, URL o página…" autocomplete="off" />
+        <div id="historyList" class="hist-list"></div>
+        <button id="btnHistoryExport" class="chip-btn">Exportar historial (.json)</button>
+      </div>
+    </dialog>
+
+    <script src="../vendor/jszip.min.js"></script>
+    <script src="../vendor/hls.min.js"></script>
+    <script src="../vendor/dash.all.min.js"></script>
+    <script src="../shared/dl-indicator.js"></script>
+    <script type="module" src="panel.js"></script>
+  </body>
+</html>

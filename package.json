@@ -1,0 +1,26 @@
+{
+  "name": "operant",
+  "version": "0.4.0",
+  "private": true,
+  "license": "GPL-3.0-or-later",
+  "description": "Operant — Extensión multi-navegador con Native Messaging, media scraping, ffmpeg, yt-dlp y base para agentes de navegación.",
+  "scripts": {
+    "dev": "web-ext run --target=chromium --source-dir=./src",
+    "dev:firefox": "node scripts/build-firefox.mjs && web-ext run --source-dir=./dist-firefox",
+    "build": "web-ext build --source-dir=./src --artifacts-dir=./web-ext-artifacts",
+    "build:firefox": "node scripts/build-firefox.mjs && web-ext build --source-dir=./dist-firefox --artifacts-dir=./web-ext-artifacts",
+    "test:verify": "node tests/run-verification.js",
+    "test:verify:public": "node tests/run-verification.js --public",
+    "test:audit": "node tests/run-panel-audit.js",
+    "test:fixtures": "node tests/generate-fixtures.js"
+  },
+  "devDependencies": {
+    "puppeteer-core": "25.4.0",
+    "web-ext": "^8.3.0"
+  },
+  "dependencies": {
+    "@ffmpeg/core": "0.12.10",
+    "@ffmpeg/ffmpeg": "0.12.15",
+    "jszip": "3.10.1"
+  }
+}
