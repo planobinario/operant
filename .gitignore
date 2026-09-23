@@ -13,3 +13,7 @@ tests/.chrome/
 # Configuración local de la herramienta (no es parte del proyecto)
 .commandcode/
 scratchpad/
+
+# Rust build artifacts
+target/
+native-host-rs/target/

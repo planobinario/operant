@@ -183,7 +183,7 @@ function start(port = 8765) {
       return;
     }
 
-    // Vídeo "protegido" (simula erome): exige un Referer de la misma página.
+    // Vídeo "protegido" (simula anti-hotlink): exige un Referer de la misma página.
     // El SW/descarga directa no envía Referer -> 403. El fetch en-página sí lo
     // envía automáticamente -> 200. Reproduce el anti-hotlink real.
     if (p === "/video-protected.mp4") {
@@ -200,9 +200,8 @@ function start(port = 8765) {
       return;
     }
 
-    // ARCHIVO GRANDE PROTEGIDO (simula el vídeo real de cientos de MB en una
-    // CDN con hotlink por Referer, tipo erome): exige Referer local Y soporta
-    // Range (206). Combina los dos casos: /protected-big/<MB>.bin.
+    // ARCHIVO GRANDE PROTEGIDO (simula vídeo pesado en CDN con anti-hotlink por Referer):
+    // exige Referer local Y soporta Range (206). Combina los dos casos: /protected-big/<MB>.bin.
     const pbig = /^\/protected-big\/(\d+)\.bin$/.exec(p);
     if (pbig) {
       const s = bigStream(Math.min(2000, Number(pbig[1])));
@@ -264,8 +263,8 @@ function start(port = 8765) {
       return;
     }
 
-    // Vídeo "protegido" CROSS-ORIGIN (simula la CDN de erome, p. ej.
-    // v15.erome.com): exige Referer y responde SIN Access-Control-Allow-Origin.
+    // Vídeo "protegido" CROSS-ORIGIN (simula CDN estricta sin cabeceras CORS):
+    // exige Referer y responde SIN Access-Control-Allow-Origin.
     // El fetch DESDE la página muere por CORS (el bug real) aunque el recurso
     // exista; solo un fetch del SW (sin CORS) con el Referer inyectado por DNR
     // lo puede leer.
@@ -278,7 +277,7 @@ function start(port = 8765) {
         return;
       }
       const body = fs.readFileSync(file);
-      // Nota: SIN Access-Control-Allow-Origin a propósito (simula v15.erome.com).
+      // Nota: SIN Access-Control-Allow-Origin a propósito (simula CDN cross-origin estricta).
       res.writeHead(200, { "Content-Type": "video/mp4", "Content-Length": body.length });
       res.end(body);
       return;

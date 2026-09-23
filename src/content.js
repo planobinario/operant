@@ -21,15 +21,36 @@ function classify(url) {
 }
 
 function extOf(url) {
-  try {
-    const m = new URL(url).pathname.match(/\.([a-z0-9]+)(?:$|[?#])/i);
-    return m ? m[1].toLowerCase() : "";
-  } catch {
-    return "";
+  if (url && url.startsWith("data:image/")) {
+    const m = url.match(/^data:image\/([a-zA-Z0-9\+\-]+);/);
+    if (!m) return "png";
+    const sub = m[1].toLowerCase();
+    if (sub === "jpeg") return "jpg";
+    if (sub === "svg+xml") return "svg";
+    return sub;
   }
+  try {
+    const u = new URL(url);
+    const m = u.pathname.match(/\.([a-z0-9]{2,5})(?:$|[?#])/i);
+    if (m) return m[1].toLowerCase();
+
+    for (const p of ["format", "fm", "ext", "type", "f", "mime"]) {
+      const val = u.searchParams.get(p);
+      if (val) {
+        const clean = val.replace(/^image\//i, "").toLowerCase();
+        if (/^(jpe?g|png|webp|avif|gif|svg)$/i.test(clean)) {
+          return clean === "jpeg" ? "jpg" : clean;
+        }
+      }
+    }
+  } catch {}
+  return "";
 }
 
 function domainOf(url) {
+  if (url && url.startsWith("data:")) {
+    return location.hostname.replace(/^www\./, "") || "inline";
+  }
   try {
     return new URL(url).hostname.replace(/^www\./, "");
   } catch {
@@ -37,12 +58,20 @@ function domainOf(url) {
   }
 }
 
-// Normaliza a URL absoluta; descarta data: (embebido en base64, ruido).
+// Normaliza a URL absoluta; preserva data:image/ válidas (Google Images, canvas, WebApps).
 function normalize(url) {
   if (!url || typeof url !== "string") return null;
-  if (url.startsWith("data:")) return null;
+  const trimmed = url.trim();
+  if (trimmed.startsWith("data:")) {
+    if (trimmed.startsWith("data:image/")) {
+      // Excluir tracking pixels 1x1, spacers transparentes y data URIs minúsculas (< 250 caracteres)
+      if (trimmed.length < 250) return null;
+      return trimmed;
+    }
+    return null;
+  }
   try {
-    return new URL(url, location.href).href;
+    return new URL(trimmed, location.href).href;
   } catch {
     return null;
   }
@@ -68,6 +97,11 @@ const LAZY_ATTRS = [
   "data-image",
   "data-actualsrc",
   "data-srcset",
+  "data-thumb",
+  "data-thumbnail",
+  "data-full-src",
+  "data-zoom-src",
+  "data-highres",
 ];
 
 // --- Almacén deduplicado: URL normalizada -> item ---
@@ -91,24 +125,47 @@ function notify() {
 function add(url, kind, extra = {}) {
   const normalized = normalize(url);
   if (!normalized) return;
-  const key = normalized.split("#")[0];
+  const isData = normalized.startsWith("data:");
+  const key = isData
+    ? `data_${normalized.slice(0, 80)}_${normalized.length}_${normalized.slice(-40)}`
+    : normalized.split("#")[0];
+
   const existing = store.get(key);
   if (existing) {
     if (extra.thumb && !existing.thumb) existing.thumb = extra.thumb;
     if (extra.durationSec && !existing.durationSec) existing.durationSec = extra.durationSec;
     if (existing.sizeUnknown === undefined && extra.sizeUnknown) existing.sizeUnknown = true;
+    if (extra.w && !existing.w) existing.w = extra.w;
+    if (extra.h && !existing.h) existing.h = extra.h;
+    if (extra.name && !existing.name) existing.name = extra.name;
     return;
   }
   if (store.size >= MAX_ITEMS) return;
+
+  let sizeBytes = extra.sizeBytes || null;
+  if (!sizeBytes && isData) {
+    const comma = normalized.indexOf(",");
+    if (comma !== -1) {
+      sizeBytes = Math.floor((normalized.length - comma - 1) * 0.75);
+    }
+  }
+  if (!sizeBytes && !isData) {
+    sizeBytes = perfSizeBytes(normalized);
+  }
+
+  const detectedExt = extOf(normalized);
+  const fallbackExt = kind === "image" ? "jpg" : kind === "video" ? "mp4" : kind === "audio" ? "mp3" : "";
+  const ext = detectedExt || fallbackExt;
+
   const item = {
     url: normalized,
     type: kind,
-    ext: extOf(normalized),
+    ext,
     domain: domainOf(normalized),
-    sizeKB: null,
-    sizeUnknown: false,
-    sizeBytes: perfSizeBytes(normalized), // Técnica 1: Performance Resource Timing
-    source: "dom",
+    sizeKB: sizeBytes ? Math.round(sizeBytes / 1024) : null,
+    sizeUnknown: !sizeBytes && !isData,
+    sizeBytes,
+    source: extra.source || "dom",
     // Método de detección (para el badge de la UI y la jerarquía de descarga):
     //   dom      -> <video>/<source>/<img> con URL directa en el DOM
     //   manifest -> .m3u8/.mpd (HLS/DASH): se puede parsear sin yt-dlp
@@ -261,31 +318,70 @@ function qsaAll(selector) {
 }
 
 function scanImages() {
+  // 1. Elementos <img> estándar con src, currentSrc y TODOS sus atributos
   for (const img of qsaAll("img")) {
     const extra = {
-      w: img.naturalWidth || null,
-      h: img.naturalHeight || null,
+      w: img.naturalWidth || (img.width > 0 ? img.width : null),
+      h: img.naturalHeight || (img.height > 0 ? img.height : null),
+      name: img.alt || img.title || null,
     };
-    for (const attr of LAZY_ATTRS) {
-      const value = img.getAttribute(attr);
-      if (!value) continue;
-      if (attr === "srcset" || attr === "data-srcset") {
+    if (img.currentSrc) add(img.currentSrc, "image", extra);
+    if (img.src) add(img.src, "image", extra);
+
+    for (const attr of img.attributes) {
+      const name = attr.name.toLowerCase();
+      if (name === "src" || name === "currentsrc" || name === "alt" || name === "title" || name === "width" || name === "height" || name === "class" || name === "id" || name === "style") continue;
+      const value = attr.value?.trim();
+      if (!value || value.length < 3) continue;
+
+      if (name.includes("srcset")) {
         for (const c of parseSrcset(value)) add(c, "image", extra);
-      } else {
+      } else if (name.startsWith("data-") || value.startsWith("data:image/") || /^(\/|\.\/|\.\.\/|https?:|\/\/)/i.test(value) || EXT_GROUPS.image.test(value)) {
         add(value, "image", extra);
       }
     }
   }
 
-  // <picture><source srcset>
-  for (const source of qsaAll("picture source")) {
+  // 2. <picture><source srcset>
+  for (const source of qsaAll("picture source, source")) {
     for (const c of parseSrcset(source.getAttribute("srcset"))) add(c, "image");
     const s = source.getAttribute("src");
-    if (s) add(s, "image");
+    if (s && EXT_GROUPS.image.test(s)) add(s, "image");
   }
 
-  // <noscript> con <img> dentro (fallback de lazy-load): el navegador no
-  // activa su contenido, hay que parsear el HTML crudo como texto.
+  // 3. Elementos SVG con imágenes embebidas (<image href="...">)
+  for (const svgImg of qsaAll("svg image, image")) {
+    const href = svgImg.getAttribute("href") || svgImg.getAttribute("xlink:href");
+    if (href) add(href, "image");
+  }
+
+  // 4. Elementos <canvas> con gráficos o renders (visores protegidos, editores, diagramas)
+  for (const cvs of qsaAll("canvas")) {
+    try {
+      if (cvs.width >= 100 && cvs.height >= 100) {
+        const dataUrl = cvs.toDataURL("image/png");
+        if (dataUrl && dataUrl.length >= 250) {
+          add(dataUrl, "image", { w: cvs.width, h: cvs.height, source: "canvas" });
+        }
+      }
+    } catch {}
+  }
+
+  // 5. Enlaces <a> que apuntan directamente a imágenes de alta resolución
+  for (const a of qsaAll("a[href]")) {
+    const href = a.getAttribute("href");
+    if (href && EXT_GROUPS.image.test(href)) {
+      add(href, "image", { name: a.textContent?.trim() || a.title || null });
+    }
+  }
+
+  // 6. Meta tags de alta resolución (OpenGraph, Twitter card, canonical poster)
+  for (const meta of qsaAll("meta[property='og:image'], meta[property='og:image:secure_url'], meta[name='twitter:image'], meta[name='twitter:image:src'], link[rel='image_src'], link[rel='apple-touch-icon']")) {
+    const content = meta.getAttribute("content") || meta.getAttribute("href");
+    if (content) add(content, "image");
+  }
+
+  // 7. <noscript> con <img> dentro (fallback de lazy-load)
   for (const ns of qsaAll("noscript")) {
     const raw = ns.textContent || ns.innerHTML || "";
     const srcsetAll = raw.match(/srcset\s*=\s*["'][^"']*["']/gi) || [];
@@ -296,55 +392,211 @@ function scanImages() {
     const srcs = raw.match(/\bsrc\s*=\s*["'][^"']*["']/gi) || [];
     for (const s of srcs) {
       const url = s.replace(/^\s*src\s*=\s*["']|["']$/gi, "").trim();
-      if (url && !url.startsWith("data:")) add(url, "image");
+      if (url) add(url, "image");
     }
+  }
+}
+
+// --- Extractor universal de medios anidados en parámetros de enlace (<a href="...?url=...">) ---
+// En cualquier visor, agregador o buscador web, los enlaces que envuelven miniaturas contienen
+// parámetros que apuntan a la imagen original o de alta resolución en la web de origen.
+function scanNestedMediaLinks() {
+  for (const a of qsaAll("a[href]")) {
+    const rawHref = a.getAttribute("href");
+    if (!rawHref || rawHref.startsWith("#") || rawHref.startsWith("javascript:") || rawHref.startsWith("mailto:")) continue;
+
+    try {
+      const u = new URL(rawHref, location.href);
+      for (const [key, val] of u.searchParams.entries()) {
+        if (!val || typeof val !== "string" || val.length < 8) continue;
+
+        const isUrlPattern = /^(https?:)?\/\//i.test(val) || /^https?%3A%2F%2F/i.test(val);
+        if (!isUrlPattern) continue;
+
+        try {
+          const decoded = decodeURIComponent(val);
+          const fullUrl = new URL(decoded, location.href).href;
+          const kind = classify(fullUrl);
+
+          const isMediaParam = /(imgurl|image|img|pic|photo|media|src|file|thumb|thumbnail|orig|original|target|download)/i.test(key);
+          if (kind || isMediaParam) {
+            const w = Number(u.searchParams.get("w") || u.searchParams.get("width")) || null;
+            const h = Number(u.searchParams.get("h") || u.searchParams.get("height")) || null;
+            const label = a.getAttribute("aria-label") || a.title || a.textContent?.trim() || "";
+            const innerImg = a.querySelector("img");
+            const thumb = innerImg?.currentSrc || innerImg?.src || null;
+            add(fullUrl, kind || "image", {
+              w,
+              h,
+              thumb,
+              source: "link_param",
+              name: label.length > 2 && label.length < 100 ? label : null,
+            });
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+}
+
+// --- Extractor universal de atributos profundos y estructuras JSON incrustadas ---
+function scanDeepElementAttributes() {
+  const elements = qsaAll("figure, [data-src], [data-lazy], [data-original], [data-url], [data-image], [data-full], [data-zoom], [data-highres], [data-thumb], [data-media], [data-sources], [data-meta], [m]");
+
+  for (const el of elements) {
+    const innerImg = el.tagName === "IMG" ? el : el.querySelector("img");
+    const thumb = innerImg?.currentSrc || innerImg?.src || null;
+    for (const attr of el.attributes) {
+      const val = attr.value?.trim();
+      if (!val || val.length < 8) continue;
+      const name = attr.name.toLowerCase();
+
+      if (name === "src" || name === "currentsrc" || name === "srcset") continue;
+
+      if (val.startsWith("data:image/") || /^(https?:)?\/\//i.test(val)) {
+        const kind = classify(val);
+        if (kind) add(val, kind, { thumb });
+        continue;
+      }
+
+      if (val.includes(",") && (val.includes(" 1x") || val.includes(" 2x") || val.includes("w,") || val.includes("w "))) {
+        for (const c of parseSrcset(val)) add(c, "image", { thumb });
+        continue;
+      }
+
+      if ((val.startsWith("{") && val.endsWith("}")) || (val.startsWith("[") && val.endsWith("]"))) {
+        try {
+          const parsed = JSON.parse(val);
+          extractUrlsFromJson(parsed, { thumb });
+        } catch {}
+      }
+    }
+  }
+}
+
+function extractUrlsFromJson(obj, extra = {}, depth = 0) {
+  if (!obj || depth > 4) return;
+  if (typeof obj === "string") {
+    if (obj.startsWith("data:image/") || /^(https?:)?\/\//i.test(obj)) {
+      const kind = classify(obj);
+      if (kind) add(obj, kind, extra);
+    }
+    return;
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) extractUrlsFromJson(item, extra, depth + 1);
+    return;
+  }
+  if (typeof obj === "object") {
+    const w = Number(obj.width || obj.w) || extra.w || null;
+    const h = Number(obj.height || obj.h) || extra.h || null;
+    const currentExtra = (w || h) ? { ...extra, w, h } : extra;
+
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === "string" && (/^(https?:)?\/\//i.test(v) || v.startsWith("data:image/"))) {
+        const isMediaKey = /(url|src|murl|turl|image|thumb|original|full|poster)/i.test(k);
+        const kind = classify(v);
+        if (kind || isMediaKey) {
+          add(v, kind || "image", currentExtra);
+        }
+      } else if (typeof v === "object") {
+        extractUrlsFromJson(v, currentExtra, depth + 1);
+      }
+    }
+  }
+}
+
+// --- Extractor universal de datos estructurados Schema.org / JSON-LD ---
+function scanJsonLd() {
+  for (const script of qsaAll("script[type='application/ld+json']")) {
+    try {
+      const content = script.textContent?.trim();
+      if (!content) continue;
+      const data = JSON.parse(content);
+      extractUrlsFromJson(data);
+    } catch {}
   }
 }
 
 const URL_RE = /url\((["']?)(.*?)\1\)/g;
 
 // --- Progreso real de escaneo (feedback no decorativo en el panel) ---
-// La fase lenta es el barrido de background-image por tandas; se reporta
-// done/total de elementos procesados, throttled a 120 ms.
+// Enfocado de forma matemática en candidatos visuales para evitar congelar
+// el hilo principal con 30.000+ consultas getComputedStyle en nodos vacíos.
 let scanTotal = 0;
 let scanDone = 0;
 let lastProgressAt = 0;
 
-function reportProgress() {
+function reportProgress(force = false, phase = "estilos") {
   const now = Date.now();
-  if (now - lastProgressAt < 120) return;
+  if (!force && now - lastProgressAt < 80) return;
   lastProgressAt = now;
   chrome.runtime
-    .sendMessage({ type: "scan-progress", done: scanDone, total: scanTotal, phase: "estilos" })
+    .sendMessage({
+      type: "scan-progress",
+      done: scanDone,
+      total: scanTotal,
+      phase: (scanTotal > 0 && scanDone >= scanTotal) ? "done" : phase,
+      found: store.size,
+    })
     .catch(() => {});
 }
 
-function scanBackgroundImages() {
-  // background-image en CSS computado, en tandas de 400 elementos vía idle.
-  const all = qsaAll("*");
-  scanTotal = all.length;
-  scanDone = 0;
-  reportProgress();
+function getBackgroundCandidates() {
+  const visualSelectors = [
+    "[style*='background']",
+    "[style*='url(']",
+    "[style*='--']",
+    "header", "nav", "section", "article", "aside", "footer", "figure", "main",
+    "div[class]", "a[class]", "span[class]", "button[class]", "li[class]"
+  ].join(",");
+
+  const rawElements = qsaAll(visualSelectors);
+  const ignoredTags = /^(script|style|link|meta|title|head|path|svg|g|circle|rect|polygon|line|br|hr|wbr|option|input|textarea)$/i;
+  return rawElements.filter((el) => !ignoredTags.test(el.tagName));
+}
+
+function scanBackgroundImages(candidates = null, baseDone = 0, targetTotal = 0) {
+  const all = candidates || getBackgroundCandidates();
+  if (targetTotal > 0) {
+    scanTotal = targetTotal;
+    scanDone = baseDone;
+  } else {
+    scanTotal = all.length;
+    scanDone = 0;
+  }
+  reportProgress(false, "estilos");
   let i = 0;
   function step() {
-    const end = Math.min(i + 400, all.length);
+    const end = Math.min(i + 200, all.length);
     for (; i < end; i++) {
-      const bg = getComputedStyle(all[i]).backgroundImage;
-      if (!bg || bg === "none") continue;
-      let m;
-      URL_RE.lastIndex = 0;
-      while ((m = URL_RE.exec(bg))) {
-        if (m[2] && !m[2].startsWith("data:")) add(m[2], "image");
-      }
+      try {
+        const bg = getComputedStyle(all[i]).backgroundImage;
+        if (!bg || bg === "none") continue;
+        let m;
+        URL_RE.lastIndex = 0;
+        while ((m = URL_RE.exec(bg))) {
+          if (m[2]) add(m[2], "image");
+        }
+      } catch {}
     }
-    scanDone = end;
-    reportProgress();
+    scanDone = baseDone + end;
     if (i < all.length) {
-      if ("requestIdleCallback" in window) requestIdleCallback(step, { timeout: 80 });
-      else setTimeout(step, 80);
+      reportProgress(false, "estilos");
+      if ("requestIdleCallback" in window) requestIdleCallback(step, { timeout: 40 });
+      else setTimeout(step, 40);
+    } else {
+      scanDone = scanTotal;
+      reportProgress(true, "done");
+      notify();
     }
   }
-  step();
+  if (all.length > 0) step();
+  else {
+    scanDone = scanTotal;
+    reportProgress(true, "done");
+    notify();
+  }
 }
 
 const EMBED_PATTERNS = [
@@ -396,21 +648,73 @@ function embedInfo(src) {
 }
 
 function scanVideosAndAudio() {
+  // 1. Si la propia página actual es un vídeo de plataforma (YouTube, Vimeo, Dailymotion, etc.),
+  // registrar el vídeo canónico con su título real, thumbnail y método embed (para yt-dlp).
+  const pageEmbed = embedInfo(location.href);
+  if (pageEmbed) {
+    let title = (document.title || "").replace(/\s*-\s*YouTube$/i, "").trim() || "Vídeo de YouTube";
+    const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute("content");
+    if (ogTitle) title = ogTitle;
+    const currentVideoEl = document.querySelector("video");
+    const durSec = currentVideoEl?.duration;
+    add(location.href, "video", {
+      name: title,
+      title: title,
+      embed: pageEmbed.platform,
+      embedId: pageEmbed.id,
+      thumb: pageEmbed.thumb || (pageEmbed.id ? `https://i.ytimg.com/vi/${pageEmbed.id}/hqdefault.jpg` : null),
+      method: "embed",
+      source: "page",
+      durationSec: durSec && isFinite(durSec) ? durSec : null,
+      w: currentVideoEl?.videoWidth || null,
+      h: currentVideoEl?.videoHeight || null,
+    });
+    if (pageEmbed.id) {
+      add(`https://i.ytimg.com/vi/${pageEmbed.id}/maxresdefault.jpg`, "image", { name: `${title} (portada 1080p)` });
+      add(`https://i.ytimg.com/vi/${pageEmbed.id}/hqdefault.jpg`, "image", { name: `${title} (portada)` });
+    }
+  }
+
+  // 2. En YouTube/plataformas de vídeo: detectar enlaces a otros vídeos visibles (feed, recomendaciones)
+  if (/youtube\.com/i.test(location.hostname)) {
+    for (const a of qsaAll("a[href*='/watch?v='], a[href*='/shorts/']")) {
+      const href = a.href;
+      const emb = embedInfo(href);
+      if (emb && emb.id) {
+        const linkTitle = a.getAttribute("title") || a.getAttribute("aria-label") || (a.textContent || "").trim();
+        if (linkTitle.length > 3) {
+          add(href, "video", {
+            name: linkTitle,
+            title: linkTitle,
+            embed: "youtube",
+            embedId: emb.id,
+            thumb: emb.thumb,
+            method: "embed",
+            source: "page",
+          });
+          if (emb.thumb) {
+            add(emb.thumb, "image", { name: `${linkTitle} (miniatura)` });
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Vídeos estándar HTML5 en el DOM
   for (const v of qsaAll("video")) {
     const src = v.currentSrc || v.getAttribute("src");
+    // En YouTube: ignorar blob: efímeros del reproductor nativo porque ya tenemos la URL canónica arriba
+    if (pageEmbed && src && src.startsWith("blob:")) continue;
+
     const extra = {
       durationSec: v.duration && isFinite(v.duration) ? v.duration : null,
       w: v.videoWidth || null,
       h: v.videoHeight || null,
-      // Poster real del <video> como thumbnail del item (Bug 1: preview).
       thumb: v.poster && v.poster.startsWith("http") ? v.poster : null,
     };
     if (src) add(src, "video", extra);
     if (v.poster) add(v.poster, "image");
-    // Fallback: si el vídeo no tiene poster, capturar un frame real con canvas
-    // (el content script está en la página con sesión/Referer — evita el CORS
-    // que bloquea la captura desde el panel). Se hace en segundo plano y solo
-    // si el vídeo está cargado.
+
     if (!extra.thumb && src && v.readyState >= 2) {
       captureVideoThumb(src, v).then((dataUrl) => {
         if (!dataUrl) return;
@@ -425,6 +729,7 @@ function scanVideosAndAudio() {
       if (s.src) add(s.src, "video", extra);
     }
   }
+
   for (const a of qsaAll("audio")) {
     const src = a.currentSrc || a.getAttribute("src");
     if (src) add(src, "audio");
@@ -463,7 +768,7 @@ const OBSERVER_OPTS = {
   childList: true,
   subtree: true,
   attributes: true,
-  attributeFilter: ["src", "srcset", "data-src", "data-lazy-src", "data-original", "href"],
+  attributeFilter: ["src", "srcset", "data-src", "data-lazy-src", "data-original", "data-url", "data-image", "style", "href", "poster"],
 };
 
 // Detectar contenido cargado dinámicamente (infinite scroll, SPAs).
@@ -479,10 +784,43 @@ function ensureObserved() {
 }
 
 function fullScan() {
+  const domImgCount = qsaAll("img, picture source, svg image, canvas, meta[property*='image']").length;
+  const linkCount = qsaAll("a[href]").length;
+  const deepCount = qsaAll("figure, [data-src], [data-lazy], [data-original], [data-url], [data-image], [data-full], [data-zoom], [data-highres], [data-thumb], [data-media], [data-sources], [data-meta], [m], script[type='application/ld+json']").length;
+  const mediaCount = qsaAll("video, audio, object, embed, iframe").length;
+  const bgCandidates = getBackgroundCandidates();
+  const bgCount = bgCandidates.length;
+
+  scanTotal = domImgCount + linkCount + deepCount + mediaCount + bgCount;
+  scanDone = 0;
+  reportProgress(true, "inicio");
+
+  // Fase 1: Elementos visuales DOM
   scanImages();
+  scanDone += domImgCount;
+  reportProgress(true, "imágenes");
+
+  // Fase 2: Enlaces con parámetros anidados y alta resolución
+  scanNestedMediaLinks();
+  scanDone += Math.round(linkCount / 2);
+  reportProgress(true, "enlaces");
+
+  // Fase 3: Atributos profundos, visores dinámicos y JSON-LD
+  scanDeepElementAttributes();
+  scanJsonLd();
+  scanDone += deepCount;
+  reportProgress(true, "atributos");
+
+  // Fase 4: Descargas directas y elementos multimedia (vídeo/audio/embeds)
   scanDownloadLinks();
   scanVideosAndAudio();
-  scanBackgroundImages();
+  scanDone += (linkCount - Math.round(linkCount / 2)) + mediaCount;
+  reportProgress(true, "medios");
+
+  // Fase 5: Estilos y fondos CSS con fluid steps
+  const baseDone = scanDone;
+  scanBackgroundImages(bgCandidates, baseDone, scanTotal);
+
   ensureObserved(); // vigilar también los shadow roots descubiertos
   notify();
 }
@@ -518,6 +856,20 @@ function handleUserClick(ev) {
 // Captura de clicks a nivel de documento (capture: también dentro de shadow
 // roots / iframes same-origin). No interfiere con el comportamiento normal.
 document.addEventListener("click", handleUserClick, { capture: true, passive: true });
+
+// Eventos de navegación SPA en YouTube y sitios dinámicos
+window.addEventListener("yt-navigate-finish", () => {
+  setTimeout(() => {
+    fullScan();
+    ensureObserved();
+  }, 400);
+});
+window.addEventListener("popstate", () => {
+  setTimeout(() => {
+    fullScan();
+    ensureObserved();
+  }, 400);
+});
 
 // --- Auto-scroll activo (estilo ImageEye) ---
 // Recorre la página hacia abajo en saltos de viewport, espera a que el
@@ -632,6 +984,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     );
     return true; // respuesta asíncrona
   }
+  if (msg?.type === "rec-start" || msg?.type === "rec-stop" || msg?.type === "rec-cancel") {
+    // Puente SW → recorder (mundo MAIN) vía postMessage entre mundos.
+    const cmd = msg.type === "rec-start" ? "start" : msg.type === "rec-stop" ? "stop" : "cancel";
+    const installed = !!window.__operantRecorderInstalled;
+    if (installed) {
+      window.postMessage({ __operantRecCmd: true, cmd }, "*");
+    }
+    sendResponse({ ok: true, installed });
+    return;
+  }
+});
+
+// --- Puente del modo grabación: recorder (mundo MAIN) → SW ---
+// Todos los mensajes del recorder llevan __operantRec (los comandos del otro
+// sentido llevan __operantRecCmd y no se retransmiten).
+window.addEventListener("message", (event) => {
+  if (event.source !== window) return;
+  const msg = event.data;
+  if (!msg || !msg.__operantRec) return;
+  chrome.runtime.sendMessage({ type: "rec-relay", payload: msg }).catch(() => {});
 });
 
 // Escaneo inicial (document_idle: DOM ya disponible).
@@ -694,10 +1066,26 @@ function loadOverlayPrefs() {
 // ¿El elemento es elegible para mostrar el overlay según los filtros
 // configurables (tamaño mínimo y exclusión de SVG)?
 function overlayTargetEligible(el) {
-  if (overlayMinSize > 0) {
-    const r = el.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0 && Math.min(r.width, r.height) < overlayMinSize) return false;
+  // Las imágenes pequeñas (iconos, avatares, badges, botones <120px) nunca deben activar el hover overlay.
+  const effectiveMin = overlayMinSize > 0 ? overlayMinSize : 120;
+  const r = el.getBoundingClientRect();
+
+  // Si no está renderizado o sus dimensiones en pantalla son menores al umbral, descartar
+  if (r.width <= 0 || r.height <= 0) return false;
+  if (r.width < effectiveMin || r.height < effectiveMin) return false;
+
+  if (el instanceof HTMLImageElement) {
+    // Si las dimensiones intrínsecas de la imagen son menores al umbral, descartar
+    if (el.naturalWidth > 0 && el.naturalWidth < effectiveMin) return false;
+    if (el.naturalHeight > 0 && el.naturalHeight < effectiveMin) return false;
+
+    // Descartar favicons, avatares e iconos por heurística de URL
+    const src = (el.currentSrc || el.src || "").toLowerCase();
+    if (/(avatar|favicon|\/icon|badge|emoji)/i.test(src)) {
+      if (r.width < 160 || r.height < 160) return false;
+    }
   }
+
   if (overlayIgnoreSvg) {
     // SVG directo (elemento <svg> o <img src="*.svg">): iconos/logos, se ignoran.
     if (el instanceof SVGSVGElement) return false;
@@ -725,12 +1113,12 @@ let overlayTargetRect = null;
 // En navegadores sin soporte, se usa el fallback JS (getBoundingClientRect +
 // scroll listener) dentro del MISMO estilo, bajo `@supports not`.
 // Soporte detectado en runtime. Para testing/fallback forzado, el documento
-// puede desactivarlo con <html data-nt-no-anchors> (lo lee el content script).
+// puede desactivarlo con <html data-operant-no-anchors> (lo lee el content script).
 const supportsAnchorPositioning =
   typeof CSS !== "undefined" &&
   !!CSS.supports &&
-  CSS.supports("anchor-name", "--nt-test") &&
-  !(document.documentElement && document.documentElement.hasAttribute("data-nt-no-anchors"));
+  CSS.supports("anchor-name", "--operant-test") &&
+  !(document.documentElement && document.documentElement.hasAttribute("data-operant-no-anchors"));
 // Nombre de ancla del target actual (solo en modo nativo). Se asigna al
 // elemento detectado bajo el cursor y lo referencia el overlay.
 let overlayAnchorName = null;
@@ -740,14 +1128,14 @@ const overlayAnchorCache = new WeakMap(); // elemento -> anchor-name (no re-asig
 function ensurePageOverlay() {
   if (pageOverlay) return pageOverlay;
   pageOverlay = document.createElement("div");
-  pageOverlay.id = "nt-page-overlay";
-  pageOverlay.setAttribute("data-nt", "1");
+  pageOverlay.id = "operant-page-overlay";
+  pageOverlay.setAttribute("data-operant", "1");
   // Modo nativo: atributo para que el CSS aplique el posicionamiento por ancla.
   if (supportsAnchorPositioning) pageOverlay.setAttribute("data-anchored", "1");
   // El propio overlay actúa como ancla del popover (el popover se abre debajo
-  // de los iconos). Nombre fijo: el popover lo referencia como --nt-ov-anchor.
+  // de los iconos). Nombre fijo: el popover lo referencia como --operant-ov-anchor.
   try {
-    pageOverlay.style.setProperty("anchor-name", "--nt-ov-anchor");
+    pageOverlay.style.setProperty("anchor-name", "--operant-ov-anchor");
   } catch {
     /* navegador sin soporte */
   }
@@ -761,7 +1149,7 @@ function ensurePageOverlay() {
 function overlayAnchorNameFor(el) {
   const cached = overlayAnchorCache.get(el);
   if (cached) return cached;
-  const name = `--nt-anchor-${++overlayAnchorSeq}`;
+  const name = `--operant-anchor-${++overlayAnchorSeq}`;
   overlayAnchorCache.set(el, name);
   try {
     el.style.setProperty("anchor-name", name);
@@ -958,26 +1346,26 @@ function blobToBase64(blob) {
 // arriba si no hay espacio abajo, y alineado a la derecha si no hay espacio
 // a la izquierda. Cierra con click fuera, Escape o al elegir una opción.
 // CRÍTICO: un único par de listeners de documento, añadidos UNA vez, que
-// consultan el popover actual (ntPopover). Así no quedan listeners huérfanos
+// consultan el popover actual (operantPopover). Así no quedan listeners huérfanos
 // de aperturas anteriores que cierren el popover nuevo (bug "solo funciona
 // la primera vez").
-let ntPopover = null;
+let operantPopover = null;
 
-function closeNtPopover() {
-  if (ntPopover && ntPopover.isConnected) {
-    ntPopover.removeAttribute("data-anchored");
-    ntPopover.remove();
+function closeOperantPopover() {
+  if (operantPopover && operantPopover.isConnected) {
+    operantPopover.removeAttribute("data-anchored");
+    operantPopover.remove();
   }
-  ntPopover = null;
+  operantPopover = null;
 }
 
 // Listener único de cierre (click fuera / Escape). Se añade una sola vez.
-function ntPopoverDocHandler(ev) {
-  const pop = ntPopover;
+function operantPopoverDocHandler(ev) {
+  const pop = operantPopover;
   if (!pop) return;
   if (ev.type === "keydown") {
     if (ev.key === "Escape") {
-      closeNtPopover();
+      closeOperantPopover();
       return;
     }
     return;
@@ -992,7 +1380,7 @@ function ntPopoverDocHandler(ev) {
   // intermedio (o el popover acaba de moverse). Comprobar también la posición
   // del puntero respecto al rect del popover y del overlay.
   if (ev.target instanceof Node && pop.contains(ev.target)) return;
-  if (ntPopoverAnchor && ev.target instanceof Node && ntPopoverAnchor.contains(ev.target)) return;
+  if (operantPopoverAnchor && ev.target instanceof Node && operantPopoverAnchor.contains(ev.target)) return;
   if (typeof ev.clientX === "number") {
     if (overlayInPopover(ev.clientX, ev.clientY)) return;
     const ov = pageOverlay;
@@ -1001,21 +1389,21 @@ function ntPopoverDocHandler(ev) {
       if (r.width > 0 && r.height > 0 && inRect(ev.clientX, ev.clientY, r)) return;
     }
   }
-  closeNtPopover();
+  closeOperantPopover();
 }
-let ntPopoverAnchor = null;
-document.addEventListener("pointerdown", ntPopoverDocHandler, true);
-document.addEventListener("keydown", ntPopoverDocHandler, true);
+let operantPopoverAnchor = null;
+document.addEventListener("pointerdown", operantPopoverDocHandler, true);
+document.addEventListener("keydown", operantPopoverDocHandler, true);
 
-function openNtPopover(anchor, buildContent) {
-  closeNtPopover();
-  ntPopoverAnchor = anchor;
+function openOperantPopover(anchor, buildContent) {
+  closeOperantPopover();
+  operantPopoverAnchor = anchor;
   const pop = document.createElement("div");
-  pop.id = "nt-popover";
-  pop.className = "nt-popover";
+  pop.id = "operant-popover";
+  pop.className = "operant-popover";
   buildContent(pop);
   document.documentElement.appendChild(pop);
-  ntPopover = pop;
+  operantPopover = pop;
   // Posicionamiento adaptativo (getBoundingClientRect del ancla y viewport).
   // En modo nativo, el popover se ancla al OVERLAY DE ICONOS (pageOverlay),
   // NO a la imagen/vídeo: así queda justo debajo de los botones, como el
@@ -1046,20 +1434,20 @@ function openNtPopover(anchor, buildContent) {
 }
 
 function searchMenuFor(imageUrl, sourceEl) {
-  openNtPopover(sourceEl, (pop) => {
+  openOperantPopover(sourceEl, (pop) => {
     const title = document.createElement("div");
-    title.className = "nt-pop-title";
+    title.className = "operant-pop-title";
     title.textContent = "Buscar imagen similar";
     pop.appendChild(title);
     const list = document.createElement("div");
-    list.className = "nt-pop-list";
+    list.className = "operant-pop-list";
     for (const eng of SEARCH_ENGINES) {
       const item = document.createElement("button");
       item.type = "button";
-      item.className = "nt-pop-item";
+      item.className = "operant-pop-item";
       item.textContent = eng.name;
       item.addEventListener("click", () => {
-        closeNtPopover();
+        closeOperantPopover();
         openSearchEngine(eng, imageUrl);
       });
       list.appendChild(item);
@@ -1099,20 +1487,20 @@ async function copyImageToClipboard(imgEl) {
 // Muestra un aviso transparente de subida temporal; si el usuario prefiere
 // no subir, ofrece copiar al portapapeles para pegar manualmente.
 function confirmUploadThenSearch(sourceEl, anchor, what) {
-  openNtPopover(anchor, (pop) => {
+  openOperantPopover(anchor, (pop) => {
     const title = document.createElement("div");
-    title.className = "nt-pop-title";
+    title.className = "operant-pop-title";
     title.textContent = `Buscar ${what} similar`;
     pop.appendChild(title);
     const note = document.createElement("div");
-    note.className = "nt-pop-note";
+    note.className = "operant-pop-note";
     note.textContent = `Para buscar este ${what}, se subirá temporalmente a un servicio de alojamiento de imágenes anónimo (Litterbox, expira en 1h). ¿Continuar?`;
     pop.appendChild(note);
     const row = document.createElement("div");
-    row.className = "nt-pop-row";
+    row.className = "operant-pop-row";
     const uploadBtn = document.createElement("button");
     uploadBtn.type = "button";
-    uploadBtn.className = "nt-pop-item nt-pop-primary";
+    uploadBtn.className = "operant-pop-item operant-pop-primary";
     uploadBtn.textContent = "Subir y buscar";
     uploadBtn.addEventListener("click", async () => {
       uploadBtn.disabled = true;
@@ -1120,7 +1508,7 @@ function confirmUploadThenSearch(sourceEl, anchor, what) {
       try {
         const blob = await captureElementToPng(sourceEl);
         const hosted = await uploadToTmpHost(blob);
-        closeNtPopover();
+        closeOperantPopover();
         searchMenuFor(hosted, anchor);
       } catch (e) {
         uploadBtn.disabled = false;
@@ -1130,13 +1518,13 @@ function confirmUploadThenSearch(sourceEl, anchor, what) {
     });
     const copyBtn = document.createElement("button");
     copyBtn.type = "button";
-    copyBtn.className = "nt-pop-item";
+    copyBtn.className = "operant-pop-item";
     copyBtn.textContent = "Copiar al portapapeles";
     copyBtn.addEventListener("click", async () => {
       try {
         const blob = await captureElementToPng(sourceEl);
         await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-        closeNtPopover();
+        closeOperantPopover();
         toastMsg("Fotograma copiado — pégalo en el buscador");
       } catch (e) {
         toastMsg(e.message || "No se pudo copiar");
@@ -1180,18 +1568,18 @@ async function captureElementToPng(sourceEl) {
 }
 
 // Toast breve del overlay (feedback visual de acciones como copiar).
-let ntToastTimer = null;
+let operantToastTimer = null;
 function toastMsg(msg) {
-  let el = document.getElementById("nt-overlay-toast");
+  let el = document.getElementById("operant-overlay-toast");
   if (!el) {
     el = document.createElement("div");
-    el.id = "nt-overlay-toast";
+    el.id = "operant-overlay-toast";
     document.documentElement.appendChild(el);
   }
   el.textContent = msg;
   el.classList.add("show");
-  clearTimeout(ntToastTimer);
-  ntToastTimer = setTimeout(() => el.classList.remove("show"), 1800);
+  clearTimeout(operantToastTimer);
+  operantToastTimer = setTimeout(() => el.classList.remove("show"), 1800);
 }
 
 // Botones según el tipo del elemento bajo el ratón (exhaustivo, con iconos).
@@ -1298,7 +1686,7 @@ function overlayButtonsFor(el) {
         }
         if (!url) return;
         // Primero intentar la descarga DESDE LA PÁGINA (fetch con cookies y
-        // Referer de sesión — necesario para CDNs con anti-hotlink como erome,
+        // Referer de sesión — necesario para servidores con anti-hotlink por Referer,
         // que devuelven 403/410 al SW o al download directo). Si falla, el
         // fallback interno envía overlay-download al SW.
         overlayDownloadInPage(url, "");
@@ -1372,7 +1760,7 @@ async function overlayCaptureFrame(el, mime) {
 
 // Descarga DESDE EL CONTEXTO DE EXTENSIÓN (el SW), nunca desde la página:
 // un fetch aquí (content script) comparte la pila de red de la página y queda
-// sujeto a CORS real — por eso erome (v15.erome.com) bloqueaba la lectura con
+// sujeto a CORS real — por eso los servidores con comprobación estricta de cabecera bloqueaban la lectura con
 // "ERR_FAILED". El SW con <all_urls> no tiene CORS y declarativeNetRequest le
 // inyecta el Referer de la página (regla efímera por descarga). El blob vuelve
 // al panel vía download-blob -> chrome.downloads.
@@ -1402,7 +1790,7 @@ function showPageOverlay(el) {
   if (!btns.length) return;
   const ov = ensurePageOverlay();
   ov.textContent = "";
-  ov.classList.remove("nt-ov-busy");
+  ov.classList.remove("operant-ov-busy");
   // El botón de descarga (el primero, para vídeo) puede mostrar el indicador
   // de motion design compartido (anillo indeterminado → check) durante la
   // descarga, en vez del icono estático + giro genérico.
@@ -1410,17 +1798,18 @@ function showPageOverlay(el) {
     const b = btns[i];
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "nt-ov-btn";
+    btn.className = "operant-ov-btn";
     btn.title = b.label; // tooltip NATIVO del navegador (sin duplicados custom)
     btn.setAttribute("aria-label", b.label);
     // Acción principal sugerida: el primer botón (descargar) con tratamiento
     // destacado consistente (fondo morado suave + texto blanco).
-    if (i === 0) btn.classList.add("nt-ov-primary");
+    if (i === 0) btn.classList.add("operant-ov-primary");
     let indicator = null;
-    if (i === 0 && window.NTDLIndicator && b.label.startsWith("Descargar")) {
+    const DLInd = window.OperantDLIndicator || window.NTDLIndicator;
+    if (i === 0 && DLInd && b.label.startsWith("Descargar")) {
       // Indicador dentro del botón: idle (flecha) → anillo → check.
-      indicator = new window.NTDLIndicator(btn, { size: "sm" });
-      btn.classList.add("nt-dl-host");
+      indicator = new DLInd(btn, { size: "sm" });
+      btn.classList.add("operant-dl-host");
     } else {
       btn.innerHTML = b.icon;
     }
@@ -1440,8 +1829,8 @@ function showPageOverlay(el) {
       // Prevención de errores: marcar el overlay como ocupado (el indicador
       // muestra el anillo de progreso), NO ocultarlo al instante — así el
       // usuario ve el feedback y un segundo click no puede repetir la acción.
-      if (ov.classList.contains("nt-ov-busy")) return;
-      ov.classList.add("nt-ov-busy");
+      if (ov.classList.contains("operant-ov-busy")) return;
+      ov.classList.add("operant-ov-busy");
       if (indicator) {
         indicator.setProgress(undefined); // indeterminado: anillo rotando
       }
@@ -1483,7 +1872,7 @@ function positionPageOverlay() {
   // Target desconectado (imagen eliminada del DOM): ocultar en vez de dejar
   // el overlay colgado en una posición muerta (reactividad estricta).
   if (!pageOverlayTarget.isConnected) {
-    closeNtPopover();
+    closeOperantPopover();
     hidePageOverlay();
     return;
   }
@@ -1585,25 +1974,25 @@ function inRect(x, y, r) {
 
 // ¿El punto está dentro del rect del popover (con un margen de tolerancia
 // para el hueco entre el botón ancla y el menú)? (Si no está en el DOM, false.)
-const NT_POPOVER_HOVER_MARGIN = 10;
+const OPERANT_POPOVER_HOVER_MARGIN = 10;
 function overlayInPopover(x, y) {
-  const pop = ntPopover;
+  const pop = operantPopover;
   if (!pop || !pop.isConnected) return false;
   const r = pop.getBoundingClientRect();
   if (r.width <= 0 || r.height <= 0) return false;
-  return inRect(x, y, rectExpanded(r, NT_POPOVER_HOVER_MARGIN));
+  return inRect(x, y, rectExpanded(r, OPERANT_POPOVER_HOVER_MARGIN));
 }
 
 function handleOverlayMove(x, y) {
   if (!overlayAllowedFor(location)) return;
   // Mientras el overlay esté "ocupado" (acción en curso tras un click),
   // no ocultarlo: el feedback de procesando debe completarse.
-  if (pageOverlay && !pageOverlay.hidden && pageOverlay.classList.contains("nt-ov-busy")) return;
+  if (pageOverlay && !pageOverlay.hidden && pageOverlay.classList.contains("operant-ov-busy")) return;
   const el = overlayAtPoint(x, y);
   if (!(el instanceof Element)) return;
 
   // Si el cursor está sobre el propio overlay, mantenerlo (y su popover).
-  if (el.closest("#nt-page-overlay")) {
+  if (el.closest("#operant-page-overlay")) {
     positionPageOverlay();
     return;
   }
@@ -1611,13 +2000,13 @@ function handleOverlayMove(x, y) {
   // separado del botón por un margen: al mover el ratón del botón al menú,
   // el punto cae en el hueco. Si el hueco cae dentro del rect EXPANDIDO del
   // popover, seguimos considerándolo "sobre el popover" (hover tolerante).
-  if (el.closest("#nt-popover") || overlayInPopover(x, y)) {
+  if (el.closest("#operant-popover") || overlayInPopover(x, y)) {
     return;
   }
 
   // El cursor salió del overlay y del popover: cerrar el popover
   // INMEDIATAMENTE (sin delay) — reactividad estricta al salir del hover.
-  if (ntPopover) closeNtPopover();
+  if (operantPopover) closeOperantPopover();
 
   let target = overlayFindTarget(el);
   if (!target) {
@@ -1709,7 +2098,7 @@ function overlayAnchorVisible(el) {
   const hit = overlayAtPoint(cx, cy);
   if (!hit) return true; // sin elemento: nada que oculte
   if (hit === el || el.contains(hit) || hit.contains(el)) return true;
-  if (hit.closest("#nt-page-overlay") || hit.closest("#nt-popover")) return true;
+  if (hit.closest("#operant-page-overlay") || hit.closest("#operant-popover")) return true;
   // Oclusión real: un elemento fijo/sticky (header, modal) tapa el centro.
   try {
     const pos = getComputedStyle(hit).position;
@@ -1803,14 +2192,15 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-// Estilos del overlay (aislados con prefijo nt- para no chocar con la página).
+// Estilos del overlay (aislados con prefijo operant- para no chocar con la página).
 // Diseño milimétrico: contenedor compacto, transparencia base, hover estable
 // (sin scale que tambalee), animación de pulsación sobria y feedback de acción.
 // Incluye el CSS del indicador de descarga compartido (anillo/check/error).
-if (!document.getElementById("nt-page-overlay-style")) {
+if (!document.getElementById("operant-page-overlay-style")) {
   const style = document.createElement("style");
-  style.id = "nt-page-overlay-style";
-  style.textContent = (window.NTDLIndicatorCSS ? window.NTDLIndicatorCSS() : "") + `
+  style.id = "operant-page-overlay-style";
+  const indCss = window.OperantDLIndicatorCSS || window.NTDLIndicatorCSS;
+  style.textContent = (indCss ? indCss() : "") + `
     /* Modo NATIVO: CSS Anchor Positioning (Chrome 125+).
        El overlay se posiciona relativo al ancla (imagen/vídeo bajo el cursor)
        con anchor() y position-anchor. El motor de renderizado mueve el
@@ -1818,9 +2208,9 @@ if (!document.getElementById("nt-page-overlay-style")) {
        perfecta, sin JS en el camino. El offset de 8-10px se aplica con margin
        para no chocar con el top/left del fallback JS (que no debe existir
        aquí). */
-    #nt-page-overlay[data-anchored="1"] {
+    #operant-page-overlay[data-anchored="1"] {
       position: fixed;
-      position-anchor: var(--nt-anchor-none); /* se sobreescribe por JS con el nombre real */
+      position-anchor: var(--operant-anchor-none); /* se sobreescribe por JS con el nombre real */
       top: anchor(top);
       left: anchor(left);
       margin: 10px 0 0 10px; /* desplazamiento de 8-12px respecto al ancla */
@@ -1832,77 +2222,77 @@ if (!document.getElementById("nt-page-overlay-style")) {
        JS (getBoundingClientRect + scroll listener) que posiciona el overlay
        con top/left inline. Se resetea el margin del modo nativo (allí el
        offset de 10px ya está en el top/left inline). */
-    @supports not (anchor-name: --nt-test) {
-      #nt-page-overlay {
+    @supports not (anchor-name: --operant-test) {
+      #operant-page-overlay {
         position: fixed;
         top: 8px;
         left: 8px;
         margin: 0;
       }
     }
-    #nt-page-overlay {
+    #operant-page-overlay {
       z-index: 2147483647;
       display: flex;
       flex-direction: row;
-      gap: 6px; /* gap UNIFORME entre todos los botones */
-      padding: 4px;
-      background: rgba(15, 23, 42, 0.62);
-      border: 1px solid rgba(148, 163, 184, 0.28);
-      border-radius: 7px;
-      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
-      backdrop-filter: blur(5px);
-      -webkit-backdrop-filter: blur(5px);
-      opacity: 0.88;
-      transition: opacity 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+      gap: 3px;
+      padding: 3px;
+      background: rgba(18, 18, 20, 0.78);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 6px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.2);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      opacity: 0.92;
+      transition: opacity 0.14s ease, background 0.14s ease, box-shadow 0.14s ease;
     }
-    #nt-page-overlay:hover {
+    #operant-page-overlay:hover {
       opacity: 1;
-      background: rgba(15, 23, 42, 0.88);
-      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+      background: rgba(18, 18, 20, 0.92);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
     }
-    #nt-page-overlay[hidden] { display: none; }
-    #nt-page-overlay .nt-ov-btn {
+    #operant-page-overlay[hidden] { display: none; }
+    #operant-page-overlay .operant-ov-btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 24px;
-      height: 24px;
+      width: 22px;
+      height: 22px;
       padding: 0;
       border: none;
-      border-radius: 5px;
+      border-radius: 4px;
       background: transparent;
-      color: rgba(226, 232, 240, 0.8);
+      color: rgba(240, 240, 242, 0.85);
       cursor: pointer;
       transition: background 0.12s ease, color 0.12s ease;
     }
-    #nt-page-overlay .nt-ov-btn:hover {
-      background: rgba(139, 92, 246, 0.45);
+    #operant-page-overlay .operant-ov-btn:hover {
+      background: rgba(224, 78, 57, 0.35);
       color: #fff;
     }
-    #nt-page-overlay .nt-ov-btn:active {
-      background: rgba(139, 92, 246, 0.65);
+    #operant-page-overlay .operant-ov-btn:active {
+      background: rgba(224, 78, 57, 0.55);
     }
     /* Acción principal sugerida (primer botón, descargar): tratamiento
        destacado consistente con el hover, para guiar al usuario. */
-    #nt-page-overlay .nt-ov-btn.nt-ov-primary {
-      background: rgba(139, 92, 246, 0.3);
+    #operant-page-overlay .operant-ov-btn.operant-ov-primary {
+      background: rgba(224, 78, 57, 0.22);
       color: #fff;
     }
-    #nt-page-overlay .nt-ov-btn svg {
+    #operant-page-overlay .operant-ov-btn svg {
       display: block;
-      width: 15px;
-      height: 15px;
+      width: 13px;
+      height: 13px;
     }
     /* Pulsación sobria al hacer click: micro-scale SIMÉTRICO y MONÓTONO
        (sin overshoot ni rebote — el overshoot tambalea el icono). El
        transform-origin centrado evita desplazamiento subpixel. */
-    #nt-page-overlay .nt-ov-btn svg {
+    #operant-page-overlay .operant-ov-btn svg {
       transform-origin: center center;
     }
-    #nt-page-overlay .nt-ov-btn:active svg {
-      animation: nt-ov-press 0.18s cubic-bezier(0.25, 0.1, 0.25, 1);
+    #operant-page-overlay .operant-ov-btn:active svg {
+      animation: operant-ov-press 0.18s cubic-bezier(0.25, 0.1, 0.25, 1);
     }
-    @keyframes nt-ov-press {
+    @keyframes operant-ov-press {
       0% { transform: scale(1); }
       45% { transform: scale(0.85); }
       100% { transform: scale(1); }
@@ -1910,16 +2300,16 @@ if (!document.getElementById("nt-page-overlay-style")) {
     /* Mientras el overlay está ocupado (descarga en curso), los botones no
        responden a clicks duplicados — SIN rotar los iconos. El anillo de
        progreso del indicador (dl-indicator.js) es lo único que anima. */
-    #nt-page-overlay.nt-ov-busy .nt-ov-btn {
+    #operant-page-overlay.operant-ov-busy .operant-ov-btn {
       pointer-events: none;
     }
     /* Popover inteligente (búsqueda inversa / confirmación de subida).
-       En modo nativo se posiciona relativo al OVERLAY DE ICONOS (--nt-ov-anchor),
+       En modo nativo se posiciona relativo al OVERLAY DE ICONOS (--operant-ov-anchor),
        NO a la imagen: queda justo debajo de los botones, como el fallback JS.
        Reposiciona automáticamente cerca de bordes con position-try-fallbacks. */
-    #nt-popover[data-anchored="1"] {
+    #operant-popover[data-anchored="1"] {
       position: fixed;
-      position-anchor: --nt-ov-anchor;
+      position-anchor: --operant-ov-anchor;
       top: anchor(bottom);
       left: anchor(left);
       /* Reposicionamiento automático si no cabe: abrir hacia arriba, o
@@ -1931,13 +2321,13 @@ if (!document.getElementById("nt-page-overlay-style")) {
       margin: 8px 0 0 0;
       position-visibility: anchors-visible;
     }
-    @supports not (anchor-name: --nt-test) {
-      #nt-popover {
+    @supports not (anchor-name: --operant-test) {
+      #operant-popover {
         position: fixed;
         margin: 0;
       }
     }
-    #nt-popover {
+    #operant-popover {
       z-index: 2147483646;
       min-width: 160px;
       max-width: 260px;
@@ -1950,25 +2340,25 @@ if (!document.getElementById("nt-page-overlay-style")) {
       padding: 6px;
       font: 12px/1.4 system-ui, sans-serif;
       color: #e2e8f0;
-      animation: nt-pop-in 0.12s ease-out;
+      animation: operant-pop-in 0.12s ease-out;
     }
-    @keyframes nt-pop-in {
+    @keyframes operant-pop-in {
       from { opacity: 0; transform: translateY(-3px); }
       to { opacity: 1; transform: translateY(0); }
     }
-    #nt-popover .nt-pop-title {
+    #operant-popover .operant-pop-title {
       font-weight: 600;
       color: #cbd5e1;
       padding: 4px 6px 6px;
       border-bottom: 1px solid rgba(148, 163, 184, 0.15);
       margin-bottom: 4px;
     }
-    #nt-popover .nt-pop-list {
+    #operant-popover .operant-pop-list {
       display: flex;
       flex-direction: column;
       gap: 1px;
     }
-    #nt-popover .nt-pop-item {
+    #operant-popover .operant-pop-item {
       display: block;
       width: 100%;
       text-align: left;
@@ -1981,34 +2371,34 @@ if (!document.getElementById("nt-page-overlay-style")) {
       cursor: pointer;
       transition: background 0.1s ease;
     }
-    #nt-popover .nt-pop-item:hover {
-      background: rgba(139, 92, 246, 0.35);
+    #operant-popover .operant-pop-item:hover {
+      background: rgba(224, 78, 57, 0.3);
       color: #fff;
     }
-    #nt-popover .nt-pop-item:disabled {
+    #operant-popover .operant-pop-item:disabled {
       opacity: 0.6;
       cursor: default;
     }
-    #nt-popover .nt-pop-primary {
-      background: rgba(139, 92, 246, 0.4);
+    #operant-popover .operant-pop-primary {
+      background: rgba(224, 78, 57, 0.35);
       color: #fff;
       font-weight: 600;
     }
-    #nt-popover .nt-pop-primary:hover {
-      background: rgba(139, 92, 246, 0.55);
+    #operant-popover .operant-pop-primary:hover {
+      background: rgba(224, 78, 57, 0.5);
     }
-    #nt-popover .nt-pop-note {
+    #operant-popover .operant-pop-note {
       padding: 4px 6px 8px;
       color: #94a3b8;
       line-height: 1.45;
     }
-    #nt-popover .nt-pop-row {
+    #operant-popover .operant-pop-row {
       display: flex;
       flex-direction: column;
       gap: 3px;
     }
     /* Toast del overlay (feedback de copiar / errores). */
-    #nt-overlay-toast {
+    #operant-overlay-toast {
       position: fixed;
       bottom: 24px;
       left: 50%;
@@ -2025,7 +2415,7 @@ if (!document.getElementById("nt-page-overlay-style")) {
       pointer-events: none;
       transition: opacity 0.18s ease, transform 0.18s ease;
     }
-    #nt-overlay-toast.show {
+    #operant-overlay-toast.show {
       opacity: 1;
       transform: translateX(-50%) translateY(-4px);
     }

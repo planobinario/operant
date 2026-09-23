@@ -14,7 +14,11 @@ import tempfile
 import threading
 import time
 
-HOST = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "native-host", "operant_host.py"))
+RUST_HOST = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "native-host", "operant-host.exe"))
+PY_HOST = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "native-host", "operant_host.py"))
+USE_RUST = os.path.isfile(RUST_HOST) and ("--python" not in sys.argv)
+HOST_BIN = RUST_HOST if USE_RUST else PY_HOST
+
 FIXTURES_SERVER = os.path.join(os.path.dirname(__file__), "fixtures-server.js")
 FIXTURES_PORT = 18765
 FIXTURE_M3U8 = f"http://localhost:{FIXTURES_PORT}/media/stream.m3u8"
@@ -42,8 +46,9 @@ class Host:
     def __init__(self, bin_dir):
         env = dict(os.environ)
         env["OPERANT_BIN"] = bin_dir
+        cmd = [HOST_BIN] if USE_RUST else [sys.executable, HOST_BIN]
         self.p = subprocess.Popen(
-            [sys.executable, HOST], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, env=env,
         )
         self.q = queue.Queue()
@@ -112,7 +117,7 @@ def format_size(b):
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="nt-host-e2e-")
+    tmp = tempfile.mkdtemp(prefix="operant-host-e2e-")
 
     # Arranca el servidor de fixtures en un puerto dedicado y espera a que responda.
     server = subprocess.Popen(
@@ -201,8 +206,13 @@ def main():
         yt = msg["tools"]["ytDlp"]
         report("version real detectada (2026.x)", bool(yt["version"]) and yt["version"].startswith("20"),
                f"-> v{yt['version']} source={yt['source']}")
-        report("updateAvailable=False en la ultima version", yt["updateAvailable"] is False,
-               f"-> ultima {yt.get('latestVersion')}")
+        if SKIP_YTDLP:
+            expected_update = yt.get("version") != yt.get("latestVersion")
+            report("updateAvailable coherente con la version del sistema", yt["updateAvailable"] == expected_update,
+                   f"-> v{yt.get('version')} vs ultima {yt.get('latestVersion')} (update={yt['updateAvailable']})")
+        else:
+            report("updateAvailable=False en la ultima version", yt["updateAvailable"] is False,
+                   f"-> ultima {yt.get('latestVersion')}")
         h.close()
 
         print("== 6. Descarga real de ffmpeg (gyan.dev, ~100 MB) ==")

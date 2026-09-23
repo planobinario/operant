@@ -94,7 +94,7 @@ def write_fake_tool(bin_dir, name, body):
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="nt-host-linux-")
+    tmp = tempfile.mkdtemp(prefix="operant-host-linux-")
 
     print("== 1. Deteccion: fakes sin extension en app-bin ==")
     write_fake_tool(tmp, "yt-dlp", 'echo 2021.05.05')

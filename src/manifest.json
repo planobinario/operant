@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Operant — Media Engine & Browser Agent",
   "version": "0.4.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2h3iu7JEva02JLCRAHOpEwk5fDU/7tP3QbLxD3lr8EjyutB5LhT+6MTAiRbuPbnSPO8AN9sY8oaBXShuhktmm4lpQgbfyzD+NLuaX7sHaWu5RBBxlPAmwHF19ItOqCgOp/2QH8cMhADT32pyHeQFrL3/oEjrA1WT0l2RjB6Vprzj8d49cY6KL2br4DczZS/BXzDJ8oVm7YhhOXCe6OKQH65tSyKhxm+/Svw6xGPV0+xtQ9xBA0vyO7TVxQjvuUzr6AAuAgobnfz+pu/JXCa084eLodXtnoBsUIYM7X/5k76Iny3QmlrtXZ/VyAWzEdo6UrgnSR1o2FeFz6FHlZ8a8QIDAQAB",
   "description": "Panel lateral avanzado para inspección, extracción y procesado de medios con ffmpeg, yt-dlp y Native Messaging.",
   "permissions": [
     "storage",
@@ -46,6 +47,16 @@
         "content.js"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "recorder-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "browser_specific_settings": {

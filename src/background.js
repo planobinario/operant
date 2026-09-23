@@ -6,7 +6,7 @@
 //   4. Comunicarse con el host nativo (yt-dlp/ffmpeg) vía Native Messaging.
 
 // ÚNICA FUENTE DE VERDAD de detección/descarga (compartida con el panel).
-import { NTMedia } from "./shared/media-core.js";
+import { OperantMedia } from "./shared/media-core.js";
 // Ruta rápida HLS 100% en navegador (mismo motor que ejecuta el panel):
 // parseo m3u8 + fetch paralelo + AES-128 (WebCrypto) + concat fMP4/TS.
 import { HLSFast } from "./shared/hls-fast.js";
@@ -165,8 +165,9 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
-// Badge con el nº de medios de la pestaña activa.
-chrome.action.setBadgeBackgroundColor({ color: "#3f3f46" }).catch(() => {});
+// Badge con el nº de medios de la pestaña activa (acento de marca).
+chrome.action.setBadgeBackgroundColor({ color: "#f2554d" }).catch(() => {});
+chrome.action.setBadgeTextColor({ color: "#ffffff" }).catch(() => {});
 
 function updateBadge(tabId) {
   const tab = tabs.get(tabId);
@@ -195,6 +196,7 @@ chrome.webNavigation?.onCommitted.addListener(
       `[operant-sw] NAVIGATION tabId=${tabId} oldItems=${oldCount} url=${details.url.slice(0, 90)} (onCommitted)`
     );
     chrome.storage.session.remove(keyFor(tabId)).catch(() => {});
+    updateBadge(tabId); // el badge no debe quedar rancio tras navegar
     // Avisa al panel para que no muestre la caché vieja mientras escanea.
     chrome.runtime
       .sendMessage({ type: "tab-navigated", tabId, url: details.url })
@@ -213,6 +215,7 @@ chrome.webNavigation?.onHistoryStateUpdated.addListener(
     // SPA: el content script sigue vivo. Se le pide reiniciar su store para
     // no arrastrar items de la vista anterior.
     chrome.tabs.sendMessage(tabId, { type: "reset-state" }).catch(() => {});
+    updateBadge(tabId);
   },
   { url: [{ schemes: ["http", "https"] }] }
 );
@@ -325,10 +328,10 @@ chrome.webRequest.onBeforeRequest.addListener(
 //      ya cargó el recurso y registró encodedBodySize — sin petición extra.
 //   1. GET real + blob.size: cuenta los bytes recibidos, preciso aunque el
 //      servidor no mande Content-Length (gstatic/Google Images funcionan así).
-//   1.5. GET con Referer vía DNR (anti-hotlink): muchos CDNs (erome) rechazan
-//      el HEAD/GET del SW sin el Referer de la página; con la regla DNR efímera
-//      el fetch funciona y se obtiene el tamaño real. Es el mismo mecanismo de
-//      la descarga (sw-fetch-blob), aplicado al enriquecimiento.
+//   1.5. GET con Referer vía DNR (anti-hotlink): muchos servidores con protección
+//      anti-hotlink rechazan el HEAD/GET del SW sin el Referer de la página; con la
+//      regla DNR efímera el fetch funciona y se obtiene el tamaño real. Es el mismo
+//      mecanismo de la descarga (sw-fetch-blob), aplicado al enriquecimiento.
 //   2. HEAD + Content-Length: último recurso (muchos CDNs no lo devuelven).
 async function enrichSize(item, pageUrl = "") {
   if (sizeCache.has(item.url)) {
@@ -364,7 +367,7 @@ async function enrichSize(item, pageUrl = "") {
       }
     }
 
-    // Nivel 1.5: GET con Referer vía DNR (anti-hotlink, caso erome). Solo si el
+    // Nivel 1.5: GET con Referer vía DNR (anti-hotlink por Referer). Solo si el
     // recurso es de otro dominio que la página y las técnicas normales fallaron.
     if (len <= 0 && pageUrl && item.url.startsWith("http")) {
       try {
@@ -459,7 +462,7 @@ async function enrichMissing(tabId) {
 }
 
 // La cadena de detección/descarga (HEAD → Range → magic bytes → parseo de
-// manifiesto) vive en src/shared/media-core.js (NTMedia) — ÚNICA fuente de
+// manifiesto) vive en src/shared/media-core.js (OperantMedia) — ÚNICA fuente de
 // verdad, compartida con el panel. Aquí solo se ejecuta la estrategia.
 
 // --- Mensajería con el panel ---
@@ -511,7 +514,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
   if (msg?.type === "overlay-download") {
-    // La decisión de estrategia la toma NTMedia.classifyDownload (media-core.js),
+    // La decisión de estrategia la toma OperantMedia.classifyDownload (media-core.js),
     // la ÚNICA fuente de verdad — misma lógica que usa el panel. Aquí solo se
     // ejecuta la estrategia resultante (directo / manifiesto→mp4 / yt-dlp).
     let url = msg.url || "";
@@ -553,7 +556,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const filename = /\.(png|jpe?g|webp|gif|mp4|mp3|pdf|zip|m3u8|mpd|ts)$/i.test(base) ? base : `${base}${urlExt(url)}`;
     const doDirect = () =>
       // Re-validar que la URL sigue viva (tokens que expiran) antes de descargar.
-      NTMedia.isUrlAlive(url).then((alive) => {
+      OperantMedia.isUrlAlive(url).then((alive) => {
         if (!alive) {
           return Promise.reject(new Error("La URL expiró o no está disponible. Re-escanea la página e inténtalo de nuevo."));
         }
@@ -653,7 +656,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     };
 
-    NTMedia.classifyDownload(url, kind).then((c) => {
+    OperantMedia.classifyDownload(url, kind).then((c) => {
       if (c.strategy === "manifest") return doManifest(c.manifest);
       if (c.strategy === "ytdl") return doYtdl();
       if (c.strategy === "direct") {
@@ -691,7 +694,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "overlay-download-blob") {
     // Blob capturado DESDE EL CONTEXTO DE LA PÁGINA (con cookies/Referer de
-    // sesión — para CDNs con anti-hotlink tipo erome). El SW de MV3 NO tiene
+    // sesión — para servidores con protección anti-hotlink por Referer). El SW de MV3 NO tiene
     // URL.createObjectURL, así que se reenvía al PANEL (que sí lo tiene y
     // además tiene chrome.downloads) para que lo entregue.
     let data = msg.data;
@@ -746,9 +749,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "sw-fetch-blob") {
     // Nivel A del fallback anti-hotlink (GENÉRICO): el SW hace el fetch (sin
     // CORS con <all_urls>) con el Referer REAL de la página inyectado por una
-    // regla DNR EFÍMERA por descarga (no hay lista de sitios). Resuelve CDNs
-    // cross-origin que responden SIN Access-Control-Allow-Origin (tipo erome,
-    // i.erome.com, cualquier host) donde el content script muere por CORS.
+    // regla DNR EFÍMERA por descarga (no hay lista de sitios). Resuelve servidores
+    // cross-origin que responden sin cabeceras permisivas donde el content script muere por CORS.
     const { url, filename } = msg;
     const pageUrl = msg.pageUrl || sender.tab?.url || "";
     if (!url) {
@@ -853,7 +855,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "overlay-download-audio") {
     // Extraer SOLO el audio de un vídeo, con lógica inteligente:
     //  - URL directa (mp4/webm/mov): ffmpeg del host (extract-mp3, 192k).
-    //  - URL no-directa (YouTube/Erome/streaming protegido): yt-dlp con -x
+    //  - URL no-directa (plataformas de vídeo o streaming protegido): yt-dlp con -x
     //    (extracción de audio profesional por extractor).
     const url = msg.url || "";
     if (!url) {
@@ -920,6 +922,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         done: msg.done,
         total: msg.total,
         phase: msg.phase,
+        found: msg.found,
       })
       .catch(() => {});
     sendResponse({ ok: true });
@@ -942,7 +945,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // El panel pide crear la regla DNR efímera que inyecta el Referer de la
     // página para las peticiones del propio SW (y de las páginas de extensión,
     // mismo origin). La usa la cola por chunks del panel para descargar
-    // archivos grandes con hotlink por Referer (caso erome + 300MB).
+    // archivos grandes con protección de cabecera Referer.
     const { url, pageUrl } = msg;
     if (!url) {
       sendResponse({ ok: false, error: "Sin URL" });
@@ -1053,12 +1056,82 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleYtdl(msg).then(sendResponse);
     return true;
   }
+  if (msg?.type === "record-start") {
+    const port = connectNative();
+    if (!port) {
+      sendResponse({ ok: false, error: "El host nativo no está instalado. Abre Herramientas e instálalo." });
+      return;
+    }
+    recSession = { tabId: msg.tabId, session: null, filename: null };
+    port.postMessage({ type: "rec-begin" });
+    chrome.tabs.sendMessage(
+      msg.tabId,
+      { type: "rec-start" },
+      { frameId: 0 },
+      (r) => {
+        const err = chrome.runtime.lastError;
+        if (err || !r?.ok || r?.installed === false) {
+          recFail(
+            r?.installed === false
+              ? "La grabación no está disponible en este navegador o página (hook MSE no activo)."
+              : "No se pudo iniciar la grabación en la pestaña activa."
+          );
+        }
+      }
+    );
+    recBroadcast({ state: "starting" });
+    sendResponse({ ok: true });
+    return;
+  }
+  if (msg?.type === "record-stop") {
+    if (!recSession) {
+      sendResponse({ ok: false, error: "No hay grabación en curso." });
+      return;
+    }
+    chrome.tabs.get(recSession.tabId, (tab) => {
+      if (recSession) recSession.filename = (tab?.title || "grabacion").slice(0, 120);
+      chrome.tabs.sendMessage(recSession.tabId, { type: "rec-stop" }).catch(() => {});
+    });
+    sendResponse({ ok: true });
+    return;
+  }
+  if (msg?.type === "rec-relay") {
+    // Datos y eventos del recorder (MAIN world) llegados vía content script.
+    const p = msg.payload || {};
+    if (!recSession || p.type === "started") return;
+    if (p.type === "stats") {
+      recBroadcast({ state: "recording", bytes: p.bytes, segments: p.segments, sources: p.sources });
+    } else if (p.type === "track-chunk") {
+      const port = connectNative();
+      if (port && recSession.session) {
+        port.postMessage({ type: "rec-append", session: recSession.session, track: p.track, data: p.data });
+      }
+    } else if (p.type === "stopped") {
+      const session = recSession;
+      const port = connectNative();
+      chrome.tabs.get(session.tabId, (tab) => {
+        const filename = (tab?.title || "grabacion").slice(0, 120);
+        if (port && session.session) {
+          port.postMessage({ type: "rec-end", session: session.session, filename });
+          recBroadcast({ state: "assembling" });
+        } else {
+          recFail(p.error || "La grabación terminó sin sesión del host nativo.");
+        }
+      });
+    } else if (p.type === "cancelled") {
+      const port = connectNative();
+      if (port && recSession.session) port.postMessage({ type: "rec-cancel", session: recSession.session });
+      recSession = null;
+      recBroadcast({ state: "idle" });
+    }
+    return;
+  }
 });
 
 async function handleYtdl(msg) {
   const port = connectNative();
   if (!port) {
-    return { ok: false, error: "El host nativo no está instalado. Ejecuta native-host/install_host.bat <ID_EXTENSION>." };
+    return { ok: false, error: "El host nativo no está instalado. Ejecuta native-host/operant-host.exe con doble clic." };
   }
   try {
     port.postMessage({ type: "ytdl", url: msg.url, filename: msg.filename, format: msg.format || null });
@@ -1066,6 +1139,27 @@ async function handleYtdl(msg) {
   } catch (err) {
     return { ok: false, error: String(err) };
   }
+}
+
+// --- Modo grabación: captura de buffers MSE del reproductor ---
+// El recorder-main.js (mundo MAIN, document_start) captura appendBuffer; los
+// datos llegan al SW vía content script y se pasan al host tal cual
+// (passthrough sin acumular: el host los escribe a disco en su bucle
+// principal, que preserva el orden). El ffmpeg final corre en el host.
+let recSession = null; // { tabId, session, filename } | null
+
+function recBroadcast(patch) {
+  chrome.runtime.sendMessage({ type: "rec", ...patch }).catch(() => {});
+}
+
+function recFail(message) {
+  const session = recSession?.session || null;
+  if (session) {
+    const port = connectNative();
+    port?.postMessage({ type: "rec-cancel", session });
+  }
+  recSession = null;
+  recBroadcast({ state: "error", message });
 }
 
 // --- Ruta rápida HLS en el SW (fallback del overlay sin host nativo) ---
@@ -1084,6 +1178,7 @@ async function swFastHls(url, filename, tabId) {
     const result = await HLSFast.downloadHls({
       url,
       concurrency: 6,
+      allowLive: false, // sin botón de parada en el SW: un live no debe colgarse aquí
       beforeFetch: async (segUrl) => {
         try {
           const host = new URL(segUrl).hostname;
@@ -1220,13 +1315,19 @@ function connectNative() {
   try {
     nativePort = chrome.runtime.connectNative(NATIVE_HOST);
     nativePort.onMessage.addListener((msg) => {
-      if (msg?.type === "pong" || msg?.type === "tools-status") {
+      if (msg?.type === "pong" || msg?.type === "tools-status" || msg?.type === "tool-uninstalled") {
         nativeStatus = {
           installed: true,
           checkedAt: Date.now(),
           tools: msg.tools || null,
         };
         chrome.storage.local.set({ nativeStatus });
+      }
+      if (msg?.type === "rec-beginned" && recSession) {
+        recSession.session = msg.session; // ya se pueden enviar chunks
+      }
+      if (msg?.type === "rec-error" && recSession) {
+        recFail(msg.message || "Error del host nativo durante la grabación.");
       }
       // El mensaje se envuelve (no se hace spread): el spread machacaba el
       // tipo con el del host y los progresos/formatos nunca llegaban al panel.
@@ -1263,7 +1364,7 @@ async function nativeHealthcheck() {
 function sendNativeToolAction(action, tool) {
   const port = connectNative();
   if (!port) {
-    return { ok: false, error: "El host nativo no está instalado. Ejecuta native-host/install_host.bat <ID_EXTENSION>." };
+    return { ok: false, error: "El host nativo no está instalado. Ejecuta native-host/operant-host.exe con doble clic." };
   }
   try {
     port.postMessage({ type: action, tool });

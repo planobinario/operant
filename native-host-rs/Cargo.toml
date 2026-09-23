@@ -1,0 +1,31 @@
+[package]
+name = "operant-host"
+version = "0.4.0"
+edition = "2021"
+authors = ["Operant Team"]
+description = "Operant Native Messaging Host (Rust)"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2.10", features = ["tls"] }
+zip = { version = "2.1", default-features = false, features = ["deflate"] }
+tempfile = "3"
+base64 = "0.22"
+regex = "1.10"
+fastrand = "2.0"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem"
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -29,7 +29,7 @@ async function findExe() {
   const browser = await puppeteer.launch({
     executablePath: await findExe(),
     headless: true,
-    userDataDir: fs.mkdtempSync(path.join(os.tmpdir(), "nt-debug-")),
+    userDataDir: fs.mkdtempSync(path.join(os.tmpdir(), "operant-debug-")),
     ignoreDefaultArgs: ["--disable-extensions", "--enable-automation"],
     args: [
       `--load-extension=${EXT_SRC}`,
