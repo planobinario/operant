@@ -1,167 +1,178 @@
 # Operant — Browser Agent & Media Engine
 
-Extensión multi-navegador (Chrome, Edge, y navegadores Chromium) para **descubrir, extraer y procesar medios y contenido de una página**: imágenes, vídeos, audio, streams HLS/DASH y archivos descargables, con un **panel lateral profesional**, captura de streams por red, **descargas optimizadas con Range requests en paralelo**, **procesado de medios con el ffmpeg nativo del host** (remux, extraer audio, comprimir, redimensionar) e **integración con yt-dlp**, todo vía Native Messaging, diseñado como base modular para agentes de navegación.
+<p align="center">
+  <strong>Motor de medios y agente de navegación para descubrimiento, extracción profunda y procesado de medios en la web moderna.</strong>
+</p>
 
-> Nota Firefox: el **side panel** (`chrome.sidePanel`) solo existe en Chrome/Edge. En Firefox la extensión sigue funcionando (content script, descargas, host nativo) pero sin el panel lateral.
+<p align="center">
+  <img src="https://img.shields.io/badge/Manifest-V3-brightgreen.svg" alt="Manifest V3" />
+  <img src="https://img.shields.io/badge/Companion-Rust%20Standalone-orange.svg" alt="Rust Native Host" />
+  <img src="https://img.shields.io/badge/Engines-yt--dlp%20%7C%20ffmpeg-blue.svg" alt="Engines" />
+  <img src="https://img.shields.io/badge/Tests-10%2F10%20PASS-success.svg" alt="Tests" />
+  <img src="https://img.shields.io/badge/License-GPL--3.0-lightgrey.svg" alt="License" />
+</p>
 
-## Estructura
+---
+
+## Descripción General
+
+**Operant** es una extensión avanzada y modular para navegadores basados en Chromium (Chrome, Edge, Brave, Opera) y Firefox, diseñada para **descubrir, extraer, descargar y procesar medios desde cualquier página web**: imágenes en alta resolución, vídeos HTML5 nativos, audio, streams de red (HLS/DASH), enlaces de descarga y contenido protegido por visores dinámicos.
+
+Incorpora un **Side Panel profesional** de alta densidad visual, descargas optimizadas con **Range requests en paralelo (chunks)**, un **host nativo autónomo en Rust puro (`operant-host.exe`)** que gestiona y ejecuta `ffmpeg` y `yt-dlp` fuera del sandbox del navegador, y un motor de grabación de buffers MSE para capturar flujos multimedia en tiempo real.
+
+---
+
+## Capacidades Principales
+
+### 1. Detección Universal Profunda de Medios
+* **Escaneo Exhaustivo en 5 Fases**: Inspecciona elementos `<img>`, `<picture>`, `srcset`, imágenes embebidas en `<svg>`, renders en `<canvas>` (editores gráficos y diagramas), y fondos CSS computados (`background-image`).
+* **Resolución Original en Parámetros de Enlace**: Extrae las URLs reales de alta resolución contenidas en parámetros de enlaces (`imgurl`, `original`, `src`, `media`, `download`) en motores de búsqueda, galerías y agregadores web.
+* **Atributos Dinámicos y Visores JS**: Decodifica atributos profundos (`data-src`, `data-zoom`, `data-original`, `data-highres`, `[m]`) y analiza estructuras de datos estructurados **Schema.org / JSON-LD**.
+* **Captura de Red Pasiva (`webRequest`)**: Detecta automáticamente listas de reproducción y manifiestos de streaming (`.m3u8`, `.mpd`) mientras navegas, sin requerir interacción manual.
+
+### 2. Barra de Progreso Milimétrica, Fluida y Transparente
+* **Cálculo Unificado de Unidades de Trabajo**: La carga total se determina matemáticamente antes de comenzar ($N_{\text{img}} + N_{\text{links}} + N_{\text{deep}} + N_{\text{media}} + N_{\text{bg}}$), garantizando un avance monótono y exacto de 0% a 100%.
+* **Contador en Vivo**: Notifica en tiempo real el número de medios descubiertos en cada fase (`found: store.size`) directamente en la barra.
+* **Física y Estética Visual**: Gradiente *Signal Red* (`#e04e39` $\to$ `#f08271`), curva de aceleración cubic-bezier y tipografía con **números tabulares (`tabular-nums`)** para erradicar cualquier temblor o desplazamiento horizontal durante el conteo.
+
+### 3. Ordenación Inteligente por Defecto (`sort: "smart"`)
+* **Imágenes Grandes/Pesadas Primero en Orden Cronológico**: Sitúa el contenido principal de alta resolución en la parte superior respetando escrupulosamente su **orden natural de aparición en la página web** (de arriba hacia abajo en el DOM).
+* **Relegación de Elementos Decorativos**: Favicons, avatares e iconos (< 100×100 px o < 3 KB) se envían al final de la cuadrícula sin entorpecer la visualización del contenido principal.
+
+### 4. Desacoplamiento Estricto Imagen/Vídeo & Anti-Hotlinking
+* **Aislamiento Total de Descargas**: Las imágenes y archivos se descargan directamente vía `chrome.downloads` o cola por chunks; nunca invocan `yt-dlp` ni modales de calidad de streaming.
+* **Cabecera `referrerpolicy="no-referrer"`**: Aplicada universalmente a todas las tarjetas y al Lightbox, eliminando el origen de extensión (`chrome-extension://...`) para eludir bloqueos por anti-hotlink y CORS en servidores de terceros.
+* **Miniatura Local como Respaldo Seguro**: Cada imagen de alta resolución conserva su miniatura funcional en el DOM (`item.thumb`). Si un servidor externo deniega el acceso o la URL remota expira, el panel y el Lightbox conmutan automáticamente a la miniatura local sin mostrar carteles de error ni dejar tarjetas rotas.
+
+### 5. Operant Companion — Host Nativo Autónomo en Rust Puro
+* **Binario Standalone Ligero (2.5 MB)**: Implementado en Rust (`native-host-rs/`), compilado en `native-host/operant-host.exe`. **Cero dependencias de Python, sin necesidad de consola.**
+* **Registro en 1 Doble Clic**: Ejecutar `operant-host.exe` abre un asistente nativo con interfaz Win32 que detecta automáticamente los navegadores instalados (Chrome, Edge, Firefox) y registra el manifiesto de Native Messaging en el Registro de Windows.
+* **Auto-Gestión de `yt-dlp` y `ffmpeg`**: Detecta versiones instaladas en el sistema (PATH) o en su directorio aislado (`~/Operant/bin/`). Descarga, verifica y actualiza binarios oficiales de forma atómica y silenciosa.
+* **Procesado Multimedia de Alto Rendimiento**: Remux a MP4 sin pérdida, compresión H.264/AAC con CRF configurable, extracción de audio MP3 y reescalado de vídeo.
+
+### 6. Grabación de Buffers MSE en Tiempo Real
+* Captura los segmentos multimedia transmitidos por reproductores web modernos directamente desde el contexto de la página.
+* Transfiere los flujos al host nativo para su concatenación y empaquetado instantáneo con `ffmpeg` en `~/Downloads/Operant/`.
+
+---
+
+## Estructura del Repositorio
 
 ```
 operant/
-├── package.json                # Scripts dev (web-ext hot-reload)
-├── src/                        # Todo lo que se carga en el navegador
-│   ├── manifest.json           # MV3: side_panel, webRequest, downloads, nativeMessaging…
-│   ├── background.js           # Service worker: side panel, webRequest (streams), estado por pestaña, host nativo
-│   ├── content.js              # Escáner DOM: img/picture/css/lazy, vídeo/audio, embeds, enlaces descargables
+├── src/                               # Extensión de navegador (Manifest V3)
+│   ├── manifest.json                  # Declaración MV3, sidePanel, permissions
+│   ├── background.js                  # Service worker: captura webRequest, DNR, Native Messaging
+│   ├── content.js                     # Motor de escaneo profundo (DOM, links, deep attrs, CSS)
+│   ├── recorder-main.js               # Inyector de captura de buffers MSE en páginas web
 │   ├── panel/
-│   │   ├── panel.html          # UI del panel lateral (+ diálogo Procesar y Descargas)
-│   │   ├── panel.js            # Filtros, grid lazy, descargas por chunks, zip, procesado (host), yt-dlp
-│   │   └── panel.css           # Tema oscuro (violeta/cian)
+│   │   ├── panel.html                 # Interfaz consolidada del panel lateral
+│   │   ├── panel.js                   # Lógica de UI, filtros, lightbox, descargas y estado
+│   │   └── panel.css                  # Sistema de diseño Operant (Warm Ink + Signal Red)
+│   ├── shared/
+│   │   ├── media-core.js              # Clasificador universal de medios y detección mágica
+│   │   ├── hls-fast.js                # Parser y descargador HLS en navegador (fMP4/TS)
+│   │   └── dl-indicator.js            # Anillo de progreso y micro-interacciones de descarga
 │   ├── vendor/
-│   │   └── jszip.min.js        # JSZip bundleado localmente (sin CDN)
-│   └── icons/                  # Imán atrayendo medios (16/48/128)
-└── native-host/                # Fase 4: app satélite nativa (fuera del sandbox)
-    ├── operant_host.py         # Host nativo Python (stdlib, sin pip)
-    ├── operant_host.bat        # Wrapper silencioso para Windows
-    ├── operant_host_manifest.json # Plantilla para instalación manual
-    ├── install_host.bat        # Instalador Windows (Chrome + Edge)
-    └── install_host.sh         # Instalador Linux/macOS
+│   │   └── jszip.min.js               # Empaquetador ZIP local sin dependencias de red
+│   └── icons/                         # Identidad visual de la extensión (16, 48, 128 px)
+│
+├── native-host/                       # Aplicación satélite Native Messaging
+│   ├── operant-host.exe               # Binario autónomo compilado en Rust (Windows)
+│   ├── operant_host.py                # Host de referencia en Python (stdlib pura)
+│   ├── install_host.bat / .sh         # Scripts de registro multiplataforma
+│   └── operant_host_manifest.json     # Plantilla de manifiesto Native Messaging
+│
+├── native-host-rs/                    # Código fuente en Rust del Operant Companion
+│   ├── Cargo.toml                     # Configuración del paquete Cargo y dependencias
+│   └── src/                           # main.rs, installer.rs, protocol.rs, tools.rs, ytdl.rs, recorder.rs
+│
+└── tests/                             # Batería exhaustiva de pruebas funcionales
+    ├── run-verification.js            # Runner automatizado con Chrome for Testing (10/10 PASS)
+    ├── host-e2e.py                    # Suite de validación del host nativo (11/11 PASS)
+    ├── fixtures-server.js             # Servidor local de casos de prueba deterministas
+    └── TESTING.md                     # Documentación completa de resultados y auditoría
 ```
 
-## Puesta en marcha (desarrollo)
+---
 
-```bash
-npm install
-npm run dev        # Chromium con hot-reload
-npm run dev:firefox
-npm run build      # zip instalable en web-ext-artifacts/
-```
+## Instalación y Puesta en Marcha
 
-Carga manual: `chrome://extensions` → Modo desarrollador → **Cargar descomprimida** → carpeta `src/`.
+### 1. Cargar la Extensión en el Navegador
+1. Clona el repositorio:
+   ```bash
+   git clone https://github.com/planobinario/operant.git
+   cd operant
+   ```
+2. Instala dependencias de desarrollo y compila los paquetes:
+   ```bash
+   npm install
+   npm run build
+   ```
+3. En Google Chrome o Microsoft Edge, navega a `chrome://extensions/`.
+4. Activa el **Modo de desarrollador** (esquina superior derecha).
+5. Pulsa **Cargar descomprimida** y selecciona la carpeta **`src/`** del repositorio.
 
-## Verificación funcional real
+### 2. Activar el Operant Companion (Host Nativo)
+* **En Windows (Recomendado)**:
+  1. Ve a la carpeta `native-host/` y haz **doble clic en `operant-host.exe`**.
+  2. Un cuadro de diálogo confirmará la vinculación con Chrome, Edge y Firefox automáticamente.
+* **En Linux / macOS (o usando Python)**:
+  ```bash
+  cd native-host
+  chmod +x install_host.sh
+  ./install_host.sh <ID_DE_TU_EXTENSION>
+  ```
+  *(Puedes consultar el ID de tu extensión en `chrome://extensions`).*
 
-```bash
-npm run test:verify           # 10 casos locales deterministas (sin red)
-npm run test:verify:public    # + 5 casos contra sitios públicos reales
-```
+---
 
-Lanza Chrome for Testing (descarga automática, ~150 MB) con la extensión cargada, navega a páginas de prueba (galerías con lazy/srcset/picture/background CSS, vídeo, embeds, archivos, SPA, HLS/DASH locales, shadow DOM, 600 imágenes) y a sitios reales (w3schools, python.org, dash.js player…), validando lo detectado por el content script y webRequest. Resultados documentados en **`TESTING.md`** con capturas y logs en `tests/results/`.
+## Scripts Disponibles
 
-> Nota: los Chrome estables ≥ 137 ignoran `--load-extension`; por eso la batería usa Chrome for Testing.
-
-## Qué hace cada módulo
-
-| Módulo | Función |
+| Comando | Acción |
 |---|---|
-| `content.js` | Escanea el DOM: `<img>`/`<picture>`/`srcset`, lazy-load (`data-src`, `data-lazy-src`…), `background-image` computado, `<video>`/`<audio>`/`<source>`, embeds (YouTube/Vimeo/Dailymotion/X), `<object>`/`<embed>`, enlaces a archivos (pdf/zip/mp4…). Un `MutationObserver` detecta contenido dinámico (infinite scroll, SPAs) y re-escanea en caliente. |
-| `background.js` | Abre el side panel al hacer clic en el icono. **webRequest** observa la red y captura streams que no están en el DOM (`m3u8`, `mpd`, `ts`…). Centraliza el estado por pestaña (con persistencia en `storage.session`) y enriquece cada item con tamaño estimado (HEAD) y dominio. |
-| `panel/` | Tabs Imágenes / Vídeos·Audio / Archivos con contadores, **3 vistas (grid/lista/masonry) con slider de thumbnail y ordenación**, buscador, filtros (tamaño mínimo, extensión, dominio), **selección por rango (Shift/Ctrl), criterios rápidos y barra flotante con peso total**, marcado de **posibles duplicados**, descargas por chunks con cola y progreso, zip, **selector de calidad yt-dlp**, procesado con ffmpeg del host, **historial de descargas y exportación de URLs**, toggle auto-detect para SPAs. |
-| `native-host/` | Host nativo Python (solo stdlib) que **auto-gestiona yt-dlp y ffmpeg** (detección, descarga, verificación, actualización), ejecuta descargas `yt-dlp -f bestvideo*+bestaudio` y **procesa medios con ffmpeg real** (remux, extraer audio, comprimir, redimensionar) con progreso real y comparación de pesos. |
+| `npm run dev` | Lanza una instancia aislada de Chromium con la extensión cargada y recarga automática. |
+| `npm run dev:firefox` | Compila el manifiesto compatible y lanza Firefox con la extensión. |
+| `npm run build` | Empaqueta la extensión para producción en `web-ext-artifacts/operant_*.zip`. |
+| `npm run test:verify` | Ejecuta la batería de pruebas locales deterministas (10 suites en Chrome for Testing). |
+| `npm run test:verify:public` | Ejecuta las pruebas locales más 5 validaciones sobre sitios web públicos reales. |
+| `npm run host:build` | Compila el host nativo en Rust con optimizaciones de release y copia el ejecutable a `native-host/`. |
+| `npm run host:test` | Ejecuta la suite de verificación de protocolo, herramientas y ffmpeg del host nativo. |
 
-## Por qué todo el procesado va por el host nativo (y no por WASM)
+---
 
-- **ffmpeg.wasm se descartó a propósito**: duplicaba el ffmpeg del host sin beneficio — más lento (sin aceleración HW), codecs limitados por licencias WASM, ~31 MB extra siempre en la extensión, y dos rutas de código que mantener. Con el host nativo gestionado automáticamente (detección, descarga, actualización), un solo ffmpeg cubre todo: compresión, remux, extracción de audio y conversión.
-- **yt-dlp no se puede portar honestamente**: es un conjunto de cientos de extractors por plataforma (firmas, tokens anti-bot) que necesitan forjar cabeceras, usar cookies y saltarse restricciones CORS que el navegador bloquea por diseño. Además depende de ffmpeg nativo para unir streams DASH/HLS. Por eso vive como **módulo opcional vía Native Messaging**, separado del núcleo.
+## Sistema de Diseño y Estética
 
-## Permisos del manifest (y por qué)
+Operant utiliza los tokens de diseño oficiales de **Warm Ink Neutrals**:
 
-| Permiso | Para qué |
+* **Tema Oscuro**:
+  * Fondo: `#161311` (`--bg`) | Superficies: `#1d1a17` (`--surface`), `#232019` (`--surface-2`)
+  * Bordes: `#322d27` (`--border`) | Bordes acentuados: `#474038` (`--border-strong`)
+  * Color de Acento: `#f2554d` (*Signal Red*)
+  * Texto: `#ece8e2` (`--text`) | Texto atenuado: `#a49c92` (`--text-muted`)
+* **Tema Claro**:
+  * Fondo: `#f7f5f2` | Superficies: `#fdfcfa`, `#efece7`
+  * Bordes: `#e4e0d9` | Acento: `#cc2929`
+* **Tipografía de Precisión**: Inter para interfaces de usuario y JetBrains Mono para insignias de dimensiones (`1920×1080`), formatos (`WEBP`, `MP4`) y tamaños de archivo.
+* **Selector de Tema Cero-Latencia**: Alternancia instantánea entre Claro y Oscuro con persistencia en `chrome.storage.local`.
+
+---
+
+## Permisos del Navegador
+
+| Permiso | Justificación Técnica |
 |---|---|
-| `sidePanel` | Panel lateral nativo estilo ImageEye (solo Chrome/Edge). |
-| `webRequest` | Observar la red y capturar streams (m3u8/mpd) que no aparecen en el DOM. |
-| `downloads` | Descargar archivos individuales y zips (`chrome.downloads`). |
-| `storage` | Preferencias (`autoDetect`) y estado por pestaña (`storage.session`). |
-| `activeTab` | Acceso puntual a la pestaña al abrir el panel. |
-| `nativeMessaging` | Comunicarse con el host nativo yt-dlp/ffmpeg. |
-| `host_permissions: <all_urls>` | Que el content script se inyecte en cualquier página y webRequest vea todo el tráfico. |
+| `sidePanel` | Panel lateral persistente que no interrumpe la navegación del usuario. |
+| `webRequest` | Detección pasiva de flujos multimedia de red (`m3u8`, `mpd`) que no existen en el DOM. |
+| `downloads` | Gestión y guardado de descargas individuales y archivos ZIP consolidados. |
+| `storage` | Persistencia de preferencias del usuario y estado de medios por pestaña (`storage.session`). |
+| `activeTab` | Enlace seguro a la pestaña activa para solicitar re-escaneos. |
+| `nativeMessaging` | Canal de comunicación bidireccional con el Operant Companion (`operant-host.exe`). |
+| `declarativeNetRequest` | Reglas efímeras de cabeceras para descargas protegidas por anti-hotlinking. |
+| `host_permissions: <all_urls>` | Inyección del content script y análisis universal sin listas blancas restrictivas. |
 
-> **Ojo al distribuir:** `<all_urls>` + `webRequest` disparan el aviso de permisos «Leer y cambiar todos tus datos en todos los sitios web» en la Web Store. Para uso personal no hay problema. Si algún día la publicas, valora reducir a dominios concretos o usar `optional_host_permissions`.
+---
 
-## Fase 4a — Procesado de medios con el ffmpeg del host
+## Licencia
 
-Botón **«Procesar»** del panel: eliges un medio detectado en la página y una operación; el host nativo descarga el archivo a tu PC, lo procesa con **ffmpeg real** (rápido, todos los codecs) y guarda el resultado en `~/Downloads/Operant/`, con barra de progreso real (fases download → process) y **comparación de pesos antes/después**.
-
-Operaciones: extraer audio (mp3), remux a mp4 (sin recodificar), convertir a webm, comprimir (h264+aac con CRF configurable), reescalar al 50 %, imagen → jpg/webp. Requiere ffmpeg instalado (el host lo instala solo: Panel → Herramientas).
-
-## Fase 4b — yt-dlp vía Native Messaging (opcional)
-
-### Auto-gestión de yt-dlp y ffmpeg (sin instalación manual del usuario)
-
-El host nativo **detecta, descarga, verifica y actualiza** las herramientas por sí mismo. La extensión nunca descarga ni ejecuta binarios (sandbox): solo pide al host vía Native Messaging, y el host hace el trabajo fuera del navegador con permisos de SO.
-
-- **Detección** (orden): carpeta propia `~/Operant/bin/` (Windows: `%LOCALAPPDATA%\Operant\bin\`) → PATH del sistema (`--version` / `-version` reales). El chip inferior del panel muestra el estado.
-- **Descarga automática**: si falta yt-dlp/ffmpeg, el panel muestra «Instalar» con barra de progreso real (porcentaje + fase: download → extract → verify).
-  - yt-dlp: binario único de GitHub Releases (yt-dlp.exe en Windows).
-  - ffmpeg: build estático oficial — gyan.dev en Windows; BtbN (Linux/macOS, tar.xz/zip).
-  - Instala en `~/Operant/bin/` **sin tocar instalaciones del sistema** (si el usuario ya tiene yt-dlp/ffmpeg para otros usos, la extensión usa los suyos).
-  - Verificación funcional post-descarga (el binario responde `--version`) y reemplazo **atómico** (descarga a temporal → verifica → `os.replace`; nunca queda el sistema a medias).
-- **Actualizaciones**: compara la versión local contra la última de GitHub (yt-dlp; vía el redirect de `releases/latest/download`, **sin golpear la API** — no hay rate-limits). Cache de 24 h. ffmpeg no versiona de forma estable: ofrece «Reinstalar» (builds diarios).
-- El chip del panel abre el diálogo **Herramientas**: estado por herramienta (instalado vX (app/sistema) · no instalado · actualización disponible), botones contextuales Instalar/Actualizar/Reinstalar, y aviso de que la primera instalación de ffmpeg descarga ~100 MB (con progreso, no un spinner ciego).
-
-> El host en sí requiere instalación manual **una sola vez** (`install_host.bat <ID>` / `.sh <ID>`): es la única parte que no se puede automatizar por el modelo de seguridad del navegador.
-
-#### Endpoints externos usados por el host (para listas de permisos de red, si las hay)
-
-| Recurso | URL | Uso |
-|---|---|---|
-| yt-dlp binario | `https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp` (y `-exe` en Windows) | descarga e instalación (redirect a `objects.githubusercontent.com`) |
-| Versión de yt-dlp | mismo enlace, capturando el `Location` del redirect (`/releases/download/<versión>/`) | check de actualizaciones (sin API, cache 24 h) |
-| ffmpeg Windows | `https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip` | build estático esencial |
-| ffmpeg Linux | `https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz` | build estático |
-| ffmpeg macOS | `.../ffmpeg-master-latest-macosarm64-gpl.zip` (o `macos64`) | build estático |
-
-Requisitos previos del host: Python 3 en el PATH (el propio host corre con la stdlib).
-
-### Registro del host (una sola vez)
-
-El navegador no permite ejecutar procesos desde el sandbox de una extensión. La única vía es un **Native Messaging Host**: un script local que la extensión invoca. No se puede automatizar por políticas de seguridad — el usuario lo instala una vez:
-
-1. Copia el **ID de la extensión**: `chrome://extensions` → Modo desarrollador → ID (32 caracteres).
-2. Ejecuta el instalador desde `native-host/`:
-   - **Windows:** `install_host.bat <ID_EXTENSION>`
-   - **Linux/macOS:** `./install_host.sh <ID_EXTENSION>`
-3. Cierra y reabre el navegador, recarga la extensión.
-4. Abre el panel → clic en el chip inferior → **Herramientas**: el host detecta/instala yt-dlp y ffmpeg automáticamente.
-
-Instalación manual (alternativa a los scripts): copia `operant_host_manifest.json` a la ruta correcta con el `path` absoluto del `.py` y tu ID en `allowed_origins`, y registra la clave de registro / archivo de manifest según el sistema:
-
-- Windows: `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.operant.native_host` → ruta al JSON
-- Linux: `~/.config/google-chrome/NativeMessagingHosts/com.operant.native_host.json`
-- macOS: `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.operant.native_host.json`
-
-Las descargas de medios con el botón «yt-dlp» escriben en `~/Downloads/Operant/` con la **máxima calidad** (`bestvideo*+bestaudio`, unido a mp4) y muestran el progreso por ciento en la barra de estado del panel.
-
-## Botones de acción rápida por tipo de contenido
-
-Cada card del panel muestra, al pasar el ratón (hover), los botones de acción según el tipo de contenido, en la esquina superior izquierda (separados ~10 px del borde, con transición suave de aparición):
-
-| Tipo | Botones |
-|---|---|
-| Imagen estática | «Descargar en alta calidad» (intenta la mayor resolución real: quita parámetros de resize tipo `?w=300` o usa el candidato mayor del srcset) |
-| GIF | «Descargar GIF» + «Descargar frame actual» (captura el frame visible con `<canvas>`) |
-| Vídeo | «Descargar vídeo» (usa la jerarquía: directo → stream → manifiesto parseado → yt-dlp) + «Descargar frame actual» (frame exacto del preview) |
-| Audio | «Descargar audio» |
-| Archivo (pdf/zip/docx…) | «Descargar archivo» |
-
-### Interacción de descarga (preferencia configurable)
-
-El prompt original pedía descargar con solo pasar el hover, pero eso genera **descargas accidentales** (el ratón cruza botones constantemente). Ningún producto serio (ImageEye/FetchV) descarga en hover: lo usan para *revelar*. La extensión ofrece **dos modos**, seleccionables en el panel → «Descargas»:
-
-- **`click` (por defecto, recomendado)**: el hover revela los botones y el click ejecuta la acción. Patrón estándar.
-- **`hover sostenido`**: si el ratón permanece ~700 ms sobre el botón específico (no la card), se dispara la descarga, con un **anillo de progreso circular** durante esos 700 ms para que el usuario vea que está a punto de dispararse y pueda retirar el ratón si fue accidental. Retirarlo antes de completar el anillo cancela la descarga.
-
-Cada acción muestra un toast breve de confirmación.
-
-## Notas técnicas
-
-- **Descargas por chunks:** el botón «Descargar» usa Range requests en paralelo (4 MB/chunk, tope de 8 fetches simultáneos, cola configurable de 1-8 jobs) cuando el servidor las soporta; fallback a descarga simple si no. El diálogo «Descargas» muestra progreso por archivo y agregado. Los archivos se ensamblan en memoria (tope práctico ~1-2 GB).
-- **webRequest y blob:** las URLs `blob:` no pasan por webRequest (no son accesibles desde el sandbox). Se intentan descargar vía fetch; si fallan, el panel lo indica.
-- **Streams (m3u8/mpd):** el botón de descarga intenta bajar el índice; para unir segmentos en mp4 usa el botón **yt-dlp** (requiere Fase 4b).
-- `npx web-ext lint` → 0 errores. Los 4 warnings son esperados:
-  - `sidePanel` (permission + `setPanelBehavior`): API de Chrome/Edge, Firefox no la tiene.
-  - `service_worker`: falso positivo conocido del linter; el manifest usa el patrón dual recomendado por MDN (`scripts` + `service_worker`).
-  - `DANGEROUS_EVAL` en `jszip.min.js`: wrapper UMD de la librería, estándar y seguro.
-- **Peso:** la extensión es ligera (~250 KB + JSZip); ffmpeg/yt-dlp viven en el host nativo, no en la extensión.
-- El service worker de MV3 puede dormir: todo el estado se guarda en `chrome.storage.session`.
-- Consolas: service worker en `chrome://extensions` → «Vista de service worker»; panel: clic derecho → «Inspeccionar».
+Distribuido bajo licencia **GPL-3.0-or-later**. Consulta el archivo `LICENSE` para más detalles.
