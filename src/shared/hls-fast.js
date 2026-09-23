@@ -10,9 +10,16 @@
 // cifrado AES-128 (sin DRM) se descifra en JS: la clave es otro recurso HTTPS
 // y el IV viene en el manifiesto o es el media sequence del segmento.
 //
+// Lives (ventana deslizante): si el manifiesto no lleva EXT-X-ENDLIST, el
+// motor entra en modo live — sondeo periódico del playlist, dedupe por media
+// sequence absoluta y grabación hasta ENDLIST, parada del usuario o límites
+// (bytes/duración). Los IV derivados de la secuencia absoluta siguen siendo
+// correctos entre ventanas (RFC 8216 §5.2).
+//
 // Limites asumidos (documentados, no silenciados): SAMPLE-AES/DRM no soportado;
 // pistas separadas (audio/vídeo) requieren remux — eso sigue siendo trabajo del
-// host nativo (ffmpeg).
+// host nativo (ffmpeg); byteranges en playlists live son raros y no se
+// re-resuelven entre ventanas.
 
 (function (global) {
   "use strict";
@@ -88,16 +95,18 @@
   }
 
   // --- Parser de media playlist (segmentos reales) ---
-  // Devuelve { segments, map, mediaSequence, encrypted, live, durationSec }.
-  // Cada segmento lleva SU key y SU map activos (los tags aplican hacia abajo
-  // hasta el siguiente), y su media sequence absoluta (base para el IV por
-  // defecto). BYTERANGE soportado con offset acumulativo por recurso.
+  // Devuelve { segments, map, mediaSequence, encrypted, live, durationSec,
+  // targetDuration }. Cada segmento lleva SU key y SU map activos (los tags
+  // aplican hacia abajo hasta el siguiente), y su media sequence absoluta
+  // (base para el IV por defecto). BYTERANGE soportado con offset acumulativo
+  // por recurso.
   function parseMedia(text, baseUrl) {
     if (!text.includes("#EXTINF") && !text.includes("#EXT-X-MAP")) return null;
     const segments = [];
     let mediaSequence = 0;
     let live = true;
     let durationSec = 0;
+    let targetDuration = null;
     let currentKey = null; // {method, uri, iv} | null (METHOD=NONE)
     let currentMap = null; // {url, byterange} | null
     let pendingDuration = null;
@@ -112,6 +121,10 @@
       if (!line) continue;
       if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
         mediaSequence = Number(line.split(":")[1]) || 0;
+        continue;
+      }
+      if (line.startsWith("#EXT-X-TARGETDURATION:")) {
+        targetDuration = Number(line.split(":")[1]) || null;
         continue;
       }
       if (line.startsWith("#EXT-X-ENDLIST")) {
@@ -197,6 +210,7 @@
       encrypted: segments.some((s) => s.key),
       live,
       durationSec,
+      targetDuration,
     };
   }
 
@@ -221,38 +235,11 @@
     return new Uint8Array(plain);
   }
 
-  // --- Descarga orquestada ---
+  // --- Piezas compartidas entre el motor VOD y el live ---
 
-  // opts: { url, quality="best", fetchImpl, concurrency=6, retries=2,
-  //         onProgress(done,total,bytes), beforeFetch(url), signal,
-  //         maxSegments=5000, maxBytes=2GB }
-  // Devuelve { blob, kind: "fmp4"|"ts", segments, bytes, durationSec, variant }.
-  async function downloadHls(opts) {
-    const {
-      url,
-      quality = "best",
-      fetchImpl = (u, o) => fetch(u, o),
-      concurrency = 6,
-      retries = 2,
-      onProgress = null,
-      beforeFetch = null,
-      signal = null,
-      maxSegments = 5000,
-      maxBytes = 2 * 1024 * 1024 * 1024,
-    } = opts || {};
-
-    const doFetch = async (u, o = {}) => {
-      if (beforeFetch) await beforeFetch(u);
-      return fetchImpl(u, { credentials: "include", cache: "force-cache", ...o });
-    };
-
-    const aborted = () => signal && signal.aborted;
-    const throwIfAborted = () => {
-      if (aborted()) throw new Error("Descarga cancelada.");
-    };
-
-    // 1) Resolver variantes (master → media, con profundidad acotada para
-    //    los raros masters de masters).
+  // Resuelve master → media playlist (profundidad acotada para los raros
+  // masters de masters). Devuelve { playlistUrl, text, variant }.
+  async function resolveVariantPlaylist({ url, quality = "best", doFetch, throwIfAborted }) {
     let playlistUrl = url;
     let text = "";
     let variant = null;
@@ -276,33 +263,18 @@
       variant = chosen;
       playlistUrl = chosen.url;
     }
+    return { playlistUrl, text, variant };
+  }
 
-    // 2) Parsear la media playlist.
-    const media = parseMedia(text, playlistUrl);
-    if (!media || !media.segments.length) {
-      throw new Error("El manifiesto no contiene segmentos descargables.");
-    }
-    if (media.segments.length > maxSegments) {
-      throw new Error(
-        `El stream tiene ${media.segments.length} segmentos (máx. ${maxSegments}). Es probable que sea un directo en emisión: usa el modo grabación o yt-dlp.`
-      );
-    }
-
-    // 3) Descarga de recursos: init (EXT-X-MAP) + segmentos, con cola de
-    //    concurrencia acotada y reintentos por recurso.
-    const total = media.segments.length;
-    const buffers = new Array(total);
-    const mapBuffers = new Map(); // mapUrl -> Uint8Array
-    let done = 0;
-    let bytes = 0;
-    let firstBytes = null; // para detectar el contenedor por magic bytes
-
-    const fetchResource = async (segUrl, byterange) => {
+  // Fábrica del fetcher de recursos (segmentos/init) con Range para
+  // BYTERANGE, reintentos con backoff y abort cooperativo.
+  function createFetchResource({ doFetch, retries = 2, isAborted }) {
+    return async (segUrl, byterange) => {
       const headers = {};
       if (byterange) headers.Range = `bytes=${byterange.offset}-${byterange.offset + byterange.length - 1}`;
       let lastErr = null;
       for (let attempt = 0; attempt <= retries; attempt++) {
-        throwIfAborted();
+        if (isAborted()) throw new Error("Descarga cancelada.");
         try {
           const res = await doFetch(segUrl, byterange ? { headers, cache: "no-store" } : {});
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -313,25 +285,104 @@
           return buf;
         } catch (e) {
           lastErr = e;
-          if (aborted()) throw new Error("Descarga cancelada.");
+          if (isAborted()) throw new Error("Descarga cancelada.");
           if (attempt < retries) await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
         }
       }
       throw new Error(`Segmento fallido tras ${retries + 1} intentos: ${segUrl} (${String(lastErr?.message || lastErr)})`);
     };
+  }
+
+  // Detección de contenedor: fMP4 si hay EXT-X-MAP o el primer segmento
+  // empieza por ftyp/styp; si no, MPEG-TS (sync byte 0x47).
+  function sniffContainer(hasMap, firstBytes) {
+    if (hasMap) return "fmp4";
+    if (firstBytes && firstBytes.length >= 8) {
+      const brand = String.fromCharCode(firstBytes[4], firstBytes[5], firstBytes[6], firstBytes[7]);
+      if (brand === "ftyp" || brand === "styp") return "fmp4";
+    }
+    return "ts";
+  }
+
+  // Descarga y descifra un segmento aplicando su EXT-X-MAP (init deduplicado
+  // en mapBuffers) y su KEY AES-128 (IV explícito o media sequence absoluta).
+  async function processSegment(seg, fetchResource, doFetch, mapBuffers) {
+    let buf = await fetchResource(seg.url, seg.byterange);
+    if (seg.key) {
+      const keyBytes = await fetchKey(seg.key, doFetch);
+      const iv = seg.key.iv || sequenceIv(seg.seq);
+      buf = await decryptAes128(keyBytes, iv, buf);
+    }
+    if (seg.map && !mapBuffers.has(seg.map.url)) {
+      // El init segment del MAP activo se descarga con su BYTERANGE propio
+      // (el parser ya resolvió offset acumulativo y longitud).
+      mapBuffers.set(seg.map.url, await fetchResource(seg.map.url, seg.map.byterange));
+    }
+    return buf;
+  }
+
+  // --- Descarga orquestada (VOD) ---
+
+  // opts: { url, quality="best", fetchImpl, concurrency=6, retries=2,
+  //         onProgress(done,total,bytes), beforeFetch(url), signal,
+  //         maxSegments=5000, maxBytes=2GB, allowLive=true }
+  // Devuelve { blob, kind: "fmp4"|"ts", segments, bytes, durationSec, variant }.
+  // Si el manifiesto no lleva ENDLIST (live/event) y allowLive, delega en
+  // downloadHlsLive: el VOD normal no cambia de comportamiento.
+  async function downloadHls(opts) {
+    const {
+      url,
+      quality = "best",
+      fetchImpl = (u, o) => fetch(u, o),
+      concurrency = 6,
+      retries = 2,
+      onProgress = null,
+      beforeFetch = null,
+      signal = null,
+      maxSegments = 5000,
+      maxBytes = 2 * 1024 * 1024 * 1024,
+      allowLive = true,
+    } = opts || {};
+
+    const doFetch = async (u, o = {}) => {
+      if (beforeFetch) await beforeFetch(u);
+      return fetchImpl(u, { credentials: "include", cache: "force-cache", ...o });
+    };
+
+    const aborted = () => signal && signal.aborted;
+    const throwIfAborted = () => {
+      if (aborted()) throw new Error("Descarga cancelada.");
+    };
+
+    const { playlistUrl, text, variant } = await resolveVariantPlaylist({ url, quality, doFetch, throwIfAborted });
+
+    const media = parseMedia(text, playlistUrl);
+    if (!media || !media.segments.length) {
+      throw new Error("El manifiesto no contiene segmentos descargables.");
+    }
+
+    // Live/event (sin ENDLIST): ventana deslizante → modo grabación. Se pasa
+    // la media playlist ya parseada para no perder la ventana actual.
+    if (media.live && allowLive) {
+      return downloadHlsLive({ ...opts, initialPlaylistUrl: playlistUrl, initialMedia: media, variant });
+    }
+
+    if (media.segments.length > maxSegments) {
+      throw new Error(
+        `El stream tiene ${media.segments.length} segmentos (máx. ${maxSegments}). Es probable que sea un directo en emisión: usa el modo grabación o yt-dlp.`
+      );
+    }
+
+    const fetchResource = createFetchResource({ doFetch, retries, isAborted: aborted });
+    const total = media.segments.length;
+    const buffers = new Array(total);
+    const mapBuffers = new Map(); // mapUrl -> Uint8Array
+    let done = 0;
+    let bytes = 0;
+    let firstBytes = null; // para detectar el contenedor por magic bytes
 
     const runSegment = async (seg, index) => {
-      let buf = await fetchResource(seg.url, seg.byterange);
-      if (seg.key) {
-        const keyBytes = await fetchKey(seg.key, doFetch);
-        const iv = seg.key.iv || sequenceIv(seg.seq);
-        buf = await decryptAes128(keyBytes, iv, buf);
-      }
-      if (seg.map && !mapBuffers.has(seg.map.url)) {
-        // El init segment del MAP activo se descarga con su BYTERANGE propio
-        // (el parser ya resolvió offset acumulativo y longitud).
-        mapBuffers.set(seg.map.url, await fetchResource(seg.map.url, seg.map.byterange));
-      }
+      const buf = await processSegment(seg, fetchResource, doFetch, mapBuffers);
       buffers[index] = buf;
       if (!firstBytes && buf.length >= 4) firstBytes = buf.slice(0, 12);
       bytes += buf.byteLength;
@@ -369,19 +420,9 @@
     if (fatal) throw fatal;
     throwIfAborted();
 
-    // 4) Detección de contenedor: fMP4 si hay EXT-X-MAP o el primer segmento
-    //    empieza por ftyp/styp (deja el moof a continuación); si no, MPEG-TS
-    //    (sync byte 0x47 cada 188 bytes — comprobación ligera del primer byte).
-    let kind = "ts";
-    if (media.map || (firstBytes && String.fromCharCode(...firstBytes.slice(4, 8)) === "ftyp") || (firstBytes && String.fromCharCode(...firstBytes.slice(4, 8)) === "styp")) {
-      kind = "fmp4";
-    } else if (firstBytes && firstBytes[0] !== 0x47) {
-      // Ni TS puro ni fMP4 evidente: confiar en el EXT-X-MAP ausente y marcar
-      // TS (los players hacen sniffing). No se lanza: el archivo es el que era.
-      kind = "ts";
-    }
+    const kind = sniffContainer(media.map, firstBytes);
 
-    // 5) Concatenación binaria en orden de reproducción.
+    // Concatenación binaria en orden de reproducción.
     const parts = [];
     if (kind === "fmp4") {
       for (const mapBuf of mapBuffers.values()) parts.push(mapBuf);
@@ -401,13 +442,263 @@
     };
   }
 
+  // --- Modo live: ventana deslizante con sondeo y parada del usuario ---
+
+  // opts: los de downloadHls más { maxDurationSec=4h, stallRounds=4 }.
+  // onProgress recibe ({ bytes, segments, durationSec, elapsedSec }).
+  // La petición de parada (signal) NO es un error: finaliza y entrega lo
+  // grabado hasta el momento (semántica "Parar y guardar").
+  // Devuelve el mismo shape que downloadHls con live: true.
+  async function downloadHlsLive(opts) {
+    const {
+      url,
+      quality = "best",
+      fetchImpl = (u, o) => fetch(u, o),
+      concurrency = 6,
+      retries = 2,
+      onProgress = null,
+      beforeFetch = null,
+      signal = null,
+      maxBytes = 2 * 1024 * 1024 * 1024,
+      maxDurationSec = 4 * 60 * 60,
+      stallRounds = 4,
+      pollIntervalMs = null, // override de test; si no, TARGETDURATION/2 (mín. 4 s)
+      initialPlaylistUrl = null, // media playlist ya resuelta por downloadHls
+      initialMedia = null, // primer parse (semilla de la ventana actual)
+    } = opts || {};
+
+    const doFetch = async (u, o = {}) => {
+      if (beforeFetch) await beforeFetch(u);
+      return fetchImpl(u, { credentials: "include", cache: "force-cache", ...o });
+    };
+    const aborted = () => signal && signal.aborted;
+    const throwIfAborted = () => {
+      if (aborted()) throw new Error("Descarga cancelada.");
+    };
+    const fetchResource = createFetchResource({ doFetch, retries, isAborted: aborted });
+
+    // 1) Playlist: reutiliza la media resuelta por downloadHls (evita perder
+    //    la ventana actual al re-leer) o resuelve variantes desde cero.
+    let playlistUrl = initialPlaylistUrl || url;
+    let variant = null;
+    if (!initialMedia) {
+      const resolved = await resolveVariantPlaylist({ url, quality, doFetch, throwIfAborted });
+      playlistUrl = resolved.playlistUrl;
+      variant = resolved.variant;
+    }
+
+    // 2) Estado del live: dedupe por media sequence absoluta.
+    const seen = new Set(); // seq ya encolados
+    const buffers = new Map(); // seq -> Uint8Array
+    const mapBuffers = new Map();
+    const pending = []; // cola de segmentos pendientes de fetch
+    let bytes = 0;
+    let done = 0;
+    let durationSeen = 0;
+    let firstBytes = null;
+    let encryptedSeen = false;
+    let inFlight = 0; // segmentos en descarga ahora mismo
+    let ended = false; // ENDLIST visto
+    let stopping = false; // parada solicitada (signal)
+    let stallRoundsSeen = 0;
+    let emptyPolls = 0;
+    let emptySinceMs = 0;
+    const t0 = Date.now();
+
+    // Semilla: la ventana actual ya parseada por downloadHls entra primero.
+    if (initialMedia) {
+      for (const seg of initialMedia.segments) {
+        if (seen.has(seg.seq)) continue;
+        seen.add(seg.seq);
+        durationSeen += seg.duration || 0;
+        pending.push(seg);
+      }
+    }
+
+    let fatal = null;
+    const reportProgress = () => {
+      if (!onProgress) return;
+      try {
+        onProgress({
+          bytes,
+          segments: done,
+          durationSec: durationSeen,
+          elapsedSec: Math.round((Date.now() - t0) / 1000),
+          live: true,
+        });
+      } catch {
+        /* el callback de progreso no debe tumbar la grabación */
+      }
+    };
+
+    const runSegment = async (seg) => {
+      const buf = await processSegment(seg, fetchResource, doFetch, mapBuffers);
+      buffers.set(seg.seq, buf);
+      if (!firstBytes && buf.length >= 4) firstBytes = buf.slice(0, 12);
+      if (seg.key) encryptedSeen = true;
+      bytes += buf.byteLength;
+      done++;
+      if (bytes > maxBytes) {
+        // Límite alcanzado: vaciar la cola y cerrar la grabación con orden
+        // (no es un error fatal: se entrega lo grabado).
+        ended = true;
+        stopping = true;
+        pending.length = 0;
+        throw new Error(`El stream supera el límite de ${(maxBytes / 1073741824).toFixed(0)} GB — grabación cerrada.`);
+      }
+      reportProgress();
+    };
+
+    // 3) Workers continuos: drenan `pending` mientras haya vida en la grabación.
+    const worker = async () => {
+      while (true) {
+        if (fatal) return;
+        if (stopping && !pending.length) return;
+        const seg = pending.shift();
+        if (!seg) {
+          if (ended) return;
+          await new Promise((r) => setTimeout(r, 150));
+          continue;
+        }
+        inFlight++;
+        try {
+          await runSegment(seg);
+        } catch (e) {
+          // Parada del usuario o fin ordenado (límite/ENDLIST): cerrar worker
+          // en silencio y entregar lo grabado. Solo un fallo real es fatal.
+          // Se consulta el signal directamente: el poller puede seguir dormido.
+          if (ended || stopping || aborted()) {
+            reportProgress();
+            return;
+          }
+          if (!fatal) fatal = e;
+          return;
+        } finally {
+          inFlight--;
+        }
+      }
+    };
+
+    // 4) Sondeo del playlist: ventana deslizante con dedupe por seq.
+    const poller = (async () => {
+      let intervalMs = 4000;
+      let first = true;
+      while (!fatal) {
+        if (aborted()) stopping = true;
+        if (stopping) return;
+        try {
+          const res = await doFetch(playlistUrl, { cache: "no-store" });
+          if (!res.ok) throw new Error(`No se pudo leer el manifiesto (HTTP ${res.status}): ${playlistUrl}`);
+          const text = await res.text();
+          const media = parseMedia(text, playlistUrl);
+          if (!media || !media.segments.length) {
+            // Playlist sin segmentos: puede ser un vaciado transitorio del
+            // servidor. Con datos ya grabados, unas rondas secas cierran la
+            // grabación; sin datos, se tolera hasta 30 s antes de rendirse.
+            if (done > 0 && ++emptyPolls >= stallRounds) {
+              stopping = true;
+              return;
+            }
+            if (!emptySinceMs) emptySinceMs = Date.now();
+            if (done === 0 && inFlight === 0 && pending.length === 0 && Date.now() - emptySinceMs > 30000) {
+              throw new Error("El manifiesto no contiene segmentos descargables.");
+            }
+          } else {
+            emptyPolls = 0;
+            emptySinceMs = 0;
+            if (media.targetDuration) {
+              intervalMs = pollIntervalMs || Math.max(4000, Math.round((media.targetDuration * 1000) / 2));
+            } else if (pollIntervalMs) {
+              intervalMs = pollIntervalMs;
+            }
+
+            let added = 0;
+            for (const seg of media.segments) {
+              if (seen.has(seg.seq)) continue;
+              seen.add(seg.seq);
+              durationSeen += seg.duration || 0;
+              if (!stopping) pending.push(seg);
+              added++;
+            }
+            if (media.live === false) ended = true;
+            if (ended) {
+              // ENDLIST: drenar lo pendiente y finalizar.
+              stopping = true;
+              return;
+            }
+            // Stream sin fin y sin datos nuevos tras la primera ventana: o es un
+            // VOD mal etiquetado o el evento aún no emite. Tras stallRounds
+            // rondas sin novedad y con datos, finaliza con lo grabado.
+            if (!first && added === 0 && !pending.length && done > 0) {
+              stallRoundsSeen++;
+              if (stallRoundsSeen >= stallRounds) {
+                stopping = true;
+                return;
+              }
+            } else {
+              stallRoundsSeen = 0;
+            }
+            first = false;
+
+            if (durationSeen > maxDurationSec) {
+              stopping = true;
+              return;
+            }
+          }
+        } catch (e) {
+          if (aborted()) {
+            stopping = true;
+            return;
+          }
+          // Un fallo puntual del sondeo no mata la grabación: reintentará en
+          // el siguiente intervalo. Si el playlist ha dejado de existir, la
+          // grabación sigue con lo que hay en cola y el usuario decide.
+          if (done === 0 && pending.length === 0) {
+            fatal = e;
+            return;
+          }
+        }
+        await new Promise((r) => setTimeout(r, intervalMs));
+      }
+    })();
+
+    await Promise.all([poller, ...Array.from({ length: concurrency }, worker)]);
+    if (fatal) throw fatal;
+
+    // 5) Ensamblado en orden de reproducción (por seq absoluta).
+    const ordered = [...buffers.keys()].sort((a, b) => a - b).map((k) => buffers.get(k));
+    // Los lives fMP4 declaran EXT-X-MAP (init deduplicado en mapBuffers);
+    // sin MAP se aplica el sniffing de magic bytes sobre el primer segmento.
+    const finalKind = mapBuffers.size > 0 ? "fmp4" : sniffContainer(false, firstBytes);
+
+    const parts = [];
+    if (finalKind === "fmp4") {
+      for (const mapBuf of mapBuffers.values()) parts.push(mapBuf);
+    }
+    for (const b of ordered) parts.push(b);
+    const blob = new Blob(parts, { type: finalKind === "fmp4" ? "video/mp4" : "video/mp2t" });
+
+    reportProgress();
+    return {
+      blob,
+      kind: finalKind,
+      segments: done,
+      bytes,
+      durationSec: durationSeen,
+      encrypted: encryptedSeen,
+      live: true,
+      variant,
+      elapsedSec: Math.round((Date.now() - t0) / 1000),
+    };
+  }
+
   // Limpieza de la caché de claves (los tokens AES expiran entre descargas).
   function clearKeyCache() {
     keyCache.clear();
   }
 
   // --- API pública ---
-  const HLSFast = { parseMaster, parseMedia, downloadHls, clearKeyCache, parseHexIv, sequenceIv };
+  const HLSFast = { parseMaster, parseMedia, downloadHls, downloadHlsLive, clearKeyCache, parseHexIv, sequenceIv };
   global.HLSFast = HLSFast;
   if (typeof module !== "undefined" && module.exports) {
     module.exports = HLSFast;

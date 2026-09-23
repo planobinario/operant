@@ -7,12 +7,14 @@
   "scripts": {
     "dev": "web-ext run --target=chromium --source-dir=./src",
     "dev:firefox": "node scripts/build-firefox.mjs && web-ext run --source-dir=./dist-firefox",
-    "build": "web-ext build --source-dir=./src --artifacts-dir=./web-ext-artifacts",
-    "build:firefox": "node scripts/build-firefox.mjs && web-ext build --source-dir=./dist-firefox --artifacts-dir=./web-ext-artifacts",
+    "build": "web-ext build --source-dir=./src --artifacts-dir=./web-ext-artifacts --overwrite-dest",
+    "build:firefox": "node scripts/build-firefox.mjs && web-ext build --source-dir=./dist-firefox --artifacts-dir=./web-ext-artifacts --overwrite-dest",
     "test:verify": "node tests/run-verification.js",
     "test:verify:public": "node tests/run-verification.js --public",
     "test:audit": "node tests/run-panel-audit.js",
-    "test:fixtures": "node tests/generate-fixtures.js"
+    "test:fixtures": "node tests/generate-fixtures.js",
+    "host:build": "cargo build --release --manifest-path native-host-rs/Cargo.toml && powershell -Command Copy-Item native-host-rs/target/release/operant-host.exe native-host/operant-host.exe -Force",
+    "host:test": "python tests/host-e2e.py --skip-ytdlp-download --skip-ffmpeg-download"
   },
   "devDependencies": {
     "puppeteer-core": "25.4.0",

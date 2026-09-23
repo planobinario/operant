@@ -1,75 +1,88 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="es" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Operant</title>
     <link rel="stylesheet" href="panel.css" />
+    <script>
+      (() => {
+        try {
+          const stored = localStorage.getItem('theme');
+          const theme = stored === 'light' || stored === 'dark'
+            ? stored
+            : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+          document.documentElement.dataset.theme = theme;
+        } catch {
+          document.documentElement.dataset.theme = 'dark';
+        }
+      })();
+    </script>
   </head>
   <body>
-    <!-- Fila 1: marca + contador dinámico + buscador + seleccionar todo + acciones -->
+    <!-- Fila única consolidada: Selección + Buscador + Zip + Vista + Acciones -->
     <header class="topbar">
-      <div class="brand" title="Operant — Browser Agent & Media Engine">
-        <svg width="16" height="16" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="15" fill="currentColor" /><path d="M 10.55 9.64 L 17.14 16 L 10.55 22.36" fill="none" stroke="var(--bg)" stroke-width="3.64" stroke-linecap="round" stroke-linejoin="round" /><circle cx="23.27" cy="16" r="2.6" fill="#ef4444" /></svg>
-        <span id="connDot" class="dot" title="Página escaneable"></span>
+      <!-- Selector masivo -->
+      <div class="top-sel">
+        <label class="check selcheck" title="Seleccionar todos los visibles (con filtros activos)">
+          <input type="checkbox" id="chkSelectAll" /> <span class="sel-label">Todo</span>
+        </label>
+        <span id="selInfo" class="sel-info" hidden></span>
+        <button id="btnClearSel" class="chip-btn mini" hidden title="Limpiar selección">✕</button>
       </div>
-      <span id="counterText" class="counter" title="Medios detectados en la pestaña activa">…</span>
-      <input
-        id="search"
-        class="search"
-        type="search"
-        placeholder="Buscar por nombre o URL…"
-        autocomplete="off"
-        spellcheck="false"
-      />
-      <label class="check selcheck" title="Seleccionar todos los visibles (con filtros activos)">
-        <input type="checkbox" id="chkSelectAll" /> Todo
-      </label>
-      <button id="btnRefresh" class="icon-btn" title="Re-escaneo manual (muestra progreso)" aria-label="Actualizar">⟳</button>
-      <button
-        id="btnFilter"
-        class="icon-btn"
-        title="Opciones"
-        aria-label="Opciones"
-        aria-expanded="false"
-      >
-        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-          <path
-            d="M2 3h12l-4.2 5.2v4.1L6.2 14V8.2L2 3z"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linejoin="round"
-          />
-        </svg>
-      </button>
-    </header>
 
-    <!-- Fila 2: controles compactos en línea (estilo ImageEye) -->
-    <section class="controlbar">
-      <select id="fMinSize" class="ctl" title="Tamaño mínimo">
-        <option value="0">Tamaño: todo</option>
-        <option value="10">&gt;10 KB</option>
-        <option value="100">&gt;100 KB</option>
-        <option value="1024">&gt;1 MB</option>
-        <option value="5120">&gt;5 MB</option>
-      </select>
-      <select id="fExt" class="ctl" title="Tipo (extensión)">
-        <option value="">Tipo: todo</option>
-      </select>
-      <select id="layoutSel" class="ctl" title="Vista">
-        <option value="full">☰ Full</option>
-        <option value="masonry">▤ Masonry</option>
-      </select>
-      <input id="fDomain" class="ctl domain" type="text" placeholder="dominio…" list="domainList" autocomplete="off" spellcheck="false" />
-      <datalist id="domainList"></datalist>
-      <select id="sortBy" class="ctl sort" title="Ordenar">
-        <option value="detect">Orden: detección</option>
-        <option value="size">Orden: tamaño</option>
-        <option value="dims">Orden: dimensiones</option>
-        <option value="domain">Orden: dominio</option>
-      </select>
-    </section>
+      <!-- Buscador integrado -->
+      <div class="search-box">
+        <svg class="search-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+        <input
+          id="search"
+          class="search"
+          type="search"
+          placeholder="Buscar (Ctrl+F)…"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <!-- Acciones de cabecera: Zip normalizado + Vista + Acciones rápidas -->
+      <div class="top-actions">
+        <button id="btnZip" class="chip-btn primary zip-btn" disabled title="Descargar elementos seleccionados en archivo zip">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <span class="zip-text">Zip</span>
+        </button>
+        <select id="layoutSel" class="ctl view-select" title="Vista">
+          <option value="full">☰ Full</option>
+          <option value="masonry">▤ Masonry</option>
+        </select>
+        <button id="btnRefresh" class="icon-btn" title="Re-escaneo manual (muestra progreso)" aria-label="Actualizar">⟳</button>
+        <button id="btnCompanionHeader" class="icon-btn" title="Operant Companion (yt-dlp / ffmpeg)" aria-label="Operant Companion">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="M6 10l3 3-3 3M13 16h5"/></svg>
+        </button>
+        <button id="btnRecord" class="icon-btn" title="Grabar vídeo (buffers MSE, requiere host nativo)" aria-label="Grabar vídeo" aria-pressed="false">
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+            <circle cx="8" cy="8" r="5" fill="currentColor" />
+          </svg>
+        </button>
+        <button
+          id="btnFilter"
+          class="icon-btn"
+          title="Ajustes y opciones (tema, descargas, filtros)"
+          aria-label="Ajustes"
+          aria-expanded="false"
+        >
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Compatibilidad DOM: elementos no visuales requeridos por background/tests -->
+      <span id="counterText" hidden style="display:none"></span>
+      <span id="connDot" class="dot" hidden style="display:none"></span>
+      <button id="btnYtdl" hidden style="display:none"></button>
+      <button id="btnDl" hidden style="display:none"></button>
+    </header>
 
     <!-- Fila 3: pestañas independientes con contador propio -->
     <nav class="tabs" role="tablist">
@@ -94,8 +107,67 @@
       <button id="btnStopScan" class="chip-btn mini" title="Detener escaneo" hidden>✕</button>
     </div>
 
-    <!-- Popover de opciones: thumbnail, checks y acciones secundarias -->
+    <!-- Barra sutil de estado (reemplaza al footer inferior) -->
+    <div id="statusBar" class="status-banner" hidden>
+      <span id="statusText"></span>
+    </div>
+    <button id="nativeChip" class="chip" hidden style="display:none"></button>
+
+    <!-- Popover de opciones y ajustes -->
     <div id="filterPop" class="popover" hidden>
+      <div class="pop-header">
+        <span class="pop-title">Ajustes &amp; Opciones</span>
+      </div>
+      <div class="pop-section theme-section">
+        <span class="pop-label">Tema</span>
+        <div class="theme-segmented">
+          <button type="button" class="theme-segment-btn" data-theme-val="dark" title="Tema oscuro (Warm Ink)">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg> Oscuro
+          </button>
+          <button type="button" class="theme-segment-btn" data-theme-val="light" title="Tema claro (Paper Light)">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2"/></svg> Blanco
+          </button>
+          <button type="button" class="theme-segment-btn" data-theme-val="system" title="Detectar según el sistema">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg> Auto
+          </button>
+        </div>
+      </div>
+      <div class="pop-section filters-section">
+        <span class="pop-label">Filtros &amp; Orden</span>
+        <div class="pop-row-grid">
+          <div class="pop-field">
+            <label class="pop-field-label" for="fMinSize">Tamaño mín.</label>
+            <select id="fMinSize" class="ctl">
+              <option value="0">Tamaño: todo</option>
+              <option value="10">&gt;10 KB</option>
+              <option value="100">&gt;100 KB</option>
+              <option value="1024">&gt;1 MB</option>
+              <option value="5120">&gt;5 MB</option>
+            </select>
+          </div>
+          <div class="pop-field">
+            <label class="pop-field-label" for="fExt">Extensión</label>
+            <select id="fExt" class="ctl">
+              <option value="">Tipo: todo</option>
+            </select>
+          </div>
+          <div class="pop-field">
+            <label class="pop-field-label" for="sortBy">Ordenar</label>
+            <select id="sortBy" class="ctl">
+              <option value="smart" selected>Orden: web (grandes primero)</option>
+              <option value="size">Orden: tamaño / peso</option>
+              <option value="dims">Orden: dimensiones</option>
+              <option value="detect">Orden: detección pura</option>
+              <option value="domain">Orden: dominio</option>
+            </select>
+          </div>
+          <div class="pop-field">
+            <label class="pop-field-label" for="fDomain">Dominio</label>
+            <input id="fDomain" class="ctl domain" type="text" placeholder="dominio…" list="domainList" autocomplete="off" spellcheck="false" />
+            <datalist id="domainList"></datalist>
+          </div>
+        </div>
+      </div>
       <div class="pop-section row">
         <label class="pop-label" for="thumbSize">Tamaño</label>
         <input type="range" id="thumbSize" min="64" max="240" value="120" title="Tamaño de thumbnail (masonry)" />
@@ -147,16 +219,7 @@
       <button id="btnEmptyReset" class="chip-btn" hidden>Limpiar filtros</button>
     </div>
 
-    <!-- Barra inferior ÚNICA: estado + selección + descarga -->
-    <footer class="statusbar">
-      <span id="statusText">Escaneando…</span>
-      <span id="selInfo" class="sel-info" hidden></span>
-      <button id="btnClearSel" class="chip-btn mini" hidden>Limpiar</button>
-      <button id="btnZip" class="chip-btn primary" disabled>Descargar (zip)</button>
-      <button id="btnYtdl" class="chip-btn accent" hidden title="yt-dlp (máx. calidad)">yt-dlp</button>
-      <button id="btnDl" class="chip-btn mini" hidden title="Cola de descargas">Descargas (0)</button>
-      <button id="nativeChip" class="chip" hidden title="Herramientas: yt-dlp / ffmpeg">yt-dlp: —</button>
-    </footer>
+
 
     <!-- Lightbox: preview ampliado de imágenes con zoom -->
     <dialog id="lightboxDialog" class="lightbox">
@@ -175,7 +238,7 @@
       <div id="lbStage" class="lightbox-stage">
         <button id="lbPrev" class="icon-btn lb-nav" title="Anterior (←)" aria-label="Anterior" hidden>‹</button>
         <button id="lbNext" class="icon-btn lb-nav" title="Siguiente (→)" aria-label="Siguiente" hidden>›</button>
-        <img id="lbImg" alt="" draggable="false" />
+        <img id="lbImg" alt="" draggable="false" referrerpolicy="no-referrer" />
         <div id="lbErr" class="preview-err" hidden></div>
       </div>
       <div class="lightbox-foot" id="lbMeta"></div>
@@ -291,6 +354,16 @@
         <button value="cancel" class="chip-btn mini-btn" title="Cerrar">✕</button>
       </form>
       <div class="proc-body">
+        <div id="companionBanner" class="companion-banner">
+          <div class="companion-status-icon">
+            <span id="companionPulse" class="companion-pulse"></span>
+          </div>
+          <div class="companion-status-info">
+            <strong id="companionStatusTitle">Operant Companion</strong>
+            <p id="companionStatusDesc">Comprobando estado del host nativo…</p>
+          </div>
+          <button id="btnReconnectHost" class="chip-btn mini" type="button" title="Recomprobar conexión" hidden>Reconectar</button>
+        </div>
         <div class="tool-row" id="tool-yt-dlp">
           <div class="tool-head">
             <span class="tool-name">yt-dlp</span>
@@ -298,6 +371,7 @@
           </div>
           <div class="tool-actions">
             <button class="chip-btn primary tool-btn" id="btn-yt-dlp" hidden>Instalar</button>
+            <button class="chip-btn tool-btn btn-danger-soft" id="btn-uninstall-yt-dlp" hidden title="Desinstalar herramienta de ~/Operant/bin/">Desinstalar</button>
             <span class="tool-note" id="note-yt-dlp"></span>
           </div>
           <progress class="tool-bar" id="bar-yt-dlp" value="0" max="100" hidden></progress>
@@ -310,6 +384,7 @@
           </div>
           <div class="tool-actions">
             <button class="chip-btn primary tool-btn" id="btn-ffmpeg" hidden>Instalar</button>
+            <button class="chip-btn tool-btn btn-danger-soft" id="btn-uninstall-ffmpeg" hidden title="Desinstalar herramienta de ~/Operant/bin/">Desinstalar</button>
             <span class="tool-note" id="note-ffmpeg"></span>
           </div>
           <progress class="tool-bar" id="bar-ffmpeg" value="0" max="100" hidden></progress>

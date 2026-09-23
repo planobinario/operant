@@ -438,7 +438,7 @@ El diagnóstico proponía `chrome.downloads.download({url, headers:[{name:"Refer
 
 ### Conclusión
 
-- **El diagnóstico de fondo es correcto**: el error "El archivo no estaba disponible en el sitio" con erome es por **protección hotlink vía `Referer`**, no por CORS (el servidor rechaza las peticiones sin el Referer de su propia página).
+- **El diagnóstico de fondo es correcto**: el error "El archivo no estaba disponible en el sitio" con CDNs protegidas es por **protección hotlink vía `Referer`**, no por CORS (el servidor rechaza las peticiones sin el Referer de su propia página).
 - **Pero la técnica propuesta (headers en `chrome.downloads.download`) está bloqueada por Chrome**: `Referer` es una cabecera restringida (`Unsafe request header name`), así que no se puede forzar por esa API.
 - **El mecanismo actual de la extensión YA implementa el patrón correcto** (el mismo de FetchV, sin la pestaña intermedia): el SW hace el fetch con el Referer real de la página inyectado por una **regla DNR efímera** (la única vía en MV3 para forzar el Referer), y entrega con data URL chunked. Verificado end-to-end contra el fixture que exige Referer: `PASS` con bytes completos.
 - La diferencia con FetchV: FetchV entrega con `createObjectURL` + `<a download>` (requiere su pestaña en `fetchv.net`); esta extensión entrega con data URL chunked desde el SW (sin pestaña extra, pero con el límite de 128MB documentado antes).
@@ -447,7 +447,7 @@ El diagnóstico proponía `chrome.downloads.download({url, headers:[{name:"Refer
 
 ## Prueba final de tamaño real: 300MB + hotlink por Referer (2026-08-03)
 
-El caso combinado (vídeo de cientos de MB **y** CDN con hotlink por Referer, el erome real) se probó con un fixture nuevo `/protected-big/<MB>.bin` (exige Referer local + soporta Range 206) en Chrome for Testing 153:
+El caso combinado (vídeo de cientos de MB **y** CDN con hotlink por Referer, el caso real de CDN protegida) se probó con un fixture nuevo `/protected-big/<MB>.bin` (exige Referer local + soporta Range 206) en Chrome for Testing 153:
 
 | Vía | Resultado real |
 |---|---|
@@ -472,7 +472,7 @@ El caso combinado (vídeo de cientos de MB **y** CDN con hotlink por Referer, el
 
 ### Bug 2 — tamaño "<1 KB" en vídeos (causa raíz y fix)
 
-Los vídeos de erome mostraban "<1 KB" porque las 3 técnicas de tamaño fallaban: el vídeo no está en la Performance API (es media, no resource), y el GET/HEAD del SW **sin el Referer de la página** da 403 por anti-hotlink → `len=0` → `<1 KB`. Era el mismo anti-hotlink por Referer aplicado al **enriquecimiento**, no un bug de tipo de medio.
+Los vídeos en CDNs con anti-hotlink mostraban "<1 KB" porque las 3 técnicas de tamaño fallaban: el vídeo no está en la Performance API (es media, no resource), y el GET/HEAD del SW **sin el Referer de la página** da 403 por anti-hotlink → `len=0` → `<1 KB`. Era el mismo anti-hotlink por Referer aplicado al **enriquecimiento**, no un bug de tipo de medio.
 
 **Fix**: nueva **técnica 1.5** en `enrichSize` — si las técnicas normales fallan y el recurso es de otro dominio que la página, hacer un GET con el Referer real vía la regla DNR efímera (el mismo mecanismo de la descarga). `enrichMissing` ahora obtiene la URL de la pestaña (`chrome.tabs.get`) y la pasa a `enrichSize`. Verificado con el mismo fixture protegido.
 
@@ -692,3 +692,4 @@ Al pulsar la lupa, el overlay **ya no se marca como busy ni se oculta**: las acc
 | Sin keyframes de rotación de iconos | ✅ |
 | Lupa: popover abierto, overlay visible y NO busy | ✅ |
 | Popover de confirmación (vídeo) con 2 opciones | ✅ |
+

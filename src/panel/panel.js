@@ -12,16 +12,17 @@
 //     con los filtros" con contador lleno en páginas con iconos pequeños).
 
 // ÚNICA FUENTE DE VERDAD de detección/descarga (compartida con el SW).
-import { NTMedia } from "../shared/media-core.js";
+import { OperantMedia } from "../shared/media-core.js";
 // Ruta rápida HLS 100% en navegador (sin host nativo): parseo + fetch paralelo
 // + AES-128 (WebCrypto) + concat binaria fMP4/TS. Mismo motor que el SW.
 import { HLSFast } from "../shared/hls-fast.js";
 
 // CSS del indicador de descarga (componente compartido con el overlay).
-if (window.NTDLIndicatorCSS && !document.getElementById("nt-dl-style")) {
+const dlCss = window.OperantDLIndicatorCSS || window.NTDLIndicatorCSS;
+if (dlCss && !document.getElementById("operant-dl-style")) {
   const st = document.createElement("style");
-  st.id = "nt-dl-style";
-  st.textContent = window.NTDLIndicatorCSS();
+  st.id = "operant-dl-style";
+  st.textContent = dlCss();
   document.head.appendChild(st);
 }
 
@@ -32,9 +33,21 @@ const emptyTitle = document.getElementById("emptyTitle");
 const emptyHint = document.getElementById("emptyHint");
 const btnEmptyReset = document.getElementById("btnEmptyReset");
 const statusText = document.getElementById("statusText");
+const statusBar = document.getElementById("statusBar");
+if (statusText && statusBar) {
+  const syncStatusVisibility = () => {
+    const txt = (statusText.textContent || "").trim();
+    statusBar.hidden = !txt;
+  };
+  syncStatusVisibility();
+  try {
+    new MutationObserver(syncStatusVisibility).observe(statusText, { childList: true, characterData: true, subtree: true });
+  } catch {}
+}
 const connDot = document.getElementById("connDot");
 const nativeChip = document.getElementById("nativeChip");
 const btnAuto = document.getElementById("btnAuto");
+const btnRecord = document.getElementById("btnRecord");
 const btnRefresh = document.getElementById("btnRefresh");
 const btnFilter = document.getElementById("btnFilter");
 const filterPop = document.getElementById("filterPop");
@@ -133,7 +146,7 @@ const state = {
 
 const viewPrefs = {
   view: "full", // full = ancho completo (POR DEFECTO, estilo ImageEye) | masonry
-  sort: "detect",
+  sort: "smart", // POR DEFECTO: imágenes grandes/pesadas según orden de aparición en la web
   thumb: 120,
   hideSmall: false,
   dupes: true,
@@ -170,10 +183,14 @@ function withTimeout(promise, ms) {
 }
 
 function toolInfo(toolName) {
-  const tools = state.native.tools;
-  if (!tools) return { installed: state.native.ytDlp === true && toolName === "yt-dlp", unknown: true };
-  const t = tools[toolName];
-  if (t === undefined) return { installed: false, unknown: true };
+  const tools = state.native?.tools;
+  if (!tools) {
+    const isYt = toolName === "yt-dlp" || toolName === "ytDlp";
+    const installed = isYt ? !!state.native?.ytDlp : !!state.native?.ffmpeg;
+    return { installed, unknown: true };
+  }
+  const t = tools[toolName] ?? (toolName === "yt-dlp" ? tools["ytDlp"] : toolName === "ytDlp" ? tools["yt-dlp"] : undefined);
+  if (t === undefined) return { installed: false, unknown: false };
   if (typeof t === "boolean") return { installed: t, legacy: true };
   return t;
 }
@@ -204,9 +221,20 @@ function formatBytes(bytes) {
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
 function itemName(item) {
+  if (item.name) return item.name;
+  if (item.title) return item.title;
+  if (item.url && item.url.startsWith("data:")) {
+    const ext = item.ext || "jpg";
+    return `image_${(item.w && item.h) ? `${item.w}x${item.h}_` : ""}${Math.abs(item.url.length)}.${ext}`;
+  }
   try {
     const u = new URL(item.url);
-    const last = decodeURIComponent(u.pathname.split("/").filter(Boolean).pop() || "");
+    let last = decodeURIComponent(u.pathname.split("/").filter(Boolean).pop() || "");
+    if (last && item.ext && !last.toLowerCase().endsWith(`.${item.ext}`)) {
+      if (!/\.[a-z0-9]{2,5}$/i.test(last)) {
+        last = `${last}.${item.ext}`;
+      }
+    }
     return last || u.hostname;
   } catch {
     return item.url;
@@ -229,6 +257,19 @@ function counts() {
     if (c[it.type] !== undefined) c[it.type]++;
   }
   return c;
+}
+
+function isSmallMedia(it) {
+  if (it.type !== "image") return false;
+  // Dimensiones conocidas pequeñas (< 100px y área < 12000 px²)
+  if (it.w > 0 && it.h > 0 && (it.w < 100 || it.h < 100) && (it.w * it.h < 12000)) {
+    return true;
+  }
+  // Peso conocido minúsculo (< 3 KB) sin dimensiones grandes
+  if (it.sizeKB !== null && it.sizeKB < 3 && (!it.w || it.w < 100) && (!it.h || it.h < 100)) {
+    return true;
+  }
+  return false;
 }
 
 // --- Filtrado + ordenación ---
@@ -255,12 +296,41 @@ function sortedItems() {
     return true;
   });
 
-  const s = viewPrefs.sort;
-  if (s === "size") {
-    list.sort((a, b) => (b.sizeKB ?? -1) - (a.sizeKB ?? -1));
+  const s = viewPrefs.sort || "smart";
+  if (s === "smart") {
+    // Orden de la web: imágenes grandes/pesadas primero en su orden de aparición visual,
+    // y los iconos / elementos decorativos pequeños abajo (también en orden).
+    list.sort((a, b) => {
+      const aSmall = isSmallMedia(a) ? 1 : 0;
+      const bSmall = isSmallMedia(b) ? 1 : 0;
+      if (aSmall !== bSmall) return aSmall - bSmall;
+      return (a._idx ?? 0) - (b._idx ?? 0);
+    });
+  } else if (s === "size") {
+    list.sort((a, b) => {
+      const sizeA = a.sizeKB ?? -1;
+      const sizeB = b.sizeKB ?? -1;
+      if (sizeA !== sizeB && sizeA >= 0 && sizeB >= 0) {
+        return sizeB - sizeA;
+      }
+      if (sizeA >= 0 && sizeB < 0) return -1;
+      if (sizeB >= 0 && sizeA < 0) return 1;
+      // Desempate por dimensiones (mayor área en píxeles w*h arriba)
+      const dimsA = (a.w && a.h) ? a.w * a.h : -1;
+      const dimsB = (b.w && b.h) ? b.w * b.h : -1;
+      if (dimsA !== dimsB) return dimsB - dimsA;
+      return (a._idx ?? 0) - (b._idx ?? 0);
+    });
   } else if (s === "dims") {
     const d = (it) => (it.w && it.h ? it.w * it.h : -1);
-    list.sort((a, b) => d(b) - d(a));
+    list.sort((a, b) => {
+      const dimsA = d(a);
+      const dimsB = d(b);
+      if (dimsA !== dimsB) return dimsB - dimsA;
+      return (b.sizeKB ?? -1) - (a.sizeKB ?? -1);
+    });
+  } else if (s === "detect") {
+    list.sort((a, b) => (a._idx ?? 0) - (b._idx ?? 0));
   } else if (s === "domain") {
     list.sort((a, b) => (a.domain || "").localeCompare(b.domain || ""));
   }
@@ -298,7 +368,10 @@ function dupKeysOf(items) {
 
 // --- Estado de items (única vía de entrada, evita arrays rotos) ---
 function setItems(items) {
-  state.items = Array.isArray(items) ? items : [];
+  state.items = (Array.isArray(items) ? items : []).map((it, idx) => {
+    if (it._idx === undefined) it._idx = idx;
+    return it;
+  });
   const valid = new Set(state.items.map((it) => it.url));
   for (const u of [...state.selected]) {
     if (!valid.has(u)) state.selected.delete(u);
@@ -432,9 +505,10 @@ function quickBtn(glyph, label, opts = {}) {
   // compartido (anillo de progreso real/indeterminado, check, error) en vez
   // del glyph de texto. El resto sigue con texto.
   let indicator = null;
-  if (opts.cls === "act-dl" && window.NTDLIndicator) {
-    indicator = new window.NTDLIndicator(b);
-    b.classList.add("nt-dl-host");
+  const DLInd = window.OperantDLIndicator || window.NTDLIndicator;
+  if (opts.cls === "act-dl" && DLInd) {
+    indicator = new DLInd(b);
+    b.classList.add("operant-dl-host");
   } else {
     b.textContent = glyph;
   }
@@ -604,6 +678,12 @@ function showSkeletons() {
 function emptyReason() {
   const total = state.items.length;
   if (total === 0) {
+    if (state.reachable === false) {
+      return {
+        title: "Página no escaneable",
+        hint: "Página del sistema (chrome:// o protegida). Pulsa «Actualizar» para re-escanear en páginas web estándar. Los streams (m3u8/mpd) se capturan solos vía webRequest.",
+      };
+    }
     return {
       title: "Sin resultados",
       hint: "Pulsa «Actualizar» para re-escaneo. Los streams (m3u8/mpd) se capturan solos vía webRequest.",
@@ -642,13 +722,15 @@ function render() {
   document.getElementById("countAudio").textContent = c.audio;
   document.getElementById("countFile").textContent = c.file;
 
-  // Contador dinámico de la pestaña activa ("36 imágenes encontradas").
-  if (loading) {
-    counterText.textContent = "Escaneando…";
-  } else {
-    const n = c[state.tab];
-    const lab = COUNTER_LABELS[state.tab];
-    counterText.textContent = `${n} ${n === 1 ? lab.s : lab.p} ${n === 1 ? `encontrad${lab.v}` : `encontrad${lab.v}s`}`;
+  // Contador dinámico de la pestaña activa (si existe en el DOM)
+  if (counterText) {
+    if (loading) {
+      counterText.textContent = "Escaneando…";
+    } else {
+      const n = c[state.tab];
+      const lab = COUNTER_LABELS[state.tab];
+      counterText.textContent = `${n} ${n === 1 ? lab.s : lab.p} ${n === 1 ? `encontrad${lab.v}` : `encontrad${lab.v}s`}`;
+    }
   }
 
   // Nunca se muestra el vacío mientras se renderizan skeletons.
@@ -801,10 +883,13 @@ function renderCard(item, index) {
       const img = document.createElement("img");
       img.loading = "lazy";
       img.decoding = "async";
+      img.referrerPolicy = "no-referrer";
       img.alt = "";
       img.src = item.url;
       img.addEventListener("error", () => {
-        if (img.parentNode) {
+        if (item.thumb && img.src !== item.thumb) {
+          img.src = item.thumb;
+        } else if (img.parentNode) {
           img.replaceWith(placeholderEl("IMG", "preview no disponible"));
         }
       });
@@ -873,24 +958,9 @@ function renderCard(item, index) {
     thumb.appendChild(dupBadge);
   }
 
-  // Hover: preview ampliado (imágenes) — para vídeo se usa setupVideoHover.
+  // Hover: preview ampliado (imágenes) — bajo demanda con filtro estricto de tamaño.
   if (item.type === "image" && !blobUrl) {
-    const hover = document.createElement("div");
-    hover.className = "card-hover";
-    const hv = document.createElement("div");
-    hv.className = "hover-box";
-    const big = document.createElement("img");
-    big.loading = "lazy";
-    big.alt = "";
-    big.src = item.url;
-    big.addEventListener("error", () => big.remove());
-    hv.appendChild(big);
-    const hvMeta = document.createElement("div");
-    hvMeta.className = "hover-meta";
-    hvMeta.textContent = `${item.url} · ${metaString(item)}`;
-    hv.appendChild(hvMeta);
-    hover.appendChild(hv);
-    thumb.appendChild(hover);
+    setupImageHover(card, thumb, item);
   }
 
   // Número de tarjeta en la esquina inferior derecha del thumbnail (libre).
@@ -1024,10 +1094,15 @@ function renderListCard(item, index) {
       const img = document.createElement("img");
       img.loading = "lazy";
       img.decoding = "async";
+      img.referrerPolicy = "no-referrer";
       img.alt = "";
       img.src = item.url;
       img.addEventListener("error", () => {
-        if (img.parentNode) img.replaceWith(placeholderEl("IMG", "preview no disponible"));
+        if (item.thumb && img.src !== item.thumb) {
+          img.src = item.thumb;
+        } else if (img.parentNode) {
+          img.replaceWith(placeholderEl("IMG", "preview no disponible"));
+        }
       });
       // Medición real al cargar: rellena el badge de dimensiones si faltaba.
       img.addEventListener("load", () => {
@@ -1110,8 +1185,9 @@ function renderListCard(item, index) {
   // URL de origen debajo: gris tenue, truncada, tooltip con la URL completa.
   const urlLine = document.createElement("div");
   urlLine.className = "lc-url";
-  urlLine.textContent = item.url;
-  urlLine.title = item.url;
+  const isData = item.url.startsWith("data:");
+  urlLine.textContent = isData ? `data:${item.ext || "image"} · inline base64 (${formatSize(item.sizeKB, item.sizeUnknown)})` : item.url;
+  urlLine.title = isData ? `Imagen embebida (data:${item.ext || "image"})` : item.url;
   card.appendChild(urlLine);
 
   // Clic en la tarjeta: preview. Ctrl/Shift = selección.
@@ -1129,6 +1205,77 @@ function renderListCard(item, index) {
   });
 
   return card;
+}
+
+// Hover de imagen: preview ampliado bajo demanda con filtro estricto de tamaño.
+// Solo se activa si la imagen real es >= 140px y más grande que el thumbnail renderizado.
+function setupImageHover(card, thumb, item) {
+  let hoverEl = null;
+
+  const cleanup = () => {
+    if (hoverEl) {
+      hoverEl.remove();
+      hoverEl = null;
+    }
+  };
+
+  card.addEventListener(
+    "mouseenter",
+    () => {
+      // 1. Si ya se conocen dimensiones y es pequeña (< 140px), descartar
+      if (item.w && item.w < 140) return;
+      if (item.h && item.h < 140) return;
+
+      // 2. Si el thumbnail ya está en el DOM, verificar dimensiones reales
+      const thumbImg = thumb.querySelector("img");
+      if (thumbImg && thumbImg.naturalWidth > 0 && thumbImg.naturalHeight > 0) {
+        item.w = thumbImg.naturalWidth;
+        item.h = thumbImg.naturalHeight;
+        // Umbral estricto: descartar iconos, avatares y elementos < 140px
+        if (item.w < 140 || item.h < 140) return;
+        // Si la imagen es menor o igual al thumbnail en pantalla, no tiene sentido ampliar
+        if (item.w <= thumb.clientWidth && item.h <= thumb.clientHeight) return;
+      }
+
+      if (hoverEl) return;
+
+      hoverEl = document.createElement("div");
+      hoverEl.className = "card-hover";
+
+      const hv = document.createElement("div");
+      hv.className = "hover-box";
+
+      const big = document.createElement("img");
+      big.alt = "";
+      big.src = item.url;
+
+      big.addEventListener("load", () => {
+        if (big.naturalWidth > 0 && big.naturalHeight > 0) {
+          item.w = big.naturalWidth;
+          item.h = big.naturalHeight;
+          if (big.naturalWidth < 140 || big.naturalHeight < 140) {
+            cleanup();
+            return;
+          }
+        }
+      });
+      big.addEventListener("error", cleanup);
+
+      hv.appendChild(big);
+
+      const hvMeta = document.createElement("div");
+      hvMeta.className = "hover-meta";
+      hvMeta.textContent = `${item.url} · ${metaString(item)}`;
+      hv.appendChild(hvMeta);
+
+      hoverEl.appendChild(hv);
+      thumb.appendChild(hoverEl);
+    },
+    { passive: true }
+  );
+
+  card.addEventListener("mouseleave", cleanup, { passive: true });
+  card.addEventListener("click", cleanup);
 }
 
 // Hover de vídeo: preview mudo en loop (estilo YouTube).
@@ -1263,16 +1410,29 @@ function openPreview(item) {
 }
 
 // --- Progreso real de escaneo (barra "Analizando X de Y elementos") ---
+const SCAN_PHASE_LABELS = {
+  inicio: "Iniciando análisis",
+  "imágenes": "Escaneando imágenes DOM",
+  enlaces: "Extrayendo enlaces de alta resolución",
+  atributos: "Analizando atributos y metadatos",
+  medios: "Detectando vídeos y audio",
+  estilos: "Evaluando estilos y fondos CSS",
+  done: "Escaneo completado",
+};
+
 let scanHideTimer = null;
 
-function showScanProgress(done, total, phase) {
+function showScanProgress(done, total, phase, found) {
   clearTimeout(scanHideTimer);
   scanBar.hidden = false;
+
+  const count = typeof found === "number" && found >= 0 ? Math.max(found, state.items.length) : state.items.length;
+
   if (phase === "scroll" || (typeof phase === "string" && phase.startsWith("scroll "))) {
     // Fase de auto-scroll: mostramos el paso en curso + botón de detener.
-    const step = phase.split(" ")[1];
+    const step = phase.split(" ")[1] || "";
     scanFill.style.width = "100%";
-    scanText.textContent = `Escaneando… (scroll ${step})`;
+    scanText.textContent = `Auto-scroll (${step}) · ${count} medio${count === 1 ? "" : "s"} detectado${count === 1 ? "" : "s"}`;
     btnStopScan.hidden = false;
     scanHideTimer = setTimeout(() => {
       scanBar.hidden = true;
@@ -1280,18 +1440,27 @@ function showScanProgress(done, total, phase) {
     }, 3000);
     return;
   }
-  if (phase === "done") {
+
+  if (phase === "done" || (total > 0 && done >= total)) {
     btnStopScan.hidden = true;
-    scanHideTimer = setTimeout(() => { scanBar.hidden = true; }, 400);
+    scanFill.style.width = "100%";
+    scanText.textContent = `Escaneo completado · ${count} medio${count === 1 ? "" : "s"} detectado${count === 1 ? "" : "s"} (100%)`;
+    scanHideTimer = setTimeout(() => {
+      scanBar.hidden = true;
+    }, 450);
     return;
   }
+
   btnStopScan.hidden = true;
-  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  const pct = total > 0 ? Math.min(99, Math.round((done / total) * 100)) : 0;
   scanFill.style.width = `${pct}%`;
-  scanText.textContent = total > 0 ? `Analizando ${Math.min(done, total)} de ${total} elementos` : "Analizando…";
+
+  const label = SCAN_PHASE_LABELS[phase] || "Analizando página";
+  scanText.textContent = `${label} (${pct}%) · ${count} medio${count === 1 ? "" : "s"} detectado${count === 1 ? "" : "s"}`;
+
   scanHideTimer = setTimeout(() => {
     scanBar.hidden = true;
-  }, done >= total ? 600 : 6000);
+  }, 4000);
 }
 
 // Captura el PRIMER fotograma de un vídeo directo (mp4/webm) para usarlo como
@@ -1364,12 +1533,20 @@ function lbShow() {
   lbErr.hidden = true;
   lbImg.style.transform = "";
   applyLbZoom();
+  lbImg.referrerPolicy = "no-referrer";
   if (item.url.startsWith("blob:")) {
     showLbErr("URL blob: de la página — no se puede previsualizar desde el panel. Prueba a descargarla.");
     lbImg.onerror = null;
     lbImg.src = "";
   } else {
-    lbImg.onerror = () => showLbErr("No se pudo cargar la imagen (CORS, 404 o contenido protegido).");
+    lbImg.onerror = () => {
+      if (item.thumb && lbImg.src !== item.thumb) {
+        lbImg.src = item.thumb;
+        showLbErr("Mostrando miniatura de la página (el servidor externo bloqueó el acceso por CORS/403).");
+      } else {
+        showLbErr("No se pudo cargar la imagen (CORS, 404 o contenido protegido).");
+      }
+    };
     lbImg.src = item.url;
   }
   lbPrev.hidden = lbIndex <= 0;
@@ -1782,6 +1959,7 @@ async function loadViewPrefs() {
   Object.assign(viewPrefs, data.viewPrefs || {});
   // Migración: las vistas grid/list de versiones anteriores desaparecen.
   if (!TABS_VIEWS.includes(viewPrefs.view)) viewPrefs.view = "full";
+  if (!viewPrefs.sort || viewPrefs.sort === "detect" || viewPrefs.sort === "size") viewPrefs.sort = "smart";
   layoutSel.value = viewPrefs.view;
   sortBy.value = viewPrefs.sort;
   thumbSize.value = viewPrefs.thumb;
@@ -1928,7 +2106,7 @@ async function renderHistory() {
     re.className = "chip-btn";
     re.textContent = "Re-descargar";
     re.addEventListener("click", () => {
-      chrome.runtime.sendMessage({ type: "dl-start", url: h.url, filename: h.name });
+      dlStart({ url: h.url, filename: h.name }).catch(() => {});
       statusText.textContent = `Re-descargando ${h.name}…`;
     });
     row.append(info, re);
@@ -1980,6 +2158,50 @@ btnExport.addEventListener("click", async () => {
 //      calidades sin yt-dlp; si el parseo no da una URL descargable, caer a yt-dlp.
 //   3. Embed de plataforma (YouTube/Vimeo…) -> yt-dlp como único camino viable.
 async function downloadOne(item, indicator = null) {
+  // 1. IMÁGENES Y ARCHIVOS DIRECTOS:
+  // Nunca deben invocar yt-dlp, ffmpeg, DASH, HLS ni selectores de calidad de vídeo.
+  if (item.type === "image" || item.type === "file") {
+    statusText.textContent = `Descargando ${itemName(item)}…`;
+    try {
+      if (/^blob:|^data:/.test(item.url)) {
+        const blob = await fetch(item.url).then((r) => r.blob());
+        const objUrl = URL.createObjectURL(blob);
+        await chrome.downloads.download({ url: objUrl, filename: itemName(item), conflictAction: "uniquify" });
+        setTimeout(() => URL.revokeObjectURL(objUrl), 30000);
+        statusText.textContent = `Descarga completada: ${itemName(item)}`;
+        recordHistory(item);
+        if (indicator) indicator.success();
+        return;
+      }
+
+      await chrome.downloads.download({ url: item.url, filename: itemName(item), conflictAction: "uniquify" });
+      statusText.textContent = `Descarga iniciada: ${itemName(item)}`;
+      recordHistory(item);
+      if (indicator) indicator.success();
+      return;
+    } catch {
+      // Fallback si la URL directa es bloqueada por CORS o anti-hotlink en el navegador:
+      try {
+        await downloadInPageFallback(item);
+        if (indicator) indicator.success();
+        return;
+      } catch {
+        if (item.thumb && item.thumb !== item.url) {
+          try {
+            await chrome.downloads.download({ url: item.thumb, filename: `thumb_${itemName(item)}`, conflictAction: "uniquify" });
+            statusText.textContent = `Descargada miniatura de respaldo para ${itemName(item)}`;
+            recordHistory(item);
+            if (indicator) indicator.success();
+            return;
+          } catch {}
+        }
+        statusText.textContent = `No se pudo descargar: ${itemName(item)}`;
+        if (indicator) indicator.error();
+        return;
+      }
+    }
+  }
+
   const method = item.method || (item.embed ? "embed" : item.source === "network" ? "network" : "dom");
 
   // Embeds y vídeos de plataforma -> yt-dlp.
@@ -1994,7 +2216,7 @@ async function downloadOne(item, indicator = null) {
 
   // Clasificar la URL con la ÚNICA fuente de verdad (media-core.js) — la misma
   // cadena (extensión → HEAD → magic bytes → manifiesto → yt-dlp) que el SW.
-  const c = await NTMedia.classifyDownload(item.url, "video");
+  const c = await OperantMedia.classifyDownload(item.url, item.type || "video");
 
   // DASH con vídeo y audio SEPARADOS (Reddit/Instagram/…): el manifiesto trae
   // dos listas. Se ofrece el selector de calidades con vídeo, y al elegir se
@@ -2059,7 +2281,7 @@ async function downloadOne(item, indicator = null) {
   // Anti-hotlink: si hay una página real de origen, crear la regla DNR efímera
   // que inyecta su Referer a las peticiones de la extensión (verificado: la
   // regla aplica también al fetch del panel — la cola por chunks descarga así
-  // archivos grandes con hotlink por Referer, el caso erome + 300MB). Se limpia
+  // archivos grandes con protección de cabecera Referer). Se limpia
   // al terminar el job.
   let ruleId = null;
   if (/^https?:/.test(item.url) && pageUrl) {
@@ -2094,8 +2316,8 @@ async function downloadOne(item, indicator = null) {
 
 // Fallback anti-hotlink en 2 niveles:
 //   Nivel A — el SW hace el fetch (sin CORS con <all_urls>) con el Referer de
-//     la página inyectado por declarativeNetRequest. Resuelve CDNs que NO mandan
-//     Access-Control-Allow-Origin (v15.erome.com) donde el content script muere
+//     la página inyectado por declarativeNetRequest. Resuelve servidores que NO mandan
+//     Access-Control-Allow-Origin donde el content script muere
 //     por CORS. El blob vuelve al panel vía download-blob -> chrome.downloads.
 //   Nivel B — captura DESDE la página (cookies + Referer reales): para CDNs que
 //     SÍ mandan ACAO y exigen la sesión de la página.
@@ -2147,26 +2369,41 @@ async function downloadInPageFallback(item) {
 // segmentos, anti-hotlink con reglas DNR POR HOST (una por dominio de CDN, no
 // por segmento: cientos de reglas reventarían el límite), entrega como .mp4
 // (fMP4) o .ts (MPEG-TS) vía el createObjectURL del panel.
-async function runHlsFast(item, playlistUrl) {
+// Pausable vía AbortController (downloadHls ya lo soporta); reanudar = reinicio.
+function runHlsFast(item, playlistUrl) {
   const job = {
     id: dlNextId++,
     url: playlistUrl,
     name: itemName(item).replace(/\.(m3u8|mpd)$/i, ""),
-    status: "downloading",
+    status: "queued",
     received: 0,
     total: 0,
     error: null,
     dnrUrl: null,
     indicator: null,
+    kind: "hls",
+    ac: new AbortController(),
+    paused: false,
+    failed: false,
+    chunks: null,
+    count: 0,
+    nextChunk: 0,
+    item,
+    hostsTouched: new Set(),
   };
   dlJobs.set(job.id, job);
   dlBroadcast();
+  dlPump();
+}
+
+async function dlRunHlsJob(job) {
   const pageUrl = state.tab?.url || "";
-  const hostsTouched = new Set();
+  const hostsTouched = job.hostsTouched;
   try {
     const result = await HLSFast.downloadHls({
-      url: playlistUrl,
+      url: job.url,
       concurrency: 6,
+      signal: job.ac.signal,
       beforeFetch: async (segUrl) => {
         try {
           const host = new URL(segUrl).hostname;
@@ -2179,9 +2416,19 @@ async function runHlsFast(item, playlistUrl) {
           /* URL relativa rara: la regla global de la página ya cubre lo típico */
         }
       },
-      onProgress: (done, total) => {
-        job.received = done;
-        job.total = total;
+      onProgress: (a, b) => {
+        // VOD: (done, total). Live: objeto {bytes, segments, durationSec, ...}.
+        if (a && typeof a === "object" && a.live) {
+          job.live = true;
+          job.startedAt = job.startedAt || Date.now();
+          job.received = a.bytes;
+          job.total = 0;
+          job.segmentsLive = a.segments;
+          job.durationLive = a.durationSec;
+        } else {
+          job.received = a;
+          job.total = b;
+        }
         dlBroadcast();
       },
     });
@@ -2195,8 +2442,21 @@ async function runHlsFast(item, playlistUrl) {
     dlBroadcast();
     const mb = (result.bytes / 1048576).toFixed(1);
     statusText.textContent = `Descargado por ruta rápida: ${result.segments} segmentos, ${mb} MB${result.encrypted ? " (AES-128 descifrado)" : ""}.`;
-    recordHistory(item);
+    recordHistory(job.item);
   } catch (e) {
+    if (job.paused && !job.live) {
+      // Sin limpiar las reglas DNR por host: la reanudación las reutiliza.
+      job.status = "paused";
+      dlBroadcast();
+      return;
+    }
+    if (job.paused && job.live) {
+      // Parada de una grabación live: downloadHlsLive ya finaliza y entrega;
+      // aquí solo llega un error simultáneo — tratar como cierre limpio.
+      job.status = "done";
+      dlBroadcast();
+      return;
+    }
     job.status = "error";
     job.error = String(e?.message || e);
     dlReportIndicator(job, "error");
@@ -2206,6 +2466,7 @@ async function runHlsFast(item, playlistUrl) {
   for (const host of hostsTouched) {
     chrome.runtime.sendMessage({ type: "clear-dnr-referer-host", host }).catch(() => {});
   }
+  job.hostsTouched = new Set();
   setTimeout(() => {
     if (dlJobs.has(job.id)) {
       dlJobs.delete(job.id);
@@ -2274,11 +2535,69 @@ let dlInFlight = 0;
 let dlConcurrencyValue = 3;
 
 async function dlStart({ url, filename, dnrUrl = null, indicator = null }) {
-  const job = { id: dlNextId++, url, name: filename || "descarga", status: "queued", received: 0, total: 0, error: null, dnrUrl, indicator };
+  const job = {
+    id: dlNextId++, url, name: filename || "descarga", status: "queued",
+    received: 0, total: 0, error: null, dnrUrl, indicator,
+    kind: "chunk", ac: new AbortController(), paused: false, failed: false,
+    chunks: null, count: 0, nextChunk: 0, item: null, hostsTouched: null,
+  };
   dlJobs.set(job.id, job);
   dlBroadcast();
   dlPump();
   return true;
+}
+
+// Pausa: aborta el fetch en curso; el catch del runner cierra el job como
+// "paused" conservando chunks, cursor y reglas DNR para la reanudación.
+function dlPause(job) {
+  if (job.status !== "queued" && job.status !== "downloading") return;
+  job.paused = true;
+  if (job.status === "queued") {
+    job.status = "paused";
+    dlBroadcast();
+  } else {
+    job.ac?.abort();
+  }
+}
+
+// Reanudar (o reintentar un error): los chunks ya recibidos no se repiten.
+// En single/hls no hay estado de chunks reutilizable → arranque completo.
+function dlResume(job) {
+  if (job.status !== "paused" && job.status !== "error") return;
+  job.paused = false;
+  job.failed = false;
+  job.error = null;
+  job.ac = new AbortController();
+  if (job.kind === "chunk" && job.chunks) {
+    job.received = 0;
+    let firstHole = job.count;
+    for (let i = 0; i < job.count; i++) {
+      if (job.chunks[i]) job.received += job.chunks[i].byteLength;
+      else if (firstHole === job.count) firstHole = i;
+    }
+    job.nextChunk = firstHole;
+  } else {
+    job.chunks = null;
+    job.received = 0;
+  }
+  if (job.indicator && job.total > 0) {
+    job.indicator.setProgress(job.received / job.total);
+  }
+  job.status = "queued";
+  dlBroadcast();
+  dlPump();
+}
+
+// Guarda el prefijo contiguo descargado (desde el byte 0 hasta el primer hueco).
+async function dlSavePartial(job) {
+  if (job.kind !== "chunk" || !job.chunks) return;
+  let contig = 0;
+  while (contig < job.count && job.chunks[contig]) contig++;
+  if (contig === 0) return;
+  const m = job.name.match(/^(.*?)(\.\w+)?$/);
+  const partialName = `${m[1]}.parcial${m[2] || ""}`;
+  const blob = new Blob(job.chunks.slice(0, contig), { type: "application/octet-stream" });
+  await dlDeliver(blob, { ...job, name: partialName });
 }
 
 // Limpia la regla DNR efímera del job (si se creó) al terminar.
@@ -2298,15 +2617,16 @@ function dlReportIndicator(job, status) {
 
 function dlBroadcast() {
   renderDlJobs();
-  const active = [...dlJobs.values()].filter((j) => j.status !== "done" && j.status !== "error").length;
+  const active = [...dlJobs.values()].filter((j) => j.status !== "done" && j.status !== "error" && j.status !== "paused").length;
   btnDl.hidden = dlJobs.size === 0;
   btnDl.textContent = `Descargas (${active})`;
 }
 
 function dlSummary() {
   return [...dlJobs.values()].map((j) => ({
-    id: j.id, name: j.name, url: j.url, status: j.status,
+    id: j.id, name: j.name, url: j.url, status: j.status, kind: j.kind,
     received: j.received, total: j.total, error: j.error || null,
+    live: !!j.live, segmentsLive: j.segmentsLive || 0, startedAt: j.startedAt || 0,
     progress: j.total > 0 ? Math.min(100, Math.round((j.received / j.total) * 100)) : 0,
   }));
 }
@@ -2323,88 +2643,115 @@ async function dlPump() {
 }
 
 async function dlRunJob(job) {
+  if (job.kind === "hls") return dlRunHlsJob(job);
+  const signal = job.ac.signal;
   try {
-    const probe = await fetch(job.url, { method: "HEAD", cache: "no-store" });
-    const acceptRanges = (probe.headers.get("accept-ranges") || "").toLowerCase() === "bytes";
-    const total = Number(probe.headers.get("content-length") || 0);
+    if (!job.chunks) {
+      const probe = await fetch(job.url, { method: "HEAD", cache: "no-store", signal });
+      const acceptRanges = (probe.headers.get("accept-ranges") || "").toLowerCase() === "bytes";
+      const total = Number(probe.headers.get("content-length") || 0);
 
-    if (!acceptRanges || total <= DL_CHUNK || /^blob:|^data:/.test(job.url)) {
-      job.total = total || 0;
-      const res = await fetch(job.url, { cache: "no-store" });
-      const blob = await res.blob();
-      job.received = blob.size;
-      job.total = blob.size;
-      dlBroadcast();
-      await dlDeliver(blob, job);
-      job.status = "done";
-      dlClearDnr(job); // regla efímera: limpiar al terminar
-      dlReportIndicator(job, "done");
-      dlBroadcast();
-      return;
-    }
-
-    job.total = total;
-    // Progreso real: si el total se conoce, el indicador muestra el % real.
-    if (job.indicator) {
-      job.indicator.setProgress(total > 0 ? 0 : undefined);
-    }
-    const count = Math.ceil(total / DL_CHUNK);
-    const chunks = new Array(count);
-    let nextChunk = 0;
-    let done = 0;
-    let failed = false;
-
-    async function fetchOne(index) {
-      if (failed) return;
-      const start = index * DL_CHUNK;
-      const end = Math.min(total - 1, start + DL_CHUNK - 1);
-      dlInFlight++;
-      try {
-        const res = await fetch(job.url, { headers: { Range: `bytes=${start}-${end}` }, cache: "no-store" });
-        if (!res.ok && res.status !== 206) throw new Error(`HTTP ${res.status}`);
-        const buf = await res.arrayBuffer();
-        chunks[index] = buf;
-        job.received += buf.byteLength;
-        // Animar el anillo con el % real (transition 200ms linear en el CSS).
-        if (job.indicator && job.total > 0) {
-          job.indicator.setProgress(job.received / job.total);
-        }
+      if (!acceptRanges || total <= DL_CHUNK || /^blob:|^data:/.test(job.url)) {
+        // Ruta single-shot: sin estado de chunks, la pausa aborta y la
+        // reanudación rearranca desde cero.
+        job.kind = "single";
+        job.total = total || 0;
+        const res = await fetch(job.url, { cache: "no-store", signal });
+        const blob = await res.blob();
+        job.received = blob.size;
+        job.total = blob.size;
         dlBroadcast();
-      } catch (err) {
-        failed = true;
-        job.error = String(err.message || err);
-      } finally {
-        dlInFlight--;
+        await dlDeliver(blob, job);
+        job.status = "done";
+        dlClearDnr(job);
+        dlReportIndicator(job, "done");
+        dlBroadcast();
+        return;
       }
-      done++;
-      if (done === count) {
-        if (failed) {
-          job.status = "error";
-          dlClearDnr(job); // regla efímera: limpiar al terminar (aunque falle)
-          dlReportIndicator(job, "error");
-          dlBroadcast();
-        } else {
-          await dlFinish(job, chunks);
-        }
+
+      job.total = total;
+      // Progreso real: si el total se conoce, el indicador muestra el % real.
+      if (job.indicator) {
+        job.indicator.setProgress(0);
       }
+      job.count = Math.ceil(total / DL_CHUNK);
+      job.chunks = new Array(job.count);
+      job.nextChunk = 0;
+      dlBroadcast();
     }
 
-    while (nextChunk < count && !failed) {
+    while (job.nextChunk < job.count && !job.failed) {
+      if (job.paused) {
+        job.status = "paused";
+        dlBroadcast();
+        return; // sin limpiar DNR: la reanudación reutiliza la regla efímera
+      }
       if (dlInFlight >= DL_MAX_IN_FLIGHT) {
         await new Promise((r) => setTimeout(r, 150));
         continue;
       }
-      // Esperar a que el fetchOne termine antes de lanzar el siguiente: sin
+      // Reanudación: saltar los chunks ya recibidos.
+      if (job.chunks[job.nextChunk]) {
+        job.nextChunk++;
+        continue;
+      }
+      // Esperar a que el chunk termine antes de lanzar el siguiente: sin
       // esto, dlInFlight no se respeta y se lanzan TODOS los chunks a la vez
       // (75 chunks × 4MB = 300MB en vuelo -> "Failed to fetch").
-      await fetchOne(nextChunk++);
+      await dlFetchChunk(job);
     }
+    if (job.paused) {
+      job.status = "paused";
+      dlBroadcast();
+      return;
+    }
+    if (job.failed) {
+      job.status = "error";
+      dlClearDnr(job);
+      dlReportIndicator(job, "error");
+      dlBroadcast();
+      return;
+    }
+    await dlFinish(job, job.chunks);
   } catch (err) {
+    if (job.paused) {
+      job.status = "paused";
+      dlBroadcast();
+      return;
+    }
     job.status = "error";
     job.error = String(err.message || err);
     dlClearDnr(job); // regla efímera: limpiar al terminar (aunque falle)
     dlReportIndicator(job, "error");
     dlBroadcast();
+  }
+}
+
+async function dlFetchChunk(job) {
+  const index = job.nextChunk++;
+  const start = index * DL_CHUNK;
+  const end = Math.min(job.total - 1, start + DL_CHUNK - 1);
+  dlInFlight++;
+  try {
+    const res = await fetch(job.url, { headers: { Range: `bytes=${start}-${end}` }, cache: "no-store", signal: job.ac.signal });
+    if (!res.ok && res.status !== 206) throw new Error(`HTTP ${res.status}`);
+    const buf = await res.arrayBuffer();
+    job.chunks[index] = buf;
+    job.received += buf.byteLength;
+    // Animar el anillo con el % real (transition 200ms linear en el CSS).
+    if (job.indicator && job.total > 0) {
+      job.indicator.setProgress(job.received / job.total);
+    }
+    dlBroadcast();
+  } catch (err) {
+    // Pausa o fallo: este rango se repite al reanudar.
+    job.nextChunk = index;
+    if (!job.paused) {
+      job.failed = true;
+      job.error = String(err.message || err);
+    }
+  } finally {
+    dlInFlight--;
   }
 }
 
@@ -2462,10 +2809,21 @@ async function buildZipFromUrls(urls) {
 
   for (const item of items) {
     try {
-      const blob = await fetch(item.url).then((r) => {
-        if (!r.ok) throw new Error(r.status);
-        return r.blob();
-      });
+      let blob = null;
+      try {
+        blob = await fetch(item.url).then((r) => {
+          if (!r.ok) throw new Error(r.status);
+          return r.blob();
+        });
+      } catch {
+        if (item.thumb) {
+          blob = await fetch(item.thumb).then((r) => {
+            if (!r.ok) throw new Error(r.status);
+            return r.blob();
+          }).catch(() => null);
+        }
+      }
+      if (!blob) throw new Error("fetch-failed");
       let name = itemName(item);
       if (!/\.\w+$/.test(name)) name += item.ext ? `.${item.ext}` : "";
       let unique = name;
@@ -2713,6 +3071,14 @@ async function refreshDlDialog() {
   renderDlJobs();
 }
 
+function dlRowBtn(label, fn) {
+  const b = document.createElement("button");
+  b.className = "chip-btn";
+  b.textContent = label;
+  b.addEventListener("click", fn);
+  return b;
+}
+
 function renderDlJobs() {
   if (!dlDialog.open) return;
   const jobs = dlSummary();
@@ -2727,6 +3093,7 @@ function renderDlJobs() {
     if (j.status === "done") done++;
     if (j.status === "error") failed++;
 
+    const job = dlJobs.get(j.id);
     const row = document.createElement("div");
     row.className = "dl-job";
     const head = document.createElement("div");
@@ -2736,25 +3103,50 @@ function renderDlJobs() {
     name.textContent = j.name;
     name.title = j.name;
     const st = document.createElement("span");
-    st.className = "dl-job-status" + (j.status === "done" ? " done" : j.status === "error" ? " error" : "");
+    st.className = "dl-job-status" + (j.status === "done" ? " done" : j.status === "error" ? " error" : j.status === "paused" ? " paused" : "");
     const size = j.total ? `${formatBytes(j.received)} / ${formatBytes(j.total)}` : formatBytes(j.received);
-    st.textContent = j.status === "done" ? "✓" : j.status === "error" ? `error: ${j.error || "?"}` : `${size} · ${j.progress}%`;
+    if (j.live && (j.status === "downloading" || j.status === "queued")) {
+      const elapsed = j.startedAt ? Math.max(0, Math.round((Date.now() - j.startedAt) / 1000)) : 0;
+      const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
+      const ss = String(elapsed % 60).padStart(2, "0");
+      st.textContent = `grabando · ${formatBytes(j.received)} · ${j.segmentsLive} seg · ${mm}:${ss}`;
+    } else {
+      st.textContent = j.status === "done" ? "✓"
+        : j.status === "error" ? `error: ${j.error || "?"}`
+        : j.status === "paused" ? `en pausa · ${size} · ${j.progress}%`
+        : `${size} · ${j.progress}%`;
+    }
     head.append(name, st);
     row.appendChild(head);
     const bar = document.createElement("progress");
     bar.value = j.progress || 0;
     bar.max = 100;
-    row.appendChild(bar);
-    if (j.status === "error" && j.url) {
-      const retry = document.createElement("button");
-      retry.className = "chip-btn";
-      retry.textContent = "Reintentar";
-      retry.addEventListener("click", () => {
-        dlStart({ url: j.url, filename: j.name });
-        refreshDlDialog();
-      });
-      row.appendChild(retry);
+    if (j.live && (j.status === "downloading" || j.status === "queued")) {
+      bar.hidden = true; // sin total conocido: el texto lleva el progreso
     }
+    row.appendChild(bar);
+    const actions = document.createElement("div");
+    actions.className = "dl-job-actions";
+    if (j.live && (j.status === "downloading" || j.status === "queued")) {
+      actions.appendChild(dlRowBtn("Parar y guardar", () => { dlPause(job); refreshDlDialog(); }));
+    } else if (j.status === "downloading" || j.status === "queued") {
+      actions.appendChild(dlRowBtn("Pausar", () => { dlPause(job); refreshDlDialog(); }));
+    }
+    if (j.status === "paused") {
+      actions.appendChild(dlRowBtn("Reanudar", () => { dlResume(job); refreshDlDialog(); }));
+      if (j.kind === "chunk" && job?.chunks?.some(Boolean)) {
+        actions.appendChild(dlRowBtn("Guardar parcial", () => dlSavePartial(job).catch(() => {})));
+      }
+    }
+    if (j.status === "error" && j.url) {
+      actions.appendChild(dlRowBtn("Reintentar", () => {
+        // Con estado de chunks reanuda por rangos; si no, rearranca.
+        if (job) dlResume(job);
+        else dlStart({ url: j.url, filename: j.name });
+        refreshDlDialog();
+      }));
+    }
+    if (actions.childElementCount > 0) row.appendChild(actions);
     dlJobsEl.appendChild(row);
   }
   const pct = sumTotal > 0 ? Math.round((sumReceived / sumTotal) * 100) : 0;
@@ -2790,10 +3182,11 @@ async function requestState() {
   if (res && Array.isArray(res.items)) {
     setItems(res.items);
     await applyPersistedSelection();
-    connDot.classList.toggle("ok", !!res.reachable);
+    state.reachable = !!res.reachable;
+    if (connDot) connDot.classList.toggle("ok", !!res.reachable);
     statusText.textContent = res.reachable
       ? `${state.items.length} medios detectados`
-      : "Página no escaneable (chrome:// o sin content script)";
+      : "";
   } else {
     // El SW no respondió (MV3 dormido, recarga de extensión…). NO se vacían
     // los items: conservar el último estado conocido evita el "Sin resultados"
@@ -2849,7 +3242,7 @@ async function refreshNativeStatus() {
 function renderNativeChip() {
   if (!state.native.installed) {
     nativeChip.hidden = false;
-    nativeChip.textContent = "Herramientas: host no detectado";
+    nativeChip.innerHTML = `<span class="chip-status-dot off"></span>Companion: inactivo`;
     nativeChip.classList.add("off");
     return;
   }
@@ -2859,7 +3252,7 @@ function renderNativeChip() {
   const ff = toolInfo("ffmpeg");
   const ytOk = yt.status === "installed" || yt.legacy;
   const ffOk = ff.status === "installed" || ff.legacy;
-  nativeChip.textContent = `yt-dlp ${ytOk ? (yt.version || "✓") : "no"} · ffmpeg ${ffOk ? "✓" : "no"}`;
+  nativeChip.innerHTML = `<span class="chip-status-dot on"></span>yt-dlp ${ytOk ? (yt.version || "✓") : "no"} · ffmpeg ${ffOk ? "✓" : "no"}`;
   btnYtdl.hidden = yt.status !== "installed";
 }
 
@@ -2897,25 +3290,51 @@ function setToolProgress(tool, value) {
 
 function renderTools() {
   if (!toolsDialog.open) return;
+  const banner = document.getElementById("companionBanner");
+  const title = document.getElementById("companionStatusTitle");
+  const desc = document.getElementById("companionStatusDesc");
+  const pulse = document.getElementById("companionPulse");
+
+  const btnReconnect = document.getElementById("btnReconnectHost");
+
+  if (!state.native.installed) {
+    if (banner) banner.className = "companion-banner disconnected";
+    if (title) title.textContent = "Operant Companion: No detectado";
+    if (desc) desc.textContent = "Haz doble clic en operant-host.exe (carpeta native-host) para activar yt-dlp y ffmpeg sin consola.";
+    if (pulse) pulse.className = "companion-pulse off";
+    if (btnReconnect) btnReconnect.hidden = false;
+  } else {
+    if (banner) banner.className = "companion-banner connected";
+    if (title) title.textContent = "Operant Companion: Conectado (Rust)";
+    if (desc) desc.textContent = "yt-dlp y ffmpeg vinculados correctamente a través de Native Messaging.";
+    if (pulse) pulse.className = "companion-pulse on";
+    if (btnReconnect) btnReconnect.hidden = true;
+  }
+
   for (const tool of ["yt-dlp", "ffmpeg"]) {
     const info = toolInfo(tool);
     const stateEl = document.getElementById(`state-${tool}`);
     const btn = document.getElementById(`btn-${tool}`);
+    const uninstBtn = document.getElementById(`btn-uninstall-${tool}`);
     const note = document.getElementById(`note-${tool}`);
     const phase = document.getElementById(`phase-${tool}`);
+
+    if (uninstBtn) uninstBtn.hidden = true;
 
     if (!state.native.installed) {
       stateEl.textContent = "host no instalado";
       stateEl.className = "tool-state err";
       btn.hidden = true;
-      note.textContent = "Ejecuta native-host/install_host.bat <ID> (una sola vez).";
+      note.textContent = "Ejecuta operant-host.exe con doble clic (una sola vez).";
       continue;
     }
-    if (info.unknown) {
-      stateEl.textContent = "estado desconocido (host antiguo)";
+    if (info.unknown && !info.installed && !info.version) {
+      stateEl.textContent = "no detectado";
       stateEl.className = "tool-state warn";
-      btn.hidden = true;
-      note.textContent = "";
+      btn.hidden = false;
+      btn.textContent = "Instalar";
+      btn.disabled = false;
+      note.textContent = "Instalar en ~/Operant/bin/";
       continue;
     }
     if (info.status !== "installed") {
@@ -2924,41 +3343,59 @@ function renderTools() {
       btn.hidden = false;
       btn.textContent = "Instalar";
       btn.disabled = false;
-      note.textContent = info.latestVersion ? `última versión: ${info.latestVersion}` : "";
+      note.textContent = info.latestVersion ? `última versión: ${info.latestVersion}` : "Instalar en ~/Operant/bin/";
       continue;
     }
-    stateEl.textContent = `v${info.version || "?"} (${info.source === "app" ? "app" : "sistema"})`;
+
+    const isApp = info.source === "app";
+    stateEl.textContent = `v${info.version || "?"} (${isApp ? "Operant" : "sistema"})`;
     stateEl.className = "tool-state ok";
+
+    // Si fue instalado por Operant en ~/Operant/bin/, mostrar opción de desinstalar.
+    // Si ya estaba en el PC del usuario (sistema/PATH), NO desinstalar y señalarlo con claridad.
+    if (isApp) {
+      if (uninstBtn) {
+        uninstBtn.hidden = false;
+        uninstBtn.disabled = false;
+      }
+    }
+
     if (info.updateAvailable && info.latestVersion) {
       stateEl.textContent = `v${info.version} → ${info.latestVersion} disponible`;
       stateEl.className = "tool-state warn";
       btn.hidden = false;
       btn.textContent = "Actualizar";
       btn.disabled = false;
-      note.textContent = "";
+      note.textContent = isApp ? "Instalado por Operant (~/Operant/bin/)" : "✓ Detectado en tu sistema (PATH)";
     } else if (info.updateCheckError) {
       stateEl.textContent = `v${info.version} · no se pudo comprobar actualizaciones`;
       stateEl.className = "tool-state warn";
       btn.hidden = true;
-      note.textContent = info.updateCheckError;
-    } else if (info.source === "app" && tool === "ffmpeg") {
+      note.textContent = isApp ? "Instalado por Operant (~/Operant/bin/)" : "✓ Detectado en tu sistema (PATH)";
+    } else if (isApp && tool === "ffmpeg") {
       btn.hidden = false;
       btn.textContent = "Reinstalar";
       btn.disabled = false;
-      note.textContent = info.latestVersion || "builds diarios (master)";
+      note.textContent = "Instalado por Operant (~/Operant/bin/)";
     } else {
       btn.hidden = true;
-      note.textContent = "";
+      note.textContent = isApp ? "Instalado por Operant (~/Operant/bin/)" : "✓ Detectado en tu sistema (PATH)";
     }
-    if (phase.textContent) setToolProgress(tool, 0);
+    if (phase.textContent && !phase.textContent.includes("desinstalado")) setToolProgress(tool, 0);
   }
 }
 
 async function toolAction(tool, action) {
   const btn = document.getElementById(`btn-${tool}`);
-  btn.disabled = true;
+  const uninstBtn = document.getElementById(`btn-uninstall-${tool}`);
+  if (btn) btn.disabled = true;
+  if (uninstBtn) uninstBtn.disabled = true;
   setToolProgress(tool, 1);
-  document.getElementById(`phase-${tool}`).textContent = action === "install" ? "Descargando…" : "Actualizando…";
+  const phaseEl = document.getElementById(`phase-${tool}`);
+  if (phaseEl) {
+    phaseEl.textContent = action === "uninstall" ? "Desinstalando…" : action === "install" ? "Descargando…" : "Actualizando…";
+    phaseEl.style.color = "";
+  }
   let res = null;
   try {
     res = await chrome.runtime.sendMessage({ type: "native-tool-action", action, tool });
@@ -2966,8 +3403,12 @@ async function toolAction(tool, action) {
     res = null;
   }
   if (!res?.ok) {
-    document.getElementById(`phase-${tool}`).textContent = res?.error || "Error al comunicarse con el host.";
-    btn.disabled = false;
+    if (phaseEl) {
+      phaseEl.textContent = res?.error || "Error al comunicarse con el host.";
+      phaseEl.style.color = "var(--danger)";
+    }
+    if (btn) btn.disabled = false;
+    if (uninstBtn) uninstBtn.disabled = false;
   }
 }
 
@@ -2979,6 +3420,15 @@ document.getElementById("btn-ffmpeg").addEventListener("click", () => {
   const info = toolInfo("ffmpeg");
   toolAction("ffmpeg", info.status === "installed" ? "update" : "install");
 });
+
+const btnUninstallYtdl = document.getElementById("btn-uninstall-yt-dlp");
+if (btnUninstallYtdl) {
+  btnUninstallYtdl.addEventListener("click", () => toolAction("yt-dlp", "uninstall"));
+}
+const btnUninstallFfmpeg = document.getElementById("btn-uninstall-ffmpeg");
+if (btnUninstallFfmpeg) {
+  btnUninstallFfmpeg.addEventListener("click", () => toolAction("ffmpeg", "uninstall"));
+}
 
 nativeChip.addEventListener("click", openToolsDialog);
 
@@ -3041,6 +3491,25 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 // --- Eventos de UI ---
+
+// Modo grabación: captura los buffers MSE del reproductor de la pestaña y los
+// ensambla con ffmpeg del host nativo. Estado gestionado por el SW.
+let recState = "idle";
+btnRecord.addEventListener("click", async () => {
+  if (recState === "recording" || recState === "starting") {
+    chrome.runtime.sendMessage({ type: "record-stop" }).catch(() => {});
+    statusText.textContent = "Parando la grabación…";
+    return;
+  }
+  if (recState !== "idle") return; // transfiriendo/ensamblando: no tocar
+  const r = await chrome.runtime
+    .sendMessage({ type: "record-start", tabId: state.tabId })
+    .catch((e) => ({ ok: false, error: String(e) }));
+  if (!r?.ok) {
+    statusText.textContent = r?.error || "No se pudo iniciar la grabación.";
+  }
+});
+
 btnRefresh.addEventListener("click", async () => {
   statusText.textContent = "Re-escaneando…";
   // Barra de progreso real: force-rescan hace fluir done/total del content script.
@@ -3182,8 +3651,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return;
   }
   if (msg.type === "download-blob") {
-    // El SW reenvía un blob capturado DESDE LA PÁGINA (anti-hotlink tipo
-    // erome). El panel tiene URL.createObjectURL y chrome.downloads.
+    // El SW reenvía un blob capturado DESDE LA PÁGINA (con validación de cabecera
+    // Referer). El panel tiene URL.createObjectURL y chrome.downloads.
     // El SW ahora descarga él mismo con data URL (no envía chunks al panel);
     // este receptor queda por compatibilidad con flujos antiguos que enviaban
     // un array plano pequeño o un data URL.
@@ -3225,6 +3694,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     setItems(msg.items || []);
     applyPersistedSelection().then(render);
     statusText.textContent = `${state.items.length} medios detectados`;
+    if (!scanBar.hidden) {
+      scanFill.style.width = "100%";
+      const count = state.items.length;
+      scanText.textContent = `Escaneo completado · ${count} medio${count === 1 ? "" : "s"} detectado${count === 1 ? "" : "s"} (100%)`;
+      clearTimeout(scanHideTimer);
+      scanHideTimer = setTimeout(() => { scanBar.hidden = true; }, 450);
+    }
     // Si quedan tamaños sin resolver, pedirlos al SW (resuelve el "…").
     if ((msg.items || []).some((i) => i.sizeKB === null)) requestMissingSizes();
     return;
@@ -3240,11 +3716,44 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return;
   }
   if (msg.type === "scan-progress" && msg.tabId === state.tabId) {
-    showScanProgress(Number(msg.done) || 0, Number(msg.total) || 0, msg.phase);
+    showScanProgress(Number(msg.done) || 0, Number(msg.total) || 0, msg.phase, typeof msg.found === "number" ? msg.found : undefined);
+    return;
+  }
+  if (msg.type === "rec") {
+    // Estado del modo grabación (buffers MSE → host nativo).
+    recState = msg.state || "idle";
+    btnRecord.classList.toggle("recording", recState === "recording" || recState === "starting");
+    btnRecord.setAttribute("aria-pressed", String(recState === "recording" || recState === "starting"));
+    if (recState === "starting") statusText.textContent = "Iniciando grabación de buffers MSE…";
+    else if (recState === "recording") statusText.textContent = `Grabando… ${formatBytes(msg.bytes || 0)} · ${msg.segments || 0} segmentos`;
+    else if (recState === "transferring") statusText.textContent = "Entregando buffers al host nativo…";
+    else if (recState === "assembling") statusText.textContent = "Ensamblando la grabación con ffmpeg…";
+    else if (recState === "error") {
+      statusText.textContent = `Grabación: ${msg.message || "error"}`;
+      recState = "idle";
+    } else if (recState === "idle") statusText.textContent = "";
     return;
   }
   if (msg.type === "native") {
     const m = msg.msg || msg;
+    if (recState === "assembling") {
+      // Progreso del ffmpeg que ensambla la grabación (el diálogo de
+      // procesado no está abierto: todo va a la barra de estado).
+      if (m.type === "ffmpeg-progress") {
+        statusText.textContent = `Ensamblando grabación… ${m.progress || 0}%`;
+      } else if (m.type === "ffmpeg-done") {
+        statusText.textContent = `Grabación lista: ${m.name}. Guardada en ${m.output || "~/Downloads/Operant/"}.`;
+        recState = "idle";
+        btnRecord.classList.remove("recording");
+        btnRecord.setAttribute("aria-pressed", "false");
+      } else if (m.type === "ffmpeg-error" || m.type === "rec-error") {
+        statusText.textContent = `Grabación: ${m.message || "error"}`;
+        recState = "idle";
+        btnRecord.classList.remove("recording");
+        btnRecord.setAttribute("aria-pressed", "false");
+      }
+      return;
+    }
     if (m.type === "progress") {
       const line = m.line || "";
       const pct = line.match(/\[download\]\s+([\d.]+)%/);
@@ -3289,6 +3798,26 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       state.native = { ...state.native, checkedAt: 0 };
       refreshNativeStatus();
       renderTools();
+    } else if (m.type === "tool-uninstalled") {
+      setToolProgress(m.tool, 0);
+      const phase = document.getElementById(`phase-${m.tool}`);
+      if (phase) {
+        phase.textContent = `${TOOL_LABELS[m.tool] || m.tool} desinstalado de ~/Operant/bin/.`;
+        phase.style.color = "var(--text-muted)";
+      }
+      const btn = document.getElementById(`btn-${m.tool}`);
+      if (btn) btn.disabled = false;
+      const uninstBtn = document.getElementById(`btn-uninstall-${m.tool}`);
+      if (uninstBtn) {
+        uninstBtn.disabled = false;
+        uninstBtn.hidden = true;
+      }
+      state.native = { ...state.native, checkedAt: 0 };
+      if (m.tools) {
+        state.native.tools = m.tools;
+      }
+      refreshNativeStatus();
+      renderTools();
     } else if (m.type === "tool-error") {
       const phase = document.getElementById(`phase-${m.tool}`);
       if (phase) {
@@ -3308,8 +3837,106 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
+// --- Gestión de Tema (Warm Ink Neutrals sinc con la web) ---
+let currentThemeSetting = "dark";
+
+function resolveEffectiveTheme(pref) {
+  if (pref === "system") {
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  }
+  return pref === "light" ? "light" : "dark";
+}
+
+function updateThemeSegmentUI(setting) {
+  document.querySelectorAll(".theme-segment-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.themeVal === setting);
+  });
+}
+
+function setTheme(themeSetting, save = true) {
+  currentThemeSetting = themeSetting;
+  const effectiveTheme = resolveEffectiveTheme(themeSetting);
+  const root = document.documentElement;
+  root.classList.add("theme-switching");
+  root.dataset.theme = effectiveTheme;
+
+  try {
+    localStorage.setItem("theme", themeSetting);
+  } catch {}
+
+  if (save) {
+    chrome.storage.local.set({ theme: themeSetting });
+  }
+
+  updateThemeSegmentUI(themeSetting);
+  setTimeout(() => root.classList.remove("theme-switching"), 100);
+}
+
+function initTheme() {
+  let stored = null;
+  try {
+    stored = localStorage.getItem("theme");
+  } catch {}
+
+  if (stored) {
+    setTheme(stored, false);
+  } else {
+    chrome.storage.local.get(["theme"], (data) => {
+      const pref = data?.theme || "dark";
+      setTheme(pref, false);
+    });
+  }
+
+  if (window.matchMedia) {
+    window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+      if (currentThemeSetting === "system") {
+        setTheme("system", false);
+      }
+    });
+  }
+}
+
+const themeToggle = document.getElementById("themeToggle");
+if (themeToggle) {
+  themeToggle.addEventListener("click", () => {
+    const curEffective = document.documentElement.dataset.theme || "dark";
+    const next = curEffective === "dark" ? "light" : "dark";
+    setTheme(next, true);
+  });
+}
+
+document.querySelectorAll(".theme-segment-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const val = btn.dataset.themeVal;
+    if (val) setTheme(val, true);
+  });
+});
+
+const btnCompanionHeader = document.getElementById("btnCompanionHeader");
+if (btnCompanionHeader) {
+  btnCompanionHeader.addEventListener("click", openToolsDialog);
+}
+
+const btnReconnectHost = document.getElementById("btnReconnectHost");
+if (btnReconnectHost) {
+  btnReconnectHost.addEventListener("click", async () => {
+    btnReconnectHost.disabled = true;
+    btnReconnectHost.textContent = "Verificando…";
+    state.native.checkedAt = 0;
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "native-tools-status" });
+      if (res?.status) state.native = res.status;
+    } catch {}
+    await refreshNativeStatus();
+    renderTools();
+    btnReconnectHost.disabled = false;
+    btnReconnectHost.textContent = "Reconectar";
+  });
+}
+
 // --- Arranque ---
 (async () => {
+  initTheme();
   await loadViewPrefs();
   let data = {};
   try {

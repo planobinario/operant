@@ -19,6 +19,7 @@ const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
 if (!manifest.background?.service_worker) {
   throw new Error("src/manifest.json no define background.service_worker");
 }
+delete manifest.key;
 manifest.background = {
   scripts: [manifest.background.service_worker],
   ...(manifest.background.type ? { type: manifest.background.type } : {}),

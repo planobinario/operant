@@ -48,7 +48,7 @@ const panelEval = (p, expr, label, ms = 12000) =>
   const browser = await puppeteer.launch({
     executablePath: await findExe(),
     headless: true,
-    userDataDir: fs.mkdtempSync(path.join(os.tmpdir(), "nt-audit-")),
+    userDataDir: fs.mkdtempSync(path.join(os.tmpdir(), "operant-audit-")),
     ignoreDefaultArgs: ["--disable-extensions", "--enable-automation"],
     args: [
       `--load-extension=${EXT_SRC}`,
@@ -489,7 +489,7 @@ const panelEval = (p, expr, label, ms = 12000) =>
   await sleep(1200);
   const s7 = await panel7.evaluate(`({
     cards: document.querySelectorAll('#grid .card:not(.skeleton)').length,
-    counter: document.getElementById('counterText').textContent,
+    counter: document.getElementById('counterText')?.textContent || '',
     imgsLoaded: [...document.querySelectorAll('#grid .lc-stage img')].filter(i => i.complete && i.naturalWidth > 1).length,
     badges: document.querySelector('#grid .card') ? document.querySelectorAll('#grid .card .lc-badge').length : 0
   })`);

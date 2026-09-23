@@ -10,6 +10,7 @@
 # Solo Python stdlib. El propio host requiere instalacion manual una vez
 # (install_host.bat / .sh) — eso no se puede automatizar por seguridad del navegador.
 
+import base64
 import json
 import os
 import platform
@@ -23,6 +24,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import uuid
 import zipfile
 
 HOST_NAME = "com.operant.native_host"
@@ -558,7 +560,7 @@ def run_ffmpeg_op(url, op, options):
             if not audio_url:
                 send_message({"type": "ffmpeg-error", "message": "Falta la URL de audio (DASH con track separado)."})
                 return
-            workdir = tempfile.mkdtemp(prefix="nt-ffmpeg-")
+            workdir = tempfile.mkdtemp(prefix="operant-ffmpeg-")
             src_v = os.path.join(workdir, "video.mp4")
             src_a = os.path.join(workdir, "audio.mp4")
             send_message({"type": "ffmpeg-progress", "phase": "download", "progress": 0})
@@ -605,7 +607,7 @@ def run_ffmpeg_op(url, op, options):
             args = op_cfg["args"](options or {})
             cmd = [ffmpeg["path"], "-y", "-i", src_arg, *args, "-progress", "pipe:1", "-nostats", out_path]
         else:
-            workdir = tempfile.mkdtemp(prefix="nt-ffmpeg-")
+            workdir = tempfile.mkdtemp(prefix="operant-ffmpeg-")
             src = os.path.join(workdir, "input" + (os.path.splitext(name)[1] or ""))
             send_message({"type": "ffmpeg-progress", "phase": "download", "progress": 0})
             download(url, src, lambda p: send_message({"type": "ffmpeg-progress", "phase": "download", "progress": p}))
@@ -645,6 +647,110 @@ def run_ffmpeg_op(url, op, options):
     finally:
         if workdir:
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------- sesiones de grabacion (buffers MSE del reproductor) ----------
+# La extension envia los buffers capturados del reproductor en trozos base64
+# (< 1 MB por mensaje: el cap de read_message mata el host si se supera) y el
+# host los acumula en archivos temporales por pista. Al cerrar, ffmpeg remuxa
+# con faststart. El fMP4 concatenado (init + media) ya es valido sin recodificar.
+
+rec_sessions = {}  # session_id -> {"dir", "paths": {track: file}}
+rec_lock = threading.Lock()
+
+
+def _rec_begin():
+    session = uuid.uuid4().hex[:12]
+    workdir = tempfile.mkdtemp(prefix="operant-rec-")
+    paths = {
+        "video": os.path.join(workdir, "video.bin"),
+        "audio": os.path.join(workdir, "audio.bin"),
+    }
+    for path in paths.values():
+        open(path, "wb").close()
+    with rec_lock:
+        rec_sessions[session] = {"dir": workdir, "paths": paths}
+    send_message({"type": "rec-beginned", "session": session})
+
+
+def _rec_append(session, track, data):
+    with rec_lock:
+        sess = rec_sessions.get(session)
+    if not sess or track not in sess["paths"]:
+        send_message({"type": "rec-error", "session": session, "message": "Sesion de grabacion invalida."})
+        return
+    try:
+        raw = base64.b64decode(data)
+        with open(sess["paths"][track], "ab") as f:
+            f.write(raw)
+        send_message({"type": "rec-appended", "session": session, "bytes": len(raw)})
+    except Exception as exc:  # noqa: BLE001
+        send_message({"type": "rec-error", "session": session, "message": str(exc)})
+
+
+def _rec_end(session, filename):
+    with rec_lock:
+        sess = rec_sessions.pop(session, None)
+    if not sess:
+        send_message({"type": "rec-error", "session": session, "message": "Sesion de grabacion invalida."})
+        return
+    threading.Thread(target=_rec_finish, args=(sess, filename), daemon=True).start()
+
+
+def _rec_cancel(session):
+    with rec_lock:
+        sess = rec_sessions.pop(session, None)
+    if sess:
+        shutil.rmtree(sess["dir"], ignore_errors=True)
+    send_message({"type": "rec-cancelled", "session": session})
+
+
+def _rec_finish(sess, filename):
+    workdir = sess["dir"]
+    try:
+        ffmpeg = detect("ffmpeg")
+        if not ffmpeg:
+            send_message({"type": "rec-error", "message": "ffmpeg no esta instalado. Abre el panel -> Herramientas -> Instalar."})
+            return
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        base = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(filename or "")).strip() or "grabacion"
+        base = re.sub(r"\.[^.]+$", "", base)
+        out_path = os.path.join(OUTPUT_DIR, f"{base}.mp4")
+        n = 1
+        while os.path.exists(out_path):
+            out_path = os.path.join(OUTPUT_DIR, f"{base} ({n}).mp4")
+            n += 1
+
+        vpath = sess["paths"]["video"]
+        apath = sess["paths"]["audio"]
+        has_video = os.path.getsize(vpath) > 1024
+        has_audio = os.path.getsize(apath) > 1024
+        if not has_video and not has_audio:
+            send_message({"type": "rec-error", "message": "La grabacion no contiene datos."})
+            return
+
+        send_message({"type": "ffmpeg-progress", "phase": "process", "progress": 0})
+        args = [ffmpeg["path"], "-y"]
+        if has_video:
+            args += ["-i", vpath]
+        if has_audio:
+            args += ["-i", apath]
+        args += ["-c", "copy", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", out_path]
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=3600, encoding="utf-8", errors="replace")
+        if proc.returncode != 0 or not looks_like_real_media(out_path):
+            tail = (proc.stderr or "")[-400:]
+            send_message({"type": "rec-error", "message": f"ffmpeg no pudo ensamblar la grabacion: {tail}"})
+            return
+        send_message({
+            "type": "ffmpeg-done",
+            "output": out_path,
+            "name": os.path.basename(out_path),
+            "sizeAfter": os.path.getsize(out_path),
+        })
+    except Exception as exc:  # noqa: BLE001
+        send_message({"type": "rec-error", "message": str(exc)})
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # ---------- ruteo ----------
@@ -693,6 +799,17 @@ def handle(msg):
         threading.Thread(
             target=run_ffmpeg_op, args=(url, msg.get("op", ""), msg.get("options") or {}), daemon=True
         ).start()
+    elif msg_type == "rec-begin":
+        _rec_begin()
+    elif msg_type == "rec-append":
+        # Sincrono y en el orden de llegada: reordenar chunks corromperia el
+        # archivo. Es una escritura a disco rapida; el ffmpeg final si va en
+        # hilo propia via _rec_end.
+        _rec_append(msg.get("session", ""), msg.get("track", "video"), msg.get("data", ""))
+    elif msg_type == "rec-end":
+        _rec_end(msg.get("session", ""), msg.get("filename"))
+    elif msg_type == "rec-cancel":
+        _rec_cancel(msg.get("session", ""))
     else:
         send_message({"type": "error", "message": f"Tipo de mensaje desconocido: {msg_type}"})
 

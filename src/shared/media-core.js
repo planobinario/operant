@@ -1,7 +1,7 @@
 // media-core.js — ÚNICA FUENTE DE VERDAD para detección y descarga de medios.
 // Compartido por el service worker (background.js) y el panel (panel.js).
 // No usa chrome.* : es lógica pura + fetch, invocable desde ambos contextos.
-// Expone un objeto global `NTMedia` para compatibilidad con script tags.
+// Expone un objeto global `OperantMedia` para compatibilidad con script tags.
 
 (function (global) {
   "use strict";
@@ -325,7 +325,7 @@
   }
 
   // API pública.
-  const NTMedia = {
+  const OperantMedia = {
     classifyExt,
     extOf,
     fetchHead,
@@ -341,16 +341,19 @@
     DIRECT_FILE,
   };
 
-  global.NTMedia = NTMedia;
+  global.OperantMedia = OperantMedia;
+  global.NTMedia = OperantMedia; // alias de compatibilidad
   // Soporte dual: script tag clásico (global) o ES module (export).
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = NTMedia;
+    module.exports = OperantMedia;
   }
   if (typeof exports !== "undefined" && typeof exports !== "function") {
-    exports.NTMedia = NTMedia;
+    exports.OperantMedia = OperantMedia;
+    exports.NTMedia = OperantMedia;
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);
 
 // Export explícito para import ES module (service worker).
-export const NTMedia = globalThis.NTMedia;
-export default globalThis.NTMedia;
+export const OperantMedia = globalThis.OperantMedia;
+export const NTMedia = globalThis.OperantMedia;
+export default globalThis.OperantMedia;

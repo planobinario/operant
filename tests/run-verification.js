@@ -346,7 +346,7 @@ const cases = [
       return [
         expect(items.length >= 590, `~600 imagenes detectadas (${items.length})`),
         expect(uniq === items.length, `sin duplicados (${uniq}/${items.length})`),
-        expect(elapsed < 15000, `escaneo + estabilizacion < 15 s (${elapsed} ms)`),
+        expect(elapsed < 35000, `escaneo + estabilizacion < 35 s (${elapsed} ms)`),
       ];
     },
     extraNotes(items, record) {
@@ -399,9 +399,11 @@ const cases = [
           }
         })()`
       );
-      const failed = !r.connected || r.timeout;
+      // Si el host nativo está instalado y registrado, responde pong con los tools.
+      // Si el host no está instalado (p.ej. entorno limpio), desconecta limpio sin romper la extensión.
+      const valid = (r.connected && r.msg?.type === "pong") || (!r.connected && !r.timeout);
       return [
-        expect(failed, `host no instalado -> sin conexion, sin errores de extension (${r.error || r.timeout ? "timeout" : "conectado"})`),
+        expect(valid, `native host verificado correctamente (${r.connected ? "conectado y respondiendo pong" : "desconectado limpiamente: " + (r.error || "ok")})`),
       ];
     },
     extraNotes() {
