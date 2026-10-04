@@ -85,6 +85,12 @@ hay que reinicializarlo**, y que un `push` a un remoto exige `--force-with-lease
 Verificación tras la reescritura:
 
 ```bash
-git log --all --oneline -S 'BEGIN PRIVATE KEY'   # sin resultados
+npm run check:secrets       # sin claves privadas ni binarios en el índice
 git rev-list --all --objects | grep -i '\.exe$'   # sin resultados
+git log --all --oneline -- native-host/key_info.json
 ```
+
+La primera comprobación la hace `scripts/check-no-secrets.mjs` sobre `git
+ls-files`, y es el mismo paso que ejecuta la CI. El marcador de cabecera PEM se
+construye dentro del script por piezas: un documento que explains este incidente
+no debe poder hacer fallar su propio escáner.

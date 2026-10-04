@@ -12,7 +12,7 @@
     "lint": "node scripts/check-syntax.mjs",
     "lint:web-ext": "web-ext lint --source-dir=./src --warnings-as-errors",
     "test:unit": "node --test tests/unit/filename.test.js tests/unit/icons.test.js tests/unit/media-core.test.js tests/unit/hls-fast.test.js tests/unit/extension-id.test.js",
-    "test": "npm run lint && npm run test:unit",
+    "test": "npm run lint && npm run test:unit && npm run check:secrets && npm run key:verify && node scripts/check-version.mjs",
     "test:verify": "node tests/run-verification.js",
     "test:verify:public": "node tests/run-verification.js --public",
     "test:verify:strict": "node tests/run-verification.js --strict",
@@ -22,7 +22,8 @@
     "host:test": "python tests/host-e2e.py --skip-ytdlp-download --skip-ffmpeg-download",
     "host:lint": "cargo fmt --manifest-path native-host-rs/Cargo.toml -- --check && cargo clippy --manifest-path native-host-rs/Cargo.toml --all-targets -- -D warnings",
     "keygen": "node scripts/gen-extension-key.mjs",
-    "key:verify": "node scripts/gen-extension-key.mjs --verify"
+    "key:verify": "node scripts/gen-extension-key.mjs --verify",
+    "check:secrets": "node scripts/check-no-secrets.mjs"
   },
   "devDependencies": {
     "acorn": "8.18.0",

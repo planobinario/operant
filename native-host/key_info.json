@@ -1,0 +1,5 @@
+{
+  "_commento": "SOLO datos p'blicos. La clave privada NUNCA va aqu': est! en .secrets/extension_key.pem (gitignored). Regenerar con node scripts/gen-extension-key.mjs",
+  "extensionId": "ojipilmpchlgciidajpcgjkmfpghccjk",
+  "publicKeyBase64": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAv+vMKO8YMna4rERKP3zC33twFliau3VS/uzpLOIX5fyu3m8lJp55Sx7CuTaTENf++CRLZzRtiSCifAhu6NKrJ66GAg4hhFGDPzujcwdSllAwU5j1zorX1aG/AVdBGBjSQjERWi9oCNesXAGBAWvjEhoHwv7e5E6SQlkmvQIuTWEBuFnz6J36CkLc/SfwMLAn54RQE8UwE/X4kcKzW9LHvK4hKe01co90fUnJkeIuBpSumIGzRHipDUnWXPTGAgikNfZCH9ID785jVIFqleeVtVro2Pn4n2K22s2anMMhrBR6lW8go+Q3/kyGRL3FhaeqJhZYMB20LaZCDB72OGFHuwIDAQAB"
+}

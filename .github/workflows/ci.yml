@@ -78,18 +78,13 @@ jobs:
         # dice "host no instalado" para siempre, sin ninguna pista de por qué.
         run: npm run key:verify
 
-      - name: Sin claves privadas en el arbol ni en el historial reciente
+      - name: Sin claves privadas ni binarios en el índice
         # native-host/key_info.json llegó a contener la clave PRIVADA RSA de la
         # extensión: con ella, cualquiera podía publicar actualizaciones de la
-        # extensión instalada. Con ella publicada, esa clave queda COMPROMETIDA
-        # para siempre y rotarla es la única forma de cerrarlo (por eso el
-        # historial se reescribió y el ID cambió).
-        run: |
-          if git grep -nI -E "BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY" -- . ; then
-            echo "::error::se ha encontrado una clave privada en el arbol"
-            exit 1
-          fi
-          echo "sin claves privadas en el arbol"
+        # extensión instalada en el perfil de cualquier usuario. Con la clave
+        # publicada queda COMPROMETIDA para siempre, y rotarla era la única
+        # forma de cerrarlo (por eso el historial se reescribió y el ID cambió).
+        run: node scripts/check-no-secrets.mjs
 
       - name: Rust — formato
         uses: dtolnay/rust-toolchain@stable
@@ -103,19 +98,6 @@ jobs:
         run: cargo test --manifest-path native-host-rs/Cargo.toml
 
 
-      - name: "Bargaining: no hay binarios compilados versionados"
-        # `native-host/operant-host.exe` estuvo commiteado (2,5 MB, el 23,5 % de
-        # los bytes del repo) y desincronizado del src actual. Es un artefacto
-        # de `cargo build`, no código: si vuelve a aparecer en el índice, el
-        # repo vuelve a crecer 2,5 MB por commit y a distribuir binarios que
-        # nadie revisa. Este paso es la red que lo mantiene fuera.
-        run: |
-          if git ls-files | grep -qiE '\.(exe|dll|so|dylib|msi)$'; then
-            echo "::error::hay binarios compilados en el índice:"
-            git ls-files | grep -iE '\.(exe|dll|so|dylib|msi)$'
-            exit 1
-          fi
-          echo "sin binarios compilados en el índice"
 
       - name: Subir resultados de los tests
         if: always()
@@ -163,18 +145,12 @@ jobs:
       - name: Construir el paquete de Firefox
         run: npm run build:firefox
 
-      - name: Validar el manifest con addons-linter (baseline con dientes)
+      - name: Informe de addons-linter
         # Se valida dist-firefox y no src porque addons-linter comprueba contra
         # Firefox, donde `background.service_worker` no existe (por eso existe
-        # build-firefox.mjs, que lo traduce a `background.scripts`).
-        #
-        # No basta con exigir 0 errores: el build arrastra 20 avisos preexistentes
-        # (16 `innerHTML` sobre SVG estático propio, 4 `DANGEROUS_EVAL` de código
-        # de terceros). Aceptarlos a ciegas deja pasar los nuevos, que es lo
-        # que importa. check-lint-baseline.mjs exige 0 errores Y que la lista de
-        # avisos sea exactamente la del baseline: añadir un `innerHTML` nuevo
-        # rompe la CI, y hacerlo desaparecer obliga a actualizar el baseline a
-        # mano.
+        # build-firefox.mjs, que lo traduce a `background.scripts`). Este paso
+        # solo genera el informe para poder leerlo; el que DECIDE es el paso
+        # siguiente.
         run: npx --yes web-ext lint --source-dir=./dist-firefox 2>&1 | tee lint-report.txt || true
 
       - name: Congelar la deuda de lint (baseline con dientes)
