@@ -1,13 +1,16 @@
-mod protocol;
+mod ffmpeg_ops;
 mod installer;
+mod protocol;
+mod recorder;
 mod tools;
 mod ytdl;
-mod ffmpeg_ops;
-mod recorder;
+// Ejecución de subprocesos con drenaje de ambos pipes (evita el deadlock de
+// 64 KB en ffmpeg/yt-dlp) y con tail de stderr para diagnóstico.
+mod proc;
 
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use serde_json::{json, Value};
 
 use protocol::{read_message, MessageSender};
 use recorder::RecorderManager;
@@ -16,11 +19,11 @@ use tools::tools_status;
 fn is_stdin_pipe() -> bool {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
         use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE};
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
         unsafe {
             let handle = GetStdHandle(STD_INPUT_HANDLE);
-            if handle == std::ptr::null_mut() || handle == -1isize as _ {
+            if handle.is_null() || handle == -1isize as _ {
                 return false;
             }
             GetFileType(handle) == FILE_TYPE_PIPE
@@ -36,7 +39,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Operant Native Messaging Host v0.4.0 (Rust)");
+        println!("Operant Native Messaging Host v0.5.0 (Rust)");
         println!();
         println!("Uso:");
         println!("  operant-host [opciones]");
@@ -112,7 +115,11 @@ fn main() {
                 });
             }
             "install" | "update" => {
-                let tool = msg.get("tool").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tool = msg
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if tool != "yt-dlp" && tool != "ffmpeg" {
                     let _ = sender.send(&json!({
                         "type": "tool-error",
@@ -148,7 +155,11 @@ fn main() {
                 });
             }
             "uninstall" => {
-                let tool = msg.get("tool").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tool = msg
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let s_clone = sender.clone();
                 std::thread::spawn(move || {
                     let res = tools::uninstall_tool(&tool);
@@ -162,21 +173,33 @@ fn main() {
                 });
             }
             "ytdl" => {
-                let url = msg.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let url = msg
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if url.is_empty() {
                     let _ = sender.send(&json!({ "type": "error", "message": "URL vacía." }));
                     continue;
                 }
-                let fmt = msg.get("format").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let fmt = msg
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let s_clone = sender.clone();
                 std::thread::spawn(move || {
                     ytdl::run_download(&url, fmt, s_clone);
                 });
             }
             "ytdl-list-formats" => {
-                let url = msg.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let url = msg
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if url.is_empty() {
-                    let _ = sender.send(&json!({ "type": "formats-error", "message": "URL vacía." }));
+                    let _ =
+                        sender.send(&json!({ "type": "formats-error", "message": "URL vacía." }));
                     continue;
                 }
                 let s_clone = sender.clone();
@@ -185,12 +208,21 @@ fn main() {
                 });
             }
             "ffmpeg-op" => {
-                let url = msg.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let url = msg
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if url.is_empty() {
-                    let _ = sender.send(&json!({ "type": "ffmpeg-error", "message": "URL vacía." }));
+                    let _ =
+                        sender.send(&json!({ "type": "ffmpeg-error", "message": "URL vacía." }));
                     continue;
                 }
-                let op = msg.get("op").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let op = msg
+                    .get("op")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let options = msg.get("options").cloned().unwrap_or(json!({}));
                 let s_clone = sender.clone();
                 std::thread::spawn(move || {

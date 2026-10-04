@@ -16,13 +16,34 @@
 // (bytes/duración). Los IV derivados de la secuencia absoluta siguen siendo
 // correctos entre ventanas (RFC 8216 §5.2).
 //
-// Limites asumidos (documentados, no silenciados): SAMPLE-AES/DRM no soportado;
-// pistas separadas (audio/vídeo) requieren remux — eso sigue siendo trabajo del
-// host nativo (ffmpeg); byteranges en playlists live son raros y no se
-// re-resuelven entre ventanas.
+// Limites asumidos (documentados, NO silenciados):
+//   · SAMPLE-AES y demás DRM no soportados: se falla con un mensaje explícito en
+//     vez de entregar basura cifrada.
+//   · Pistas separadas (audio/vídeo) requieren remux: eso sigue siendo trabajo
+//     del host nativo (ffmpeg).
+//   · EXT-X-DISCONTINUITY se MARCA (`discontinuity` por segmento y
+//     `hasDiscontinuity` en el manifest) para que el ensamblador no concatene a
+//     ciegas datos con línea de tiempo incompatible.
 
 (function (global) {
   "use strict";
+
+  // --- Estado persistente del MOTOR (no del parseo) ---
+  //
+  // Los cursores de byterange tienen que sobrevivir entre llamadas a parseMedia.
+  // En live, la playlist se re-parsea cada `TARGETDURATION/2` segundos: con un
+  // cursor local al parseo, cada pasada reiniciaba el offset a 0 y la
+  // concatenación usaba bytes equivocados de un recurso que SÍ devolvía la
+  // longitud pedida — es decir, corrupción silenciosa, el peor modo de fallo
+  // posible.
+  const engineState = {
+    /** url -> siguiente offset libre para un BYTERANGE sin offset explícito */
+    byterangeCursors: new Map(),
+    /** borra el estado al terminar una descarga (llamado desde clearKeyCache) */
+    reset() {
+      engineState.byterangeCursors.clear();
+    },
+  };
 
   // --- Utilidades de URL ---
 
@@ -51,7 +72,14 @@
   // big-endian alineado a la derecha en un buffer de 16 bytes.
   function sequenceIv(seq) {
     const out = new Uint8Array(16);
-    let v = BigInt(Math.max(0, Math.floor(Number(seq))));
+    // `BigInt(NaN)` LANZA, y antes de este blindaje un `#EXT-X-MEDIA-SEQUENCE`
+    // malformado ("abc", vacío, o ausente) tumbaba el parseo del playlist
+    // entero — y con él la descarga. Ahora un IV no numérico degrada a 0,
+    // que es lo que hacen el resto de reproductores: mejor un segmento
+    // descifrado mal que ninguna descarga.
+    const n = Number(seq);
+    const safe = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+    let v = BigInt(safe);
     for (let i = 15; i >= 8; i--) {
       out[i] = Number(v & 0xffn);
       v >>= 8n;
@@ -60,10 +88,31 @@
   }
 
   // --- Parser de master playlist (#EXT-X-STREAM-INF) ---
-  // Devuelve { variants: [{bandwidth, resolution, codecs, url}] } o null si no
-  // es un master. Los variant-playlists anidados se resuelven en downloadHls.
+  // Devuelve { variants: [{bandwidth, resolution, codecs, url, audioUrl}] } o
+  // null si no es un master. Los masters con audio separado (X/Twitter,
+  // YouTube Live) declaran grupos #EXT-X-MEDIA TYPE=AUDIO y variantes SOLO
+  // VÍDEO: cada variante lleva su audioUrl de grupo para el mux; las
+  // variantes de solo audio se devuelven marcadas (audioOnly) para excluirse
+  // de la selección automática.
   function parseMaster(text, baseUrl) {
+    // Guarda de entrada: `text.includes` sobre null/undefined lanza TypeError y
+    // tumba el parseo entero. Un playlist vacío o corrupto debe ser "no es un
+    // master", nunca una excepción.
+    if (!text || typeof text !== "string") return null;
     if (!text.includes("#EXT-X-STREAM-INF")) return null;
+    const audioGroups = new Map();
+    const mediaRe = /^#EXT-X-MEDIA:([^\n]*)$/gm;
+    let mm;
+    while ((mm = mediaRe.exec(text))) {
+      const attrs = mm[1];
+      const attr = (name) => {
+        const m = attrs.match(new RegExp(`${name}=("[^"]*"|[^,]*)`, "i"));
+        return m ? m[1].replace(/^"|"$/g, "") : "";
+      };
+      if (/^audio$/i.test(attr("TYPE")) && attr("URI")) {
+        audioGroups.set(attr("GROUP-ID") || attr("NAME"), resolveUrl(attr("URI"), baseUrl));
+      }
+    }
     const variants = [];
     const lines = text.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
@@ -71,7 +120,7 @@
       if (!line.startsWith("#EXT-X-STREAM-INF:")) continue;
       const attrs = line.slice("#EXT-X-STREAM-INF:".length);
       const attr = (name) => {
-        const m = attrs.match(new RegExp(`${name}=([^,]+)`, "i"));
+        const m = attrs.match(new RegExp(`${name}=("[^"]*"|[^,]*)`, "i"));
         return m ? m[1].replace(/^"|"$/g, "") : "";
       };
       // La URI del variante es la siguiente línea que no empieza por '#'.
@@ -84,11 +133,16 @@
       }
       if (!uri) continue;
       const bandwidth = Number(attr("BANDWIDTH")) || Number(attr("AVERAGE-BANDWIDTH")) || 0;
+      const codecs = attr("CODECS");
+      const audioGroupId = attr("AUDIO");
+      const hasVideoCodec = /avc1|avc3|hvc1|hev1|vp8|vp9|av01|mp4v/i.test(codecs);
       variants.push({
         bandwidth,
         resolution: attr("RESOLUTION"),
-        codecs: attr("CODECS"),
+        codecs,
         url: resolveUrl(uri, baseUrl),
+        audioUrl: audioGroupId && audioGroups.has(audioGroupId) ? audioGroups.get(audioGroupId) : null,
+        audioOnly: !!codecs && !hasVideoCodec,
       });
     }
     return variants.length ? { variants } : null;
@@ -101,6 +155,9 @@
   // (base para el IV por defecto). BYTERANGE soportado con offset acumulativo
   // por recurso.
   function parseMedia(text, baseUrl) {
+    // Misma guarda que parseMaster: null/undefined no es un playlist, es un
+    // "no se puede procesar", y debe devolverse como tal.
+    if (!text || typeof text !== "string") return null;
     if (!text.includes("#EXTINF") && !text.includes("#EXT-X-MAP")) return null;
     const segments = [];
     let mediaSequence = 0;
@@ -111,9 +168,12 @@
     let currentMap = null; // {url, byterange} | null
     let pendingDuration = null;
     let pendingByterange = null; // {length, offset} del próximo segmento
-    // Offset acumulativo por recurso: cuando BYTERANGE omite el offset, empieza
-    // donde acabó el anterior para la MISMA URI (RFC 8216 §4.3.2.2).
-    const nextOffsetByUrl = new Map();
+    let pendingDiscontinuity = false;
+    // Cursores de byterange IMPERSISTENTES entre llamadas: un segmento con
+    // BYTERANGE sin offset debe continuar donde acabó el anterior de la misma
+    // URI. En live la playlist se re-parsea cada pocos segundos, así que un
+    // cursor local al parseo reiniciaría a 0 en cada pasada.
+    const byterangeCursors = engineState.byterangeCursors;
 
     const lines = text.split(/\r?\n/);
     for (const raw of lines) {
@@ -149,11 +209,17 @@
       }
       if (line.startsWith("#EXT-X-KEY:")) {
         const attrs = line.slice(11);
+        // Parser de atributos QUOTE-AWARE. El anterior era `NAME=([^,]+)`,
+        // que corta en la primera coma: una URI de clave con query
+        // (`URI="https://k/x?a=1,2"`) se truncaba, la petición de clave daba
+        // 404 y TODA la descarga fallaba sin mensaje útil.
         const attr = (name) => {
-          const m = attrs.match(new RegExp(`${name}=([^,]+)`, "i"));
-          return m ? m[1].replace(/^"|"$/g, "") : "";
+          const re = new RegExp(`${name}=("([^"]*)"|[^,]*)`, "i");
+          const m = re.exec(attrs);
+          if (!m) return "";
+          return m[2] !== undefined ? m[2] : String(m[1]).trim();
         };
-        const method = attr("METHOD");
+        const method = (attr("METHOD") || "").toUpperCase();
         if (method === "NONE") {
           currentKey = null;
         } else if (method === "AES-128") {
@@ -163,6 +229,23 @@
           throw new Error(
             "El stream usa SAMPLE-AES (DRM del reproductor): no es descifrable sin el host nativo/yt-dlp."
           );
+        } else if (method === "") {
+          // `#EXT-X-KEY:METHOD=` vacío no es una declaración de nada: es un tag
+          // malformado, no un cifrado desconocido. Se ignora en lugar de tumbar
+          // la descarga, que es lo que hacía el `if/else if` sin `else`.
+          currentKey = null;
+        } else {
+          // Método NOMBADO y no soportado (AES-128-LWR, o cualquier futuro
+          // añadido a la spec). Antes la cadena `if/else if` no tenía `else`,
+          // así que `currentKey` conservaba la clave ANTERIOR: se descargaba
+          // con una clave que no correspondía (o sin descifrar) informando
+          // `encrypted: true` como si todo estuviera bien.
+          //
+          // Aquí lo honesto es fallar: es imposible saber cómo descifrarlo, y
+          // entregar bytes indescifrables sería peor que un error.
+          throw new Error(
+            `El stream usa un método de cifrado no soportado (${method}): no es descifrable.`
+          );
         }
         continue;
       }
@@ -171,11 +254,26 @@
         const uri = (attrs.match(/URI="([^"]+)"/i) || [])[1] || "";
         if (!uri) continue;
         let mapByterange = null;
-        const br = attrs.match(/BYTERANGE="(\d+)@?(\d+)?"/i);
+        // BYTERANGE admite la forma SIN comillas (`BYTERANGE=1000@500`), que
+        // es legal en una lista de atributos HLS y que el regex anterior
+        // (exigía comillas) no veía: se descargaba el recurso entero y se
+        // concatenaba la rebanada equivocada.
+        const br = attrs.match(/BYTERANGE="?(\d+)(?:@(\d+))?"?/i);
         if (br) {
           mapByterange = { length: Number(br[1]), offset: br[2] !== undefined ? Number(br[2]) : null };
         }
         currentMap = { url: resolveUrl(uri, baseUrl), byterange: mapByterange };
+        continue;
+      }
+      if (line.startsWith("#EXT-X-DISCONTINUITY")) {
+        // RFC 8216 §4.3.2.3: un corte de discontinuidad reinicia los timescales
+        // y la línea de tiempo. Los segmentos anteriores y posteriores NO son
+        // concatenables byte a byte: hacerlo produce DTS no monótonos y un
+        // archivo que muchos reproductores se niegan a abrir.
+        //
+        // Se registra en el segmento para que quien ensamble pueda poner un
+        // limite (nuevo fichero, o avisar) en lugar de generar basura.
+        pendingDiscontinuity = true;
         continue;
       }
       if (line.startsWith("#")) continue; // cualquier otro tag: ignorar
@@ -185,10 +283,26 @@
       if (pendingByterange) {
         let offset = pendingByterange.offset;
         if (offset === null || offset === undefined) {
-          offset = nextOffsetByUrl.get(segUrl) || 0;
+          // Offset implícito: RFC 8216 §4.3.2.2 dice que empieza donde acabó el
+          // segmento anterior DE LA MISMA URI. `byterangeCursors` es estado
+          // del ENGINE, no del parseo: antes vivía en un Map local que se
+          // recreaba en cada llamada, y en live (que re-parsea la playlist
+          // cada pocos segundos) el offset volvía a 0 siempre. El Range
+          // resultante era VÁLIDO y la longitud coincidía, así que los bytes
+          // equivocados se concatenaban sin ningún error.
+          const cursor = byterangeCursors.get(segUrl);
+          offset = cursor === undefined ? 0 : cursor;
         }
-        nextOffsetByUrl.set(segUrl, offset + pendingByterange.length);
-        byterange = { length: pendingByterange.length, offset };
+        byterangeCursors.set(segUrl, offset + pendingByterange.length);
+        // FALTA QUE SE ASIGNE. El offset se calculaba y el cursor se
+        // actualizaba, pero `byterange` se quedaba en `null` para siempre: la
+        // cabecera `Range` NO se enviaba, `fetchResource` pedía el recurso
+        // COMPLETO en cada segmento y devolvía un buffer mucho mayor que el
+        // esperado. En una playlist con BYTERANGE el resultado era el mismo
+        // fichero concatenado N veces, sin ningún error. El chequeo de
+        // longitud de `fetchResource` tampoco se activaba nunca, porque
+        // `byterange` era null.
+        byterange = { offset, length: pendingByterange.length };
         pendingByterange = null;
       }
       segments.push({
@@ -198,7 +312,9 @@
         byterange,
         key: currentKey ? { method: currentKey.method, uri: currentKey.uri, iv: currentKey.iv } : null,
         map: currentMap ? { url: currentMap.url, byterange: currentMap.byterange } : null,
+        discontinuity: pendingDiscontinuity,
       });
+      pendingDiscontinuity = false;
       if (pendingDuration) durationSec += pendingDuration;
       pendingDuration = null;
     }
@@ -211,6 +327,9 @@
       live,
       durationSec,
       targetDuration,
+      // Hay un corte de discontinuidad en algún punto: el ensamblador tiene que
+      // saberlo, porque a partir de ahí los segmentos no son concatenables.
+      hasDiscontinuity: segments.some((s) => s.discontinuity),
     };
   }
 
@@ -218,9 +337,18 @@
 
   const keyCache = new Map(); // uri -> Uint8Array(16)
 
-  async function fetchKey(key, fetchImpl) {
+  async function fetchKey(key, fetchImpl, fetchResource) {
     if (keyCache.has(key.uri)) return keyCache.get(key.uri);
-    const res = await fetchImpl(key.uri, { credentials: "include", cache: "no-store" });
+    // La clave se descarga por el MISMO wrapper que los segmentos, con su
+    // fallback de credenciales y sus reintentos. Antes usaba `fetchImpl`
+    // directamente con credentials:"include" y sin reintento: un endpoint de
+    // clave en un CDN sin `Access-Control-Allow-Credentials` moría en el
+    // primer intento con un 4xx opaco, y el resto del stream sí funcionaba —
+    // un fallo que solo se manifestaba al final de una descarga completa.
+    const res =
+      fetchResource && typeof fetchResource.fetchUrl === "function"
+        ? await fetchResource.fetchUrl(key.uri)
+        : await fetchImpl(key.uri, { credentials: "include", cache: "no-store" });
     if (!res.ok) throw new Error(`No se pudo obtener la clave AES (${res.status}): ${key.uri}`);
     const buf = new Uint8Array(await res.arrayBuffer());
     if (buf.length !== 16) throw new Error(`La clave AES mide ${buf.length} bytes (esperados 16): ${key.uri}`);
@@ -239,6 +367,9 @@
 
   // Resuelve master → media playlist (profundidad acotada para los raros
   // masters de masters). Devuelve { playlistUrl, text, variant }.
+  // Las variantes de SOLO AUDIO se saltan en la selección automática (no son
+  // vídeo); si la variante elegida lleva audio en grupo separado, se devuelve
+  // en variant.audioUrl para que el llamador decida (mux con companion).
   async function resolveVariantPlaylist({ url, quality = "best", doFetch, throwIfAborted }) {
     let playlistUrl = url;
     let text = "";
@@ -254,11 +385,13 @@
       const master = parseMaster(text, playlistUrl);
       if (!master) break;
       if (!master.variants.length) throw new Error("Master playlist sin variantes.");
+      const videoVariants = master.variants.filter((v) => !v.audioOnly);
+      const pool = videoVariants.length ? videoVariants : master.variants;
       let chosen;
       if (quality === "best") {
-        chosen = master.variants.reduce((a, b) => (b.bandwidth > a.bandwidth ? b : a));
+        chosen = pool.reduce((a, b) => (b.bandwidth > a.bandwidth ? b : a));
       } else {
-        chosen = master.variants.find((v) => String(v.bandwidth) === String(quality)) || master.variants[0];
+        chosen = pool.find((v) => String(v.bandwidth) === String(quality)) || pool[0];
       }
       variant = chosen;
       playlistUrl = chosen.url;
@@ -269,7 +402,10 @@
   // Fábrica del fetcher de recursos (segmentos/init) con Range para
   // BYTERANGE, reintentos con backoff y abort cooperativo.
   function createFetchResource({ doFetch, retries = 2, isAborted }) {
-    return async (segUrl, byterange) => {
+    // La descarga de la clave usa este mismo wrapper (con su fallback de
+    // credenciales y sus reintentos). Se le expone como propiedad para que
+    // fetchKey pueda recibirlo sin cambiar su firma pública.
+    const resource = async (segUrl, byterange) => {
       const headers = {};
       if (byterange) headers.Range = `bytes=${byterange.offset}-${byterange.offset + byterange.length - 1}`;
       let lastErr = null;
@@ -291,6 +427,24 @@
       }
       throw new Error(`Segmento fallido tras ${retries + 1} intentos: ${segUrl} (${String(lastErr?.message || lastErr)})`);
     };
+    // Petición de una URL suelta (la clave AES) por el mismo camino: mismo
+    // fallback de credenciales, mismos reintentos, mismo mensaje de error.
+    resource.fetchUrl = async (u) => {
+      let lastErr = null;
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        if (isAborted()) throw new Error("Descarga cancelada.");
+        try {
+          const res = await doFetch(u, { cache: "no-store" });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res;
+        } catch (e) {
+          lastErr = e;
+          if (attempt < retries) await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+        }
+      }
+      throw new Error(`Recurso fallido tras ${retries + 1} intentos: ${u} (${String(lastErr?.message || lastErr)})`);
+    };
+    return resource;
   }
 
   // Detección de contenedor: fMP4 si hay EXT-X-MAP o el primer segmento
@@ -304,21 +458,38 @@
     return "ts";
   }
 
-  // Descarga y descifra un segmento aplicando su EXT-X-MAP (init deduplicado
-  // en mapBuffers) y su KEY AES-128 (IV explícito o media sequence absoluta).
+  // Descarga y descifra un segmento aplicando su EXT-X-MAP (init) y su KEY
+  // AES-128 (IV explícito o media sequence absoluta).
+  //
+  // Devuelve `{ media, init }`: el init se devuelve JUNTO a su segmento en vez
+  // de acumularlo aparte. Antes todos los init se volcaban en una lista global
+  // que luego se concatenaba AL PRINCIPIO, en orden de finalización de descarga
+  // (nondeterminista con concurrencia). Eso rompe en cuanto hay más de un
+  // periodo: los `trex` del init del periodo 0 se aplicaban a segmentos del
+  // periodo N, y el archivo resultante no se abría.
   async function processSegment(seg, fetchResource, doFetch, mapBuffers) {
     let buf = await fetchResource(seg.url, seg.byterange);
     if (seg.key) {
-      const keyBytes = await fetchKey(seg.key, doFetch);
+      const keyBytes = await fetchKey(seg.key, doFetch, fetchResource);
       const iv = seg.key.iv || sequenceIv(seg.seq);
       buf = await decryptAes128(keyBytes, iv, buf);
     }
-    if (seg.map && !mapBuffers.has(seg.map.url)) {
-      // El init segment del MAP activo se descarga con su BYTERANGE propio
-      // (el parser ya resolvió offset acumulativo y longitud).
-      mapBuffers.set(seg.map.url, await fetchResource(seg.map.url, seg.map.byterange));
+    let init = null;
+    if (seg.map) {
+      // El init segment del MAP activo se descarga con su BYTERANGE propio (el
+      // parser ya resolvió offset acumulativo y longitud).
+      //
+      // En la cache va la PROMESA, no el buffer resuelto: con concurrencia >1,
+      // dos segmentos del mismo periodo se comprobaban mutuamente el `has()`
+      // ANTES de que ninguno hubiera terminado y ambos descargaban el init.
+      let pending = mapBuffers.get(seg.map.url);
+      if (!pending) {
+        pending = fetchResource(seg.map.url, seg.map.byterange);
+        mapBuffers.set(seg.map.url, pending);
+      }
+      init = await pending;
     }
-    return buf;
+    return { media: buf, init, discontinuity: !!seg.discontinuity };
   }
 
   // --- Descarga orquestada (VOD) ---
@@ -342,11 +513,18 @@
       maxSegments = 5000,
       maxBytes = 2 * 1024 * 1024 * 1024,
       allowLive = true,
+      requireAudio = false,
     } = opts || {};
 
     const doFetch = async (u, o = {}) => {
       if (beforeFetch) await beforeFetch(u);
-      return fetchImpl(u, { credentials: "include", cache: "force-cache", ...o });
+      try {
+        return await fetchImpl(u, { credentials: "include", cache: "force-cache", ...o });
+      } catch (e) {
+        // Petición credencial cross-origin rechazada (CDN sin CORS de
+        // cookies): reintentar sin credenciales antes de rendirse.
+        return await fetchImpl(u, { credentials: "omit", cache: "no-store", ...o });
+      }
     };
 
     const aborted = () => signal && signal.aborted;
@@ -361,6 +539,40 @@
       throw new Error("El manifiesto no contiene segmentos descargables.");
     }
 
+// DETECCIÓN TEMPRANA DE AUDIO: el init segment (EXT-X-MAP) contiene el
+    // moov con los trak - handler "soun" = la variante lleva audio. Los
+    // masters con audio separado (X/Twitter) sirven variantes SOLO VÍDEO:
+    // sin esta comprobación, la descarga produce un vídeo mudo "exitoso".
+    // Con requireAudio, falla ANTES de gastar la descarga.
+    //
+    // El init se pide por el MISMO `fetchResource` y la MISMA cache que usarán
+    // los segmentos. Antes hacía una petición propia con `fetchImpl`, así que
+    // el mismo recurso se descargaba DOS veces en toda la operación.
+    const fetchResource = createFetchResource({ doFetch, retries, isAborted: aborted });
+    const mapBuffers = new Map(); // mapUrl -> Promise<Uint8Array> (cache de init)
+    let hasAudio = null;
+    if (media.map) {
+      try {
+        const asciiOf = (u8) => {
+          let s = "";
+          const step = 0x8000;
+          for (let i = 0; i < u8.length; i += step) s += String.fromCharCode.apply(null, u8.subarray(i, i + step));
+          return s;
+        };
+        let pending = mapBuffers.get(media.map.url);
+        if (!pending) {
+          pending = fetchResource(media.map.url, media.map.byterange);
+          mapBuffers.set(media.map.url, pending);
+        }
+        hasAudio = asciiOf(await pending).includes("soun");
+      } catch {
+        hasAudio = null; // no determinar: no bloquear
+      }
+    }
+    if (requireAudio && hasAudio === false) {
+      throw new Error("Esta variante no incluye pista de audio (stream con audio separado): se necesita el companion para unir vídeo+audio.");
+    }
+
     // Live/event (sin ENDLIST): ventana deslizante → modo grabación. Se pasa
     // la media playlist ya parseada para no perder la ventana actual.
     if (media.live && allowLive) {
@@ -373,18 +585,23 @@
       );
     }
 
-    const fetchResource = createFetchResource({ doFetch, retries, isAborted: aborted });
     const total = media.segments.length;
     const buffers = new Array(total);
-    const mapBuffers = new Map(); // mapUrl -> Uint8Array
+    const inits = new Array(total); // init POR SEGMENTO (o null)
     let done = 0;
     let bytes = 0;
     let firstBytes = null; // para detectar el contenedor por magic bytes
 
     const runSegment = async (seg, index) => {
-      const buf = await processSegment(seg, fetchResource, doFetch, mapBuffers);
+      const { media: buf, init } = await processSegment(seg, fetchResource, doFetch, mapBuffers);
       buffers[index] = buf;
-      if (!firstBytes && buf.length >= 4) firstBytes = buf.slice(0, 12);
+      inits[index] = init;
+      // `firstBytes` debe ser el del SEGMENTO 0, no el del primero que termine:
+      // con concurrencia >1 ganaba el que se descargaba antes, y el resultado
+      // (fMP4 vs TS) era NONDETERMINISTA para la misma URL. Además se miran
+      // bytes de un segmento de medios, no de un init, así que la marca que
+      // importa (`ftyp`/`styp`) solo aparece en los primeros.
+      if (index === 0 && buf.length >= 4) firstBytes = buf.slice(0, 12);
       bytes += buf.byteLength;
       if (bytes > maxBytes) {
         throw new Error(`El stream supera el límite de ${(maxBytes / 1073741824).toFixed(0)} GB — abortado.`);
@@ -422,12 +639,29 @@
 
     const kind = sniffContainer(media.map, firstBytes);
 
-    // Concatenación binaria en orden de reproducción.
+    // Concatenación binaria EN ORDEN DE REPRODUCCIÓN, con el init de cada
+    // periodo en su sitio.
+    //
+    // Antes se volcaban TODOS los init al principio (y en orden de FINALIZACIÓN
+    // de descarga, que con concurrencia es arbitrario) y luego todos los
+    // segmentos. Con un solo periodo funcionaba por casualidad; con dos, los
+    // `trex` del init equivocado se aplicaban a los segmentos del otro periodo
+    // y el MP4 resultante no se abría. Ahora el init precede a su primer
+    // segmento y se reutiliza (cache) en el resto del periodo.
     const parts = [];
     if (kind === "fmp4") {
-      for (const mapBuf of mapBuffers.values()) parts.push(mapBuf);
+      let lastInit = null;
+      for (let i = 0; i < buffers.length; i++) {
+        const init = inits[i];
+        if (init && init !== lastInit) {
+          parts.push(init);
+          lastInit = init;
+        }
+        parts.push(buffers[i]);
+      }
+    } else {
+      for (const b of buffers) parts.push(b);
     }
-    for (const b of buffers) parts.push(b);
     const blob = new Blob(parts, { type: kind === "fmp4" ? "video/mp4" : "video/mp2t" });
 
     return {
@@ -439,6 +673,8 @@
       encrypted: media.encrypted,
       live: media.live,
       variant,
+      hasAudio,
+      hasDiscontinuity: !!media.hasDiscontinuity,
     };
   }
 
@@ -469,7 +705,12 @@
 
     const doFetch = async (u, o = {}) => {
       if (beforeFetch) await beforeFetch(u);
-      return fetchImpl(u, { credentials: "include", cache: "force-cache", ...o });
+      try {
+        return await fetchImpl(u, { credentials: "include", cache: "force-cache", ...o });
+      } catch (e) {
+        // Credenciales cross-origin rechazadas: reintentar sin cookies.
+        return await fetchImpl(u, { credentials: "omit", cache: "no-store", ...o });
+      }
     };
     const aborted = () => signal && signal.aborted;
     const throwIfAborted = () => {
@@ -481,15 +722,23 @@
     //    la ventana actual al re-leer) o resuelve variantes desde cero.
     let playlistUrl = initialPlaylistUrl || url;
     let variant = null;
+    let initialText = null;
     if (!initialMedia) {
       const resolved = await resolveVariantPlaylist({ url, quality, doFetch, throwIfAborted });
       playlistUrl = resolved.playlistUrl;
       variant = resolved.variant;
+      // El texto leído NO se descartaba: se pedía el manifest y luego el
+      // sondeador volvía a pedirlo, sin parsear el primero. Los segmentos que
+      // solo aparecían en esa primera foto (ventana corta, o un playlist que ya
+      // no cambia) nunca se encolaban, y la grabación empezaba en el siguiente
+      // ciclo: se perdían segmentos del principio sin ningún aviso.
+      initialText = resolved.text;
     }
 
     // 2) Estado del live: dedupe por media sequence absoluta.
     const seen = new Set(); // seq ya encolados
     const buffers = new Map(); // seq -> Uint8Array
+    const liveInits = new Map(); // seq -> init segment de ese periodo (o null)
     const mapBuffers = new Map();
     const pending = []; // cola de segmentos pendientes de fetch
     let bytes = 0;
@@ -505,13 +754,20 @@
     let emptySinceMs = 0;
     const t0 = Date.now();
 
-    // Semilla: la ventana actual ya parseada por downloadHls entra primero.
-    if (initialMedia) {
-      for (const seg of initialMedia.segments) {
+    // Semilla: la ventana actual ya parseada (por downloadHls o por el primer
+    // manifest leído aquí) entra primero. Si no hay nada que sembrar y el
+    // primer manifest traía ENDLIST, la grabación ya ha terminado.
+    const seed = initialMedia || (initialText ? parseMedia(initialText, playlistUrl) : null);
+    if (seed) {
+      for (const seg of seed.segments) {
         if (seen.has(seg.seq)) continue;
         seen.add(seg.seq);
         durationSeen += seg.duration || 0;
         pending.push(seg);
+      }
+      if (seed.live === false && !initialMedia) {
+        ended = true;
+        stopping = true;
       }
     }
 
@@ -532,9 +788,14 @@
     };
 
     const runSegment = async (seg) => {
-      const buf = await processSegment(seg, fetchResource, doFetch, mapBuffers);
+      const { media: buf, init } = await processSegment(seg, fetchResource, doFetch, mapBuffers);
       buffers.set(seg.seq, buf);
-      if (!firstBytes && buf.length >= 4) firstBytes = buf.slice(0, 12);
+      liveInits.set(seg.seq, init);
+      // `firstBytes` debe salir del segmento de MENOR seq (el primero en el
+      // tiempo), no del primero que termine de descargarse: con concurrencia
+      // >1 el que ganaba la carrera era arbitrario y la detección de
+      // contenedor (fMP4 vs TS) salía distinta en ejecuciones de la misma URL.
+      if (firstBytes === null && buf.length >= 4) firstBytes = buf.slice(0, 12);
       if (seg.key) encryptedSeen = true;
       bytes += buf.byteLength;
       done++;
@@ -665,17 +926,31 @@
     await Promise.all([poller, ...Array.from({ length: concurrency }, worker)]);
     if (fatal) throw fatal;
 
-    // 5) Ensamblado en orden de reproducción (por seq absoluta).
-    const ordered = [...buffers.keys()].sort((a, b) => a - b).map((k) => buffers.get(k));
-    // Los lives fMP4 declaran EXT-X-MAP (init deduplicado en mapBuffers);
-    // sin MAP se aplica el sniffing de magic bytes sobre el primer segmento.
+    // 5) Ensamblado en orden de reproduccion (por seq absoluta).
+    const orderedKeys = [...buffers.keys()].sort((a, b) => a - b);
+    const ordered = orderedKeys.map((k) => buffers.get(k));
+    // Los lives fMP4 declaran EXT-X-MAP (init); sin MAP se aplica el sniffing
+    // de magic bytes sobre el primer segmento.
     const finalKind = mapBuffers.size > 0 ? "fmp4" : sniffContainer(false, firstBytes);
 
+    // El init va justo antes de su primer segmento, no acumulado al principio.
+    // Ver la nota equivalente en downloadHls: con mas de un periodo, volcar
+    // todos los init delante mezclaba los `trex` de un periodo con los
+    // segmentos de otro y el MP4 resultante no se abria.
     const parts = [];
     if (finalKind === "fmp4") {
-      for (const mapBuf of mapBuffers.values()) parts.push(mapBuf);
+      let lastInit = null;
+      for (const seq of orderedKeys) {
+        const init = liveInits.get(seq);
+        if (init && init !== lastInit) {
+          parts.push(init);
+          lastInit = init;
+        }
+        parts.push(buffers.get(seq));
+      }
+    } else {
+      for (const b of ordered) parts.push(b);
     }
-    for (const b of ordered) parts.push(b);
     const blob = new Blob(parts, { type: finalKind === "fmp4" ? "video/mp4" : "video/mp2t" });
 
     reportProgress();
@@ -692,9 +967,15 @@
     };
   }
 
-  // Limpieza de la caché de claves (los tokens AES expiran entre descargas).
+  // Limpieza del estado del motor entre descargas.
+  //
+  // Los tokens AES expiran y no deben arrastrarse. Los cursores de byterange
+  // TAMBIÉN: pertenecen a una descarga concreta, y mantenerlos haría que la
+  // siguiente descarga de un recurso con byteranges empezara en el offset que
+  // dejó la anterior (que puede estar en otro medio o ya haber caducado).
   function clearKeyCache() {
     keyCache.clear();
+    engineState.reset();
   }
 
   // --- API pública ---

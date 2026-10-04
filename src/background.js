@@ -10,6 +10,18 @@ import { OperantMedia } from "./shared/media-core.js";
 // Ruta rápida HLS 100% en navegador (mismo motor que ejecuta el panel):
 // parseo m3u8 + fetch paralelo + AES-128 (WebCrypto) + concat fMP4/TS.
 import { HLSFast } from "./shared/hls-fast.js";
+// ÚNICA FUENTE DE VERDAD de nombres de archivo (compartida con el panel).
+// Todo lo que va a chrome.downloads.download({filename}) pasa por aquí.
+import {
+  sanitizeFileName,
+  basenameFromUrl,
+  filenameFromResponse,
+  mimeToExt,
+  ensureExtension,
+} from "./shared/filename.js";
+// Punto de entrada del panel lateral. La build de Firefox sustituye este
+// import por ./panel-entry-gecko.js (ver scripts/build-firefox.mjs).
+import { setupPanelOnInstalled } from "./panel-entry-chromium.js";
 
 const NATIVE_HOST = "com.operant.native_host";
 const MAX_ITEMS_PER_TAB = 4000;
@@ -19,104 +31,181 @@ const MAX_ITEMS_PER_TAB = 4000;
 // Access-Control-Allow-Origin muere por CORS, y el fetch del SW sin Referer da
 // 403/410. Solución de raíz: el SW hace el fetch (sin CORS con <all_urls>) y
 // declarativeNetRequest le inyecta el Referer REAL de la página, en una regla
-// EFÍMERA por descarga (id derivado de la URL, se elimina al terminar). Así
-// funciona con cualquier CDN con anti-hotlink sin lista de sitios.
-const DNR_RULE_BASE = 7000; // rango 7001..7999 (hasta 999 reglas simultáneas)
+// por descarga (se elimina al terminar). Así funciona con cualquier CDN con
+// anti-hotlink sin lista de sitios.
+//
+// TRES CORRECCIONES IMPORTANTES sobre la implementación anterior:
+//
+// 1. `updateSessionRules` en lugar de `updateDynamicRules`. Las reglas
+//    dinámicas SOBREVIVEN a reinicios del navegador y a actualizaciones de la
+//    extensión, pero la intención documentada era "regla EFÍMERA". Con
+//    updateDynamicRules, cualquier fuga (un service worker terminado a mitad de
+//    una descarga no ejecuta su `finally`) dejaba un Referer obsoleto inyectado
+//    en peticiones de la extensión de forma indefinida. Las de sesión se
+//    limpian al cerrar el navegador y al instalar una versión nueva.
+//
+// 2. `urlFilter` con la URL ESCAPADA. `urlFilter` es un lenguaje de patrón
+//    (caracteres especiales: * | ^ : ? - \), no un literal. Con la URL cruda un
+//    `?` —presente en toda URL firmada— era comodín, y un `|` legal en un
+//    query partía el filtro en un OR de dos patrones, con lo que el Referer de
+//    la página acababa en URLs no pretendidas.
+//
+// 3. IDs de un contador con anillo, no un hash de la URL. El hash colapsaba en
+//    999 ranuras (≈3 % de colisión con 8 descargas en vuelo) y una colisión
+//    hacía que una descarga BORRARA la regla Referer de otra: 403 en un
+//    archivo diferente, con el `finally` de una borrando la de la otra.
 
-// ID determinista y estable por URL (evita colisiones entre descargas).
-function dnrRuleIdFor(url) {
-  let h = 0;
-  for (let i = 0; i < url.length; i++) h = (h * 31 + url.charCodeAt(i)) >>> 0;
-  return DNR_RULE_BASE + 1 + (h % 999);
+// Espacio de IDs. Las session rules de Chrome admiten 5000; se deja margen
+// para no agotar la cuota en versiones antiguas, donde se comparte con las
+// dinámicas.
+const DNR_RULE_BASE = 7000;
+const DNR_RULE_SPACE = 4000;
+
+// Clave -> id de regla vivo. Una sola autoridad para los dos tipos de regla
+// (por URL y por host), con lo que no pueden colisionar entre sí.
+const dnrAuthRules = new Map();
+let dnrNextRuleId = DNR_RULE_BASE + 1;
+
+function allocDnrRuleId() {
+  if (dnrNextRuleId >= DNR_RULE_BASE + DNR_RULE_SPACE) {
+    // Anillo agotado (no ocurre en uso real: ~20 reglas vivas). Se reinicia el
+    // contador; los IDs reutilizados sustituyen a las reglas anteriores, y
+    // todas son de sesión, así que no queda estado persistente que corromper.
+    dnrNextRuleId = DNR_RULE_BASE + 1;
+  }
+  return dnrNextRuleId++;
 }
 
-async function dnrSetRefererRule(url, referer) {
-  if (!chrome.declarativeNetRequest) return;
-  const id = dnrRuleIdFor(url);
+// Escapa los metacaracteres del lenguaje urlFilter de declarativeNetRequest
+// para que la URL se trate como literal.
+function dnrEscapeFilter(value) {
+  return String(value).replace(/[*|^:?\\]/g, (ch) => `\\${ch}`);
+}
+
+// Cabecera Cookie para una URL, si el usuario ha concedido el permiso
+// `cookies`. Es la ÚNICA vía bajo MV3 para reenviar cookies HttpOnly en un
+// fetch del service worker: el content script no puede leerlas y el service
+// worker no las ve sin ese permiso. Sin permiso devuelve "" y el
+// comportamiento es el de siempre (credentials:"include" + Referer).
+const COOKIE_HEADER_MAX = 3800; // límite típico de servidor para una cabecera
+
+async function cookieHeaderFor(url) {
+  if (typeof chrome === "undefined" || !chrome.cookies) return "";
   try {
-    await chrome.declarativeNetRequest.updateDynamicRules({
+    const cookies = await chrome.cookies.getAll({ url });
+    if (!cookies || !cookies.length) return "";
+    const parts = [];
+    let len = 0;
+    for (const c of cookies) {
+      const piece = `${c.name}=${c.value}`;
+      if (len + piece.length + 2 > COOKIE_HEADER_MAX) break;
+      parts.push(piece);
+      len += piece.length + 2;
+    }
+    return parts.join("; ");
+  } catch {
+    return "";
+  }
+}
+
+// Estado del permiso opcional `cookies`. Se cachea para no consultarlo en cada
+// descarga; chrome.cookies ya es undefined sin el permiso, así que este valor
+// solo se usa para decidir si merece la pena construir la cabecera Cookie.
+let cookiesPermGranted = false;
+async function hasCookiesPermission() {
+  try {
+    cookiesPermGranted = await chrome.permissions.contains({ permissions: ["cookies"] });
+  } catch {
+    cookiesPermGranted = false;
+  }
+  return cookiesPermGranted;
+}
+
+// Inyecta Referer (y Cookie si hay permiso) en las peticiones de la extensión
+// hacia una URL o un host. `key` identifica la regla viva para poder retirarla.
+async function dnrInstallAuthRule(key, filter, referer) {
+  if (!chrome.declarativeNetRequest) return false;
+  const headers = [];
+  if (referer) headers.push({ header: "Referer", operation: "set", value: referer });
+  if (await hasCookiesPermission()) {
+    const cookie = await cookieHeaderFor(filter);
+    if (cookie) headers.push({ header: "Cookie", operation: "set", value: cookie });
+  }
+  if (!headers.length) return false;
+
+  const id = allocDnrRuleId();
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({
       removeRuleIds: [id],
       addRules: [
         {
           id,
-          action: {
-            type: "modifyHeaders",
-            requestHeaders: [{ header: "Referer", operation: "set", value: referer }],
-          },
+          priority: 1,
+          action: { type: "modifyHeaders", requestHeaders: headers },
           condition: {
-            initiatorDomains: [chrome.runtime.id], // solo peticiones del propio SW
+            initiatorDomains: [chrome.runtime.id], // solo peticiones de la extensión
             resourceTypes: ["xmlhttprequest", "media", "other"],
-            urlFilter: url,
+            isUrlFilterCaseSensitive: true,
+            urlFilter: dnrEscapeFilter(filter),
           },
         },
       ],
     });
-    return id;
+    dnrAuthRules.set(key, id);
+    return true;
   } catch (e) {
-    console.log(`[operant-sw] DNR rule add failed: ${String(e?.message || e)}`);
-    return null;
+    console.log(`[operant-sw] DNR rule failed (${String(key).slice(0, 80)}): ${String(e?.message || e)}`);
+    return false;
   }
 }
 
-async function dnrClearRefererRule(url) {
+async function dnrRemoveAuthRule(key) {
   if (!chrome.declarativeNetRequest) return;
+  const id = dnrAuthRules.get(key);
+  if (id === undefined) return;
+  dnrAuthRules.delete(key);
   try {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [dnrRuleIdFor(url)] });
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] });
   } catch {
-    /* no-op */
+    /* la regla desaparece igualmente al cerrar el navegador */
   }
 }
 
-// --- Anti-hotlink POR HOST (ruta rápida HLS) ---
-// Un m3u8 puede tener cientos de segmentos: crear una regla DNR por segmento
-// revientaría el límite (~999 reglas simultáneas) y sería O(n) mensajes. Una
-// regla POR HOST con urlFilter "||host" cubre todos los segmentos del mismo
-// CDN. Rango de ids propio (6800-6999) para no colisionar con las reglas por
-// URL (7000+) al limpiar.
-const DNR_HOST_RULE_BASE = 6800;
-
-function dnrHostRuleIdFor(hostname) {
-  let h = 0;
-  for (let i = 0; i < hostname.length; i++) h = (h * 31 + hostname.charCodeAt(i)) >>> 0;
-  return DNR_HOST_RULE_BASE + 1 + (h % 199);
+// Regla por URL exacta (filtro escapado).
+function dnrSetAuthRule(url, referer) {
+  return dnrInstallAuthRule(`url:${url}`, url, referer);
+}
+function dnrClearAuthRule(url) {
+  return dnrRemoveAuthRule(`url:${url}`);
 }
 
-async function dnrSetRefererHostRule(hostname, referer) {
-  if (!chrome.declarativeNetRequest || !hostname || !referer) return null;
-  const id = dnrHostRuleIdFor(hostname);
+// Regla por HOST: cubre los cientos de segmentos de un m3u8 sin crear una
+// regla por segmento, que agotaría la cuota y sería O(n) mensajes.
+function dnrSetRefererHostRule(hostname, referer) {
+  if (!hostname) return Promise.resolve(false);
+  return dnrInstallAuthRule(`host:${hostname}`, `||${hostname}`, referer);
+}
+function dnrClearRefererHostRule(hostname) {
+  return dnrRemoveAuthRule(`host:${hostname}`);
+}
+
+// Mantiene viva una regla de auth durante toda la operación `fn` y la retira al
+// terminar (éxito, error o cancelación). Esto es lo que permite que la descarga
+// DIRECTA con chrome.downloads.download funcione contra CDN con anti-hotlink:
+// esa petición la hace el gestor de descargas del navegador —que sí lleva las
+// cookies del perfil— pero sin Referer, que es justo lo que muchos CDNs
+// comprueban. La regla cubre `initiatorDomains: [extensión]`, que incluye las
+// peticiones iniciadas por el gestor de descargas de la extensión.
+async function withDnrAuth(url, pageUrl, fn) {
+  if (!pageUrl || !/^https?:/i.test(url || "")) return fn();
+  const installed = await dnrSetAuthRule(url, pageUrl);
   try {
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [id],
-      addRules: [
-        {
-          id,
-          action: {
-            type: "modifyHeaders",
-            requestHeaders: [{ header: "Referer", operation: "set", value: referer }],
-          },
-          condition: {
-            initiatorDomains: [chrome.runtime.id], // solo peticiones del propio SW/panel
-            resourceTypes: ["xmlhttprequest", "media", "other"],
-            urlFilter: `||${hostname}`,
-          },
-        },
-      ],
-    });
-    return id;
-  } catch (e) {
-    console.log(`[operant-sw] DNR host rule add failed: ${String(e?.message || e)}`);
-    return null;
+    return await fn();
+  } finally {
+    if (installed) await dnrClearAuthRule(url);
   }
 }
 
-async function dnrClearRefererHostRule(hostname) {
-  if (!chrome.declarativeNetRequest || !hostname) return;
-  try {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [dnrHostRuleIdFor(hostname)] });
-  } catch {
-    /* no-op */
-  }
-}
 
 // Construye la lista de URLs a descargar para un track DASH: init segment
 // (si existe) + todos los media segments del .mpd. Si el parser no generó
@@ -134,6 +223,20 @@ function buildSegList(q) {
 // --- Estado por pestaña ---
 const tabs = new Map(); // tabId -> { items: [], seenNetwork: Set<string> }
 const sizeCache = new Map(); // url -> sizeKB
+
+// Secuencia global de detección (ORDEN ESTABLE DE RAÍZ): cada item recibe un
+// seq MONOTONO una sola vez, en el momento en que entra al estado central.
+// El panel ordena por este seq: es inmutable ante re-escaneos, mezclas y
+// actualizaciones de tamaño — el orden de aparición nunca "salta" al volver
+// de una pestaña a otra (los _idx reasignados por mensaje eran la causa raíz).
+let seqCounter = 1;
+function nextSeq() {
+  return seqCounter++;
+}
+function withSeq(item) {
+  if (item && item.seq === undefined) item.seq = nextSeq();
+  return item;
+}
 
 function ensureTab(tabId) {
   if (!tabs.has(tabId)) {
@@ -157,9 +260,21 @@ async function persistTab(tabId) {
 }
 
 // --- Fase 1: Side Panel API ---
+// --- Punto de entrada del panel lateral ---
+//
+// La implementación NO está aquí sino en `panel-entry-chromium.js`, y la build de
+// Firefox la sustituye por `panel-entry-gecko.js`. Motivo: `chrome.sidePanel`
+// es una API exclusiva de Chromium, y cualquier referencia a ella en el paquete
+// de Firefox la marca addons-linter como UNSUPPORTED_API. Aislarlo por target
+// deja el código correcto en ambos navegadores SIN tener que ocultar la
+// referencia para silenciar al linter.
+//
+// Lo que sí había era un bug real: la versión anterior llamaba a
+// `chrome.sidePanel.setPanelBehavior(...)` dentro de un `.catch(() => {})` que
+// se tragaba el `TypeError`, de modo que en Firefox la extensión se instalaba y
+// el icono de la barra no abría nada, sin un solo error visible.
 chrome.runtime.onInstalled.addListener(() => {
-  // Clic en el icono => abre el panel lateral.
-  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  setupPanelOnInstalled();
   chrome.storage.local.get(["autoDetect"], (data) => {
     if (data.autoDetect === undefined) chrome.storage.local.set({ autoDetect: true });
   });
@@ -263,13 +378,72 @@ function urlExt(url) {
   }
 }
 
+// Nombre de archivo SEGURO derivado de la URL. Delega en shared/filename.js,
+// que decodifica el último segmento ANTES de sanearlo: así un %2F que ocultaba
+// un separador vuelve a ser "_" en lugar de recuperar su significado de ruta.
+// Antes se hacía split("/") y luego decodeURIComponent, con lo que
+// `a%2F..%2F..%2Fevil.png` producía un nombre con separadores de ruta.
 function urlBasename(url) {
-  try {
-    const p = new URL(url).pathname.split("/").filter(Boolean).pop();
-    return p ? decodeURIComponent(p) : "";
-  } catch {
-    return "";
+  return basenameFromUrl(url);
+}
+
+// Punto único de entrada para TODO nombre que se entrega a
+// chrome.downloads.download. Garantiza que el nombre es plano (sin separadores
+// ni ".."), sin caracteres de control ni invisibles, sin nombres reservados de
+// Windows, en NFC y acotado en bytes.
+//
+// `preferred` es lo que el panel o el overlay proponen (suele venir del alt o
+// del title de la página: no es de fiar). `url` es la fuente de respaldo.
+// `ext` y `mime` son opcionales y sirven para no dejar el archivo sin extensión
+// cuando la URL es opaca (/download?token=…).
+function safeDownloadName(preferred, url, ext, mime) {
+  const fromPreferred = preferred ? sanitizeFileName(preferred, { fallback: "" }) : "";
+  const base = fromPreferred || urlBasename(url) || "descarga";
+  const resolvedExt = (ext && String(ext).replace(/^\./, "")) || mimeToExt(mime) || "";
+  return ensureExtension(base, resolvedExt);
+}
+
+// --- Bytes: utilidades sin asignaciones masivas ---
+// String.fromCharCode(...) con un array grande revienta por stack overflow
+// (límite de argumentos de la llamada). Estas dos funciones lo evitan sin
+// construir nunca una cadena gigante a mano, y son O(n) con memoria acotada.
+
+// ¿Aparece la subcadena ASCII `needle` en los primeros `window` bytes?
+// Se comparan BYTES, no caracteres: no materializa nada.
+function bytesContainAscii(bytes, needle, window) {
+  if (!bytes || !needle) return false;
+  const n = needle.length;
+  const limit = Math.min(bytes.length, window === undefined ? bytes.length : window);
+  if (n === 0 || limit < n) return false;
+  const first = needle.charCodeAt(0);
+  for (let i = 0; i <= limit - n; i++) {
+    if (bytes[i] !== first) continue;
+    let j = 1;
+    while (j < n && bytes[i + j] === needle.charCodeAt(j)) j++;
+    if (j === n) return true;
   }
+  return false;
+}
+
+// Texto ASCII/latin1 de los primeros `window` bytes, sin stack overflow.
+function asciiHead(bytes, window) {
+  const limit = Math.min(bytes.length, window);
+  const CHUNK = 0x8000;
+  let s = "";
+  for (let i = 0; i < limit; i += CHUNK) {
+    const end = Math.min(i + CHUNK, limit);
+    let piece = "";
+    for (let j = i; j < end; j++) piece += String.fromCharCode(bytes[j]);
+    s += piece;
+  }
+  return s;
+}
+
+function formatBytesKB(bytes) {
+  if (!bytes || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
 chrome.webRequest.onBeforeRequest.addListener(
@@ -291,7 +465,7 @@ chrome.webRequest.onBeforeRequest.addListener(
       /(?:^|[\/._-])(?:init|header)(?:[\/._-]|$)/i.test(details.url) ||
       /\/init[^/]*\.(mp4|m4s|m4v)(?:[?#]|$)/i.test(details.url);
 
-    const item = {
+    const item = withSeq({
       url: details.url,
       type: kind,
       ext: extOf(details.url),
@@ -308,7 +482,7 @@ chrome.webRequest.onBeforeRequest.addListener(
           : kind === "video" && /\.(m3u8|mpd)(?:[?#].*)?$/i.test(details.url)
             ? "manifest"
             : "network",
-    };
+    });
     tab.items.push(item);
     if (tab.items.length > MAX_ITEMS_PER_TAB) tab.items.shift();
 
@@ -322,20 +496,98 @@ chrome.webRequest.onBeforeRequest.addListener(
   []
 );
 
-// --- Enriquecimiento: tamaño estimado vía HEAD ---
-// Orden de técnicas para obtener el tamaño REAL (de más fiable a menos):
+// --- Enriquecimiento: tamaño real del recurso ---
+//
+// ORDEN DE LA ESCALERA (de más barata a más cara). El orden importa mucho: la
+// versión anterior empezaba por un GET COMPLETO del archivo (nivel 1) y solo
+// después probaba HEAD (nivel 2), contra su propio comentario. En una página
+// con un vídeo de 2 GB eso significaba descargar 2 GB a RAM del service worker
+// para poder pintar "2.0 GB" en el grid.
+//
 //   0. Performance Resource Timing (sizeBytes del content script): el navegador
-//      ya cargó el recurso y registró encodedBodySize — sin petición extra.
-//   1. GET real + blob.size: cuenta los bytes recibidos, preciso aunque el
-//      servidor no mande Content-Length (gstatic/Google Images funcionan así).
-//   1.5. GET con Referer vía DNR (anti-hotlink): muchos servidores con protección
-//      anti-hotlink rechazan el HEAD/GET del SW sin el Referer de la página; con la
-//      regla DNR efímera el fetch funciona y se obtiene el tamaño real. Es el mismo
-//      mecanismo de la descarga (sw-fetch-blob), aplicado al enriquecimiento.
-//   2. HEAD + Content-Length: último recurso (muchos CDNs no lo devuelven).
+//      ya cargó el recurso y registró encodedBodySize — cero peticiones.
+//   1. HEAD + Content-Length: una cabecera, sin cuerpo. Cubre la mayoría.
+//   2. Range GET de 1 byte + Content-Range: cubre los servidores que responden
+//      405/501 a HEAD pero sí aceptan Range. Cuesta 1 byte, no el archivo.
+//   3. HEAD/GET con Referer vía DNR: muchos CDN con anti-hotlink rechazan
+//      cualquier petición sin el Referer de la página.
+//   4. GET con Referer vía DNR, LEYENDO COMO MÁXIMO `FULL_GET_MAX` bytes: solo
+//      para recursos cuyo Content-Length es desconocido o miente, y nunca más
+//      allá del tope. Antes este nivel era un GET sin límite en el camino
+//      caliente de webRequest, sin concurrencia acotada.
+//
+// Semáforo global: el camino de `webRequest.onBeforeRequest` llama a enrichSize
+// por cada request de media detectado, sin ningún tope. Con 500 recursos en una
+// página eso son 500 peticiones de tamaño simultáneas. Ahora comparte el mismo
+// semáforo que enrichMissing.
+
+const ENRICH_TIMEOUT_MS = 8000;
+// Tope absoluto de bytes que se leen en el nivel 4 (GET completo). Por encima
+// de esto el recurso se marca como desconocido en lugar de descargarse entero:
+// es preferible mostrar "?" que agotar la memoria del service worker.
+const FULL_GET_MAX = 8 * 1024 * 1024;
+
+let enrichInFlight = 0;
+const enrichWaiters = [];
+const ENRICH_MAX_CONCURRENT = 8;
+
+async function enrichAcquire() {
+  if (enrichInFlight < ENRICH_MAX_CONCURRENT) {
+    enrichInFlight++;
+    return;
+  }
+  await new Promise((resolve) => enrichWaiters.push(resolve));
+  enrichInFlight++;
+}
+
+function enrichRelease() {
+  enrichInFlight--;
+  const next = enrichWaiters.shift();
+  if (next) next();
+}
+
+// fetch con timeout cuyo temporizador SIEMPRE se limpia. Antes, cuando el
+// fetch fallaba por una causa distinta del abort (DNS, offline, respuesta
+// opaca), el temporizador de 5-8 s se quedaba vivo para siempre: hasta tres
+// temporizadores fugados por item fallido, en un service worker que no
+// reinicia nunca.
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Total en bytes según Content-Range ("bytes 0-0/12345" → 12345) o
+// Content-Length. 0 si no se puede saber.
+function declaredTotalBytes(res) {
+  const range = res.headers.get("content-range");
+  if (range) {
+    const total = Number(range.split("/")[1]);
+    if (Number.isFinite(total) && total > 0) return total;
+  }
+  const len = Number(res.headers.get("content-length") || 0);
+  return Number.isFinite(len) && len > 0 ? len : 0;
+}
+
+// Referer de la página, solo si el recurso es de otro dominio (si es del mismo,
+// el fetch ya lo lleva y la regla DNR es ruido).
+function refererNeeded(itemUrl, pageUrl) {
+  if (!pageUrl || !/^https?:/i.test(itemUrl)) return "";
+  try {
+    return new URL(itemUrl).hostname === new URL(pageUrl).hostname ? "" : pageUrl;
+  } catch {
+    return "";
+  }
+}
+
 async function enrichSize(item, pageUrl = "") {
   if (sizeCache.has(item.url)) {
     item.sizeKB = sizeCache.get(item.url);
+    item.sizeUnknown = item.sizeKB === 0;
     return;
   }
   if (/^blob:|^data:/.test(item.url)) {
@@ -343,96 +595,136 @@ async function enrichSize(item, pageUrl = "") {
     item.sizeUnknown = true;
     return;
   }
+  if (!/^https?:/i.test(item.url)) {
+    item.sizeKB = 0;
+    item.sizeUnknown = true;
+    return;
+  }
+
+  let len = 0;
+
+  // Nivel 0: el navegador ya lo cargó y lo sabe.
+  if (item.sizeBytes && item.sizeBytes > 0) {
+    len = item.sizeBytes;
+  }
+
+  await enrichAcquire();
   try {
-    let len = 0;
+    const ref = refererNeeded(item.url, pageUrl);
 
-    // Nivel 0: tamaño ya registrado por el navegador (Performance API).
-    if (item.sizeBytes && item.sizeBytes > 0) {
-      len = item.sizeBytes;
-    }
-
-    // Nivel 1: GET real y contar los bytes del blob (independiente de cabeceras).
+    // Nivel 1: HEAD. Una cabecera, sin cuerpo.
     if (len <= 0) {
       try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 8000);
-        const res = await fetch(item.url, { signal: ctrl.signal, cache: "force-cache" });
-        clearTimeout(timer);
-        if (res.ok) {
-          const blob = await res.blob();
-          len = blob.size;
-        }
+        const res = await fetchWithTimeout(item.url, { method: "HEAD", cache: "no-store" }, ENRICH_TIMEOUT_MS);
+        len = declaredTotalBytes(res);
       } catch {
-        len = 0; // CORS estricto / red: caer al siguiente nivel
+        len = 0;
       }
     }
 
-    // Nivel 1.5: GET con Referer vía DNR (anti-hotlink por Referer). Solo si el
-    // recurso es de otro dominio que la página y las técnicas normales fallaron.
-    if (len <= 0 && pageUrl && item.url.startsWith("http")) {
+    // Nivel 2: Range de 1 byte. Cubre HEAD → 405/501, que es lo que hacen
+    // muchos CDN. El total viene en Content-Range.
+    if (len <= 0) {
       try {
-        let fromSame = false;
-        try {
-          fromSame = new URL(item.url).hostname === new URL(pageUrl).hostname;
-        } catch { fromSame = false; }
-        if (!fromSame) {
-          const ruleId = await dnrSetRefererRule(item.url, pageUrl);
-          try {
-            const ctrl = new AbortController();
-            const timer = setTimeout(() => ctrl.abort(), 8000);
-            const res = await fetch(item.url, {
-              referrer: pageUrl,
-              referrerPolicy: "unsafe-url",
-              cache: "no-store",
-              signal: ctrl.signal,
-            });
-            clearTimeout(timer);
-            if (res.ok) {
-              const blob = await res.blob();
-              len = blob.size;
+        const res = await fetchWithTimeout(
+          item.url,
+          { headers: { Range: "bytes=0-0" }, cache: "no-store" },
+          ENRICH_TIMEOUT_MS
+        );
+        len = declaredTotalBytes(res);
+      } catch {
+        len = 0;
+      }
+    }
+
+    // Nivel 3: HEAD con Referer real (anti-hotlink por cabecera).
+    if (len <= 0 && ref) {
+      try {
+        const res = await withDnrAuth(item.url, ref, () =>
+          fetchWithTimeout(
+            item.url,
+            { method: "HEAD", referrer: ref, referrerPolicy: "unsafe-url", cache: "no-store" },
+            ENRICH_TIMEOUT_MS
+          )
+        );
+        len = declaredTotalBytes(res);
+      } catch {
+        len = 0;
+      }
+    }
+
+    // Nivel 4: GET con Referer, LEYENDO COMO MÁXIMO FULL_GET_MAX. Es el único
+    // nivel que transfiere cuerpo, y está acotado: si al terminar no se conoce
+    // el total, el item se marca desconocido en vez de descargarse entero.
+    if (len <= 0) {
+      try {
+        const res = await withDnrAuth(item.url, ref, () =>
+          fetchWithTimeout(
+            item.url,
+            { headers: { Range: `bytes=0-${FULL_GET_MAX - 1}` }, referrer: ref, referrerPolicy: "unsafe-url", cache: "no-store" },
+            ENRICH_TIMEOUT_MS
+          )
+        );
+        const declared = declaredTotalBytes(res);
+        if (declared > 0) {
+          len = declared; // el servidor sí declara el total: no hace falta el cuerpo
+        } else {
+          // Content-Range ausente y 200: el cuerpo es el archivo entero. Se
+          // lee hasta el tope y se cuenta.
+          const reader = res.body?.getReader?.();
+          if (reader) {
+            let read = 0;
+            while (read < FULL_GET_MAX) {
+              const { done, value } = await reader.read();
+              if (done) {
+                len = read; // EOF antes del tope: este ES el tamaño total
+                break;
+              }
+              read += value.byteLength;
             }
-          } finally {
-            if (ruleId) dnrClearRefererRule(item.url);
+            try {
+              await reader.cancel();
+            } catch {
+              /* el stream ya está cerrado */
+            }
+            if (len === 0 && read >= FULL_GET_MAX) len = 0; // troncado: desconocido
           }
         }
       } catch {
         len = 0;
       }
     }
-
-    // Nivel 2: HEAD + Content-Length (menos fiable, último recurso).
-    if (len <= 0) {
-      try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 5000);
-        const res = await fetch(item.url, { method: "HEAD", signal: ctrl.signal, cache: "no-store" });
-        clearTimeout(timer);
-        len = Number(res.headers.get("content-length") || 0);
-      } catch {
-        len = 0;
-      }
-    }
-
-    const sizeKB = len > 0 ? Math.max(1, Math.round(len / 1024)) : 0;
-    item.sizeKB = sizeKB;
-    item.sizeUnknown = len <= 0;
-    item.sizeBytes = len > 0 ? len : null;
-    sizeCache.set(item.url, sizeKB);
-  } catch {
-    item.sizeKB = 0;
-    item.sizeUnknown = true;
+  } finally {
+    enrichRelease();
   }
+
+  const sizeKB = len > 0 ? Math.max(1, Math.round(len / 1024)) : 0;
+  item.sizeKB = sizeKB;
+  item.sizeUnknown = len <= 0;
+  item.sizeBytes = len > 0 ? len : null;
+  sizeCache.set(item.url, sizeKB);
 }
 
+
 // Enriquecer tamaños de los items que aún no tienen (fetch HEAD con caché).
-// Concurrencia limitada (8) para no saturar; reenvía el estado al panel a
-// medida que los tamaños se resuelven (el "?" se reemplaza en vivo).
+// Concurrencia limitada (8); broadcast de progreso THROTTLED (máx. 1/800ms)
+// — antes enviaba un state-updated POR ITEM resuelto y el panel re-renderizaba
+// el grid entero cientos de veces (tormenta de renders). Re-entrada
+// protegida por pestaña: los media-updated en ráfaga no acumulan workers.
+const enriching = new Set();
+const enrichRerun = new Set();
+
 async function enrichMissing(tabId) {
+  if (enriching.has(tabId)) {
+    enrichRerun.add(tabId); // items nuevos durante la pasada: re-ejecutar al final
+    return;
+  }
   const tab = tabs.get(tabId);
   if (!tab) return;
   const pendientes = tab.items.filter((i) => i.sizeKB === null && !i.sizeUnknown);
   if (!pendientes.length) return;
   console.log(`[operant-sw] enrichMissing tabId=${tabId}: ${pendientes.length} pendientes`);
+  enriching.add(tabId);
   // URL de la pestaña: necesaria para la técnica 1.5 (Referer vía DNR).
   let pageUrl = "";
   try {
@@ -443,22 +735,41 @@ async function enrichMissing(tabId) {
   }
   let idx = 0;
   let processed = 0;
+  let lastBroadcastAt = 0;
+  const broadcast = (force = false) => {
+    if (!autoDetect) return;
+    const now = Date.now();
+    if (!force && now - lastBroadcastAt < 800) return;
+    lastBroadcastAt = now;
+    chrome.runtime.sendMessage({ type: "state-updated", tabId, items: tab.items }).catch(() => {});
+  };
   const worker = async () => {
     while (idx < pendientes.length) {
       const item = pendientes[idx++];
       await enrichSize(item, pageUrl); // usa sizeCache: no repite HEAD ya hecho
       processed++;
       persistTab(tabId);
-      if (autoDetect) {
-        chrome.runtime
-          .sendMessage({ type: "state-updated", tabId, items: tab.items })
-          .catch(() => {});
-      }
+      broadcast();
     }
   };
   await Promise.all(Array.from({ length: Math.min(8, pendientes.length) }, worker));
+  enriching.delete(tabId);
+  broadcast(true); // estado final del lote
   const stillNull = tab.items.filter((i) => i.sizeKB === null).length;
   console.log(`[operant-sw] enrichMissing fin tabId=${tabId}: procesados=${processed}, quedanNull=${stillNull}`);
+  if (enrichRerun.delete(tabId)) enrichMissing(tabId);
+  // Con tamaños conocidos: clasificar relaciones de stream (variantes/audio)
+  // y reflejar los cambios (una sola vez por pasada, no por item).
+  classifyStreamRelations(tabId)
+    .then((changed) => {
+      if (!changed) return;
+      persistTab(tabId);
+      updateBadge(tabId);
+      if (autoDetect) {
+        chrome.runtime.sendMessage({ type: "state-updated", tabId, items: tab.items }).catch(() => {});
+      }
+    })
+    .catch(() => {});
 }
 
 // La cadena de detección/descarga (HEAD → Range → magic bytes → parseo de
@@ -467,6 +778,315 @@ async function enrichMissing(tabId) {
 
 // --- Mensajería con el panel ---
 let autoDetect = true;
+let mediaBlastAt = 0; // último broadcast media-updated (throttle 300ms)
+
+// --- Clasificación de RELACIONES de stream (X/Twitter, YouTube Live…) ---
+// Los reproductores MSE capturan múltiples piezas del MISMO vídeo: master
+// m3u8, variantes solo-vídeo, pistas de audio (m3u8 y mp4). Sin relaciones,
+// el panel muestra el mismo vídeo 3 veces (vídeo, vídeo mudo, solo audio).
+// Esta pasada (cacheada por URL, throttled) etiqueta:
+//   · pistas de audio  → type "audio" (pestaña Audio)
+//   · variantes/componentes → component: true (ocultos en la UI)
+//   · el master queda como la ÚNICA entrada de ese vídeo (mux con companion).
+const streamProbeCache = new Map(); // url de playlist → { kind, videoUrls, audioUrls }
+
+async function probePlaylist(url) {
+  if (streamProbeCache.has(url)) return streamProbeCache.get(url);
+  let info = null;
+  try {
+    const res = await fetch(url, { credentials: "omit", cache: "no-store" });
+    if (res.ok) {
+      const text = await res.text();
+      if (text.includes("#EXT-X-STREAM-INF")) {
+        const m = await OperantMedia.parseManifest(url, "application/vnd.apple.mpegurl");
+        if (m?.type === "hls-master") {
+          info = {
+            kind: "master",
+            videoUrls: (m.segments || []).filter((s) => !s.audioOnly).map((s) => s.url),
+            audioUrls: (m.segments || []).map((s) => s.audioUrl).filter(Boolean),
+          };
+        }
+      } else if (text.includes("#EXTM3U")) {
+        info = { kind: "media" };
+      }
+    }
+  } catch {
+    info = null;
+  }
+  streamProbeCache.set(url, info);
+  return info;
+}
+
+// ¿La URL capturada coincide con esta URL candidata? (exacta o por basename,
+// los CDNs añaden/tocan query strings entre peticiones).
+function streamUrlMatch(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const na = a.split("?")[0];
+  const nb = b.split("?")[0];
+  return na === nb || na.endsWith("/" + nb.split("/").pop()) || nb.endsWith("/" + na.split("/").pop());
+}
+
+function findItemByUrl(tab, url) {
+  for (const it of tab.items) {
+    if (streamUrlMatch(it.url, url)) return it;
+  }
+  return null;
+}
+
+async function classifyStreamRelations(tabId) {
+  const tab = tabs.get(tabId);
+  if (!tab) return false;
+  let changed = false;
+
+  // 1. Masters m3u8: sus variantes son componentes y sus pistas de audio
+  //    van a la pestaña de audio.
+  const masters = tab.items.filter((i) => i.type === "video" && /\.m3u8/i.test(i.url) && !i._probed);
+  for (const it of masters) {
+    it._probed = true;
+    const info = await probePlaylist(it.url);
+    if (info?.kind !== "master") continue;
+    changed = true;
+    it._isMaster = true;
+    for (const vu of info.videoUrls) {
+      const comp = findItemByUrl(tab, vu);
+      if (comp && comp !== it) {
+        comp.component = true;
+        changed = true;
+      }
+    }
+    for (const au of info.audioUrls) {
+      const track = findItemByUrl(tab, au);
+      if (track && track.type !== "audio") {
+        track.type = "audio";
+        if (track.ext === "m3u8") track.ext = "m4a";
+        changed = true;
+      }
+    }
+  }
+
+  // 2. m3u8 media-playlist que ya sabemos variantes/audio por un master
+  //    sonado (sin master propio capturado): match por basename contra las
+  //    relaciones ya cacheadas.
+  const media = tab.items.filter((i) => i.type === "video" && /\.m3u8/i.test(i.url) && !i._probed);
+  for (const it of media) {
+    it._probed = true;
+    const base = it.url.split("?")[0].split("/").pop();
+    let matched = false;
+    for (const info of streamProbeCache.values()) {
+      if (info?.kind !== "master") continue;
+      if (info.videoUrls.some((vu) => streamUrlMatch(vu, it.url))) {
+        it.component = true;
+        matched = true;
+        break;
+      }
+      if (info.audioUrls.some((au) => streamUrlMatch(au, it.url))) {
+        it.type = "audio";
+        it.ext = "m4a";
+        matched = true;
+        break;
+      }
+    }
+    if (!matched && base) {
+      for (const info of streamProbeCache.values()) {
+        if (info?.kind !== "master") continue;
+        if (info.videoUrls.some((vu) => vu.split("?")[0].endsWith("/" + base))) {
+          it.component = true;
+          break;
+        }
+      }
+    }
+    changed = true;
+  }
+
+  // 3. mp4/m4s pequeños sin clasificar: posibles init/segmentos de pistas.
+  //    Parseo real de cajas (genérico): solo-audio → pestaña Audio;
+  //    solo-vídeo o muxed diminuto → componente oculto.
+  const mp4s = tab.items.filter(
+    (i) =>
+      i.type === "video" &&
+      /\.(mp4|m4s)(?:[?#].*)?$/i.test(i.url) &&
+      !i._probedTracks &&
+      (i.sizeKB === null || (i.sizeKB > 0 && i.sizeKB < 200))
+  );
+  for (const it of mp4s.slice(0, 8)) {
+    it._probedTracks = true;
+    const t = await OperantMedia.trackTypesOf(it.url);
+    if (!t) continue;
+    if (t.audio && !t.video) {
+      it.type = "audio";
+      if (!it.ext || it.ext === "mp4") it.ext = "m4a";
+      changed = true;
+    } else if (t.video && !t.audio) {
+      it.component = true;
+      changed = true;
+    } else if (t.video && t.audio && it.sizeKB !== null && it.sizeKB < 50) {
+      it.component = true;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// --- Captura verificada del SW con Referer de la página (anti-hotlink) ---
+// Fetch en memoria con Referer inyectado (regla DNR efímera), devuelto como
+// bytes + MIME. ÚNICA implementación de fetch con Referer: la usa la descarga
+// honesta (swFetchAndDownload) y la captura para fotogramas/portapapeles
+// (fetch-blob-data). Lanza el error REAL; nunca silencia fallos.
+//
+// NOTA SOBRE COOKIES: un fetch del service worker NO puede leer cookies
+// HttpOnly (haría falta el permiso `cookies`). Se hace lo que se puede sin
+// pedir ese permiso: `credentials: "include"` para que el navegador adjunte
+// las cookies que SÍ son adjuntables (mismo origen, o cross-origin con
+// SameSite=None; Secure). Cuando el permiso `cookies` ha sido concedido por el
+// usuario, dnrAuthHeaders() añade además una cabecera Cookie explícita.
+async function swFetchAsDataUrl(url, pageUrl, maxBytes) {
+  const ruleId = pageUrl ? await dnrSetAuthRule(url, pageUrl) : null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 120000);
+  try {
+    const res = await fetch(url, {
+      ...(pageUrl ? { referrer: pageUrl, referrerPolicy: "unsafe-url" } : {}),
+      credentials: "include",
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    // El límite se comprueba ANTES de materializar el cuerpo. Antes se hacía
+    // `arrayBuffer()` primero y se comparaba después, con lo que un "fallo"
+    // de 4 GB ya había consumido 4 GB de RAM del service worker.
+    const declared = Number(res.headers.get("content-length") || 0);
+    if (declared > maxBytes) {
+      throw new Error(
+        `El medio (${(declared / 1048576).toFixed(0)} MB) supera el límite de captura (${(maxBytes / 1048576).toFixed(0)} MB).`
+      );
+    }
+
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > maxBytes) {
+      throw new Error(
+        `El medio (${(buf.byteLength / 1048576).toFixed(0)} MB) supera el límite de captura (${(maxBytes / 1048576).toFixed(0)} MB).`
+      );
+    }
+    // `new Uint8Array(arrayBuffer)` NO copia: es una vista sobre el mismo
+    // búfer. Antes se envolvía dos veces y el pico de memoria era 2x.
+    const mime = res.headers.get("content-type") || "application/octet-stream";
+    return {
+      bytes: new Uint8Array(buf),
+      mime,
+      fileName: filenameFromResponse(res, url),
+    };
+  } finally {
+    // clearTimeout SIEMPRE, también si el fetch falla por una causa que no sea
+    // el abort: antes el temporizador de 120 s se quedaba vivo para siempre en
+    // cada fallo de red.
+    clearTimeout(timer);
+    if (ruleId) dnrClearAuthRule(url);
+  }
+}
+
+// Uint8Array → data URL por chunks de 32KB (String.fromCharCode.apply con el
+// buffer completo revienta por stack overflow — verificado en el proyecto).
+function bytesToDataUrl(bytes, mime) {
+  const CHUNK = 0x8000;
+  let b64 = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    b64 += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CHUNK, bytes.length)));
+  }
+  return `data:${mime};base64,${btoa(b64)}`;
+}
+
+// Descarga VERIFICADA vía el SW: fetch con Referer → verificación de bytes
+// (rechazar init segments de fMP4) → data URL → chrome.downloads → estado
+// final del gestor. Devuelve { ok: true } o lanza el error real.
+async function swFetchAndDownload(url, filename, pageUrl) {
+  const { bytes, mime, fileName } = await swFetchAsDataUrl(url, pageUrl, 128 * 1024 * 1024);
+  // Defensa ANTI-INIT (CRITERIO SEGURO): solo se rechaza si el archivo TOTAL
+  // es diminuto (<50KB) y es un MP4 sin datos (ftyp/moov sin mdat/moof). Un
+  // vídeo real pesa MB — su primer fragmento puede tener moov sin mdat
+  // todavía; bloquear por los primeros KB daría falsos positivos. Un init
+  // segment pesa <1KB.
+  //
+  // La búsqueda de marcas se hace sobre BYTES (bytesContainAscii). Antes se
+  // hacía `String.fromCharCode(...bytes)`, que con un array grande lanza
+  // RangeError por límite de argumentos: el "fallo" se producía en el camino
+  // que precisamente debía evitarlo.
+  if (bytes.byteLength < 50 * 1024) {
+    const isInitOnly =
+      (bytesContainAscii(bytes, "ftyp") || bytesContainAscii(bytes, "moov")) &&
+      !bytesContainAscii(bytes, "mdat") &&
+      !bytesContainAscii(bytes, "moof");
+    if (isInitOnly) {
+      throw new Error("El recurso es metadata de stream (init segment), no un vídeo. Descarga el stream completo (manifiesto) o usa yt-dlp.");
+    }
+  }
+  // Prioridad de nombre: lo que propose el llamador (panel/overlay), después
+  // lo que dice Content-Disposition, después el basename de la URL. Todos
+  // pasan por el saneador.
+  const name = safeDownloadName(filename || fileName, url, "", mime);
+  const dataUrl = bytesToDataUrl(bytes, mime);
+  const downloadId = await chrome.downloads.download({ url: dataUrl, filename: name, conflictAction: "uniquify" });
+  return monitorDownloadId(downloadId);
+}
+
+// Revoca un blob URL cuando la descarga que lo consume ha TERMINADO, no cuando
+// un temporizador de reloj de pared dice que ya han pasado N segundos. Con
+// archivos grandes la escritura sigue en curso cuando ese temporizador dispara
+// y Chrome falla con ERR_FILE_NOT_FOUND. Si el estado nunca llega a un final
+// terminal, hay un temporizador de seguridad con margen holgado.
+function revokeBlobUrlWhenDone(objUrl, downloadId) {
+  let settled = false;
+  const revoke = () => {
+    if (settled) return;
+    settled = true;
+    try { chrome.downloads.onChanged.removeListener(listener); } catch { /* ya removido */ }
+    URL.revokeObjectURL(objUrl);
+  };
+  const listener = (delta) => {
+    if (delta.id !== downloadId || !delta.state) return;
+    if (delta.state.current === "complete" || delta.state.current === "interrupted") revoke();
+  };
+  chrome.downloads.onChanged.addListener(listener);
+  setTimeout(revoke, 30 * 60 * 1000);
+}
+
+// Observa el estado final REAL de una descarga del gestor de Chrome.
+// Resuelve { ok, bytes } o { ok: false, error } — nunca antes de que la
+// descarga haya terminado (complete) o se haya interrumpido.
+function monitorDownloadId(id) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (r) => {
+      if (settled) return;
+      settled = true;
+      try { chrome.downloads.onChanged.removeListener(listener); } catch { /* ya removido */ }
+      resolve(r);
+    };
+    const listener = (delta) => {
+      if (delta.id !== id || !delta.state) return;
+      if (delta.state.current === "complete") {
+        chrome.downloads.search({ id }, (r) => {
+          const d = r && r[0];
+          finish({ ok: true, bytes: (d && d.fileSize) || 0 });
+        });
+      } else if (delta.state.current === "interrupted") {
+        chrome.downloads.search({ id }, (r) => {
+          const d = r && r[0];
+          finish({ ok: false, error: `descarga interrumpida (${(d && d.error) || "desconocido"})` });
+        });
+      }
+    };
+    chrome.downloads.onChanged.addListener(listener);
+    // Carrera: el evento pudo dispararse antes de registrar el listener.
+    chrome.downloads.search({ id }, (r) => {
+      const d = r && r[0];
+      if (!d) return finish({ ok: false, error: "la descarga no se pudo iniciar" });
+      if (d.state === "complete") finish({ ok: true, bytes: d.fileSize || 0 });
+      else if (d.state === "interrupted") finish({ ok: false, error: `descarga interrumpida (${d.error || "desconocido"})` });
+    });
+  });
+}
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "get-state") {
@@ -496,19 +1116,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "media-updated") {
     // Viene del content script: actualiza estado central y reenvía al panel.
+    // Broadcast THROTTLED (300ms): el content script ya agrupa, pero una
+    // ráfaga de mensajes no debe serializar el estado completo N veces.
     const tabId = msg.tabId ?? sender.tab?.id ?? 0;
     console.log("[operant-sw] media-updated tabId=", tabId, "items=", msg.items?.length, "senderTab=", sender.tab?.id);
     const tab = ensureTab(tabId);
     const byUrl = new Map(tab.items.map((it) => [it.url.split("#")[0], it]));
-    for (const item of msg.items) byUrl.set(item.url.split("#")[0], item);
+    for (const item of msg.items) byUrl.set(item.url.split("#")[0], withSeq(item));
     tab.items = [...byUrl.values()].slice(0, MAX_ITEMS_PER_TAB);
     updateBadge(tabId);
     persistTab(tabId);
     enrichMissing(tabId); // tamaños de items del DOM (antes quedaban en "?")
     if (autoDetect) {
-      chrome.runtime
-        .sendMessage({ type: "state-updated", tabId, items: tab.items })
-        .catch(() => {});
+      const now = Date.now();
+      if (!mediaBlastAt || now - mediaBlastAt >= 300) {
+        mediaBlastAt = now;
+        chrome.runtime
+          .sendMessage({ type: "state-updated", tabId, items: tab.items })
+          .catch(() => {});
+      }
     }
     sendResponse({ ok: true });
     return;
@@ -536,10 +1162,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         /(?:^|[\/._-])(?:init|header)(?:[\/._-]|$)/i.test(u) ||
         (!isManifest(u) && Number.isFinite(sizeKB) && sizeKB > 0 && sizeKB < 50);
       const real = candidates.filter((i) => !looksLikeInit(i.url, i.sizeKB));
-      // Preferir un manifiesto (m3u8/mpd): el flujo doManifest concatena
-      // init+media y verifica looks_like_real_media en el host. Un .mp4
-      // "directo" de X suele ser el init segment.
-      const manifest = real.find((i) => isManifest(i.url));
+      // Preferir M3U8 sobre MPD: el motor HLS del navegador descarga m3u8
+      // muxed (vídeo+audio) de forma íntegra y verificada, sin host; el MPD
+      // de X/Reddit trae audio separado y exige remux externo.
+      const isM3u8 = (u) => /\.m3u8(?:[?#].*)?$/i.test(u);
+      const isMpd = (u) => /\.mpd(?:[?#].*)?$/i.test(u);
+      const manifest = real.find((i) => isM3u8(i.url)) || real.find((i) => isMpd(i.url));
       const direct = real.find((i) => /\.(mp4|webm|mov|mkv)(?:[?#].*)?$/i.test(i.url));
       url = (manifest || direct || real[0] || candidates[0] || { url: "" }).url;
       if (!url) {
@@ -552,25 +1180,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     const kind = msg.kind || ""; // "video" si viene del botón de vídeo del overlay
-    const base = msg.filename || urlBasename(url) || "descarga";
-    const filename = /\.(png|jpe?g|webp|gif|mp4|mp3|pdf|zip|m3u8|mpd|ts)$/i.test(base) ? base : `${base}${urlExt(url)}`;
-    const doDirect = () =>
-      // Re-validar que la URL sigue viva (tokens que expiran) antes de descargar.
-      OperantMedia.isUrlAlive(url).then((alive) => {
-        if (!alive) {
-          return Promise.reject(new Error("La URL expiró o no está disponible. Re-escanea la página e inténtalo de nuevo."));
-        }
-        // Defensa ANTI-INIT: si el "directo" es un MP4 fragmentado (fMP4 de
-        // X/Instagram), el init segment es solo moov/trak sin mdat/moof — un
-        // archivo de cientos de bytes. Detectarlo por los bytes reales y
-        // rechazar con un mensaje claro (el flujo caerá a manifiesto/yt-dlp).
-        return detectInitOnlyMp4(url).then((isInit) => {
-          if (isInit) {
-            return Promise.reject(new Error("Se detectó un init segment (metadata sin vídeo). Reproduce el vídeo y vuelve a intentarlo; se usará el stream completo."));
-          }
-          return chrome.downloads.download({ url, filename: filename || undefined, conflictAction: "uniquify" });
-        });
-      });
+    // Nombre SEGURO: lo propone el overlay (a menudo el `alt`/`title` de la
+    // página), y pasa por el saneador antes de tocar el sistema de ficheros.
+    const pageUrlOfSender = sender.tab?.url || msg.pageUrl || "";
+    const filename = safeDownloadName(msg.filename, url, urlExt(url).replace(/^\./, ""));
 
     // ¿La URL es un MP4 que solo contiene metadata (init segment fMP4)?
     // CRITERIO SEGURO: solo se considera init si el archivo TOTAL es diminuto
@@ -579,40 +1192,106 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // (el bug "ya no se descarga"). Un init segment de X pesa <1KB.
     async function detectInitOnlyMp4(u) {
       try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 8000);
-        const res = await fetch(u, { headers: { Range: "bytes=0-65535" }, signal: ctrl.signal, cache: "no-store" });
-        clearTimeout(timer);
+        const res = await fetchWithTimeout(
+          u,
+          { headers: { Range: "bytes=0-65535" }, cache: "no-store" },
+          ENRICH_TIMEOUT_MS
+        );
         if (!res.ok && res.status !== 206 && res.status !== 200) return false;
         // Tamaño total conocido: si es >= 50KB, es un archivo real (no init).
-        const total = Number(res.headers.get("content-range")?.split("/")[1] || res.headers.get("content-length") || 0);
+        const total = declaredTotalBytes(res);
         if (total >= 50 * 1024) return false;
         const buf = new Uint8Array(await res.arrayBuffer());
-        const ascii = String.fromCharCode(...buf);
-        if (!(ascii.includes("ftyp") || ascii.includes("moov"))) return false; // no es MP4
+        // Búsqueda por BYTES: `String.fromCharCode(...buf)` con 65536
+        // argumentos está en el límite y lanza RangeError de forma
+        // intermitente según el motor.
+        if (!bytesContainAscii(buf, "ftyp") && !bytesContainAscii(buf, "moov")) return false; // no es MP4
         // init segment: tiene moov pero no mdat ni moof (sin datos de media).
-        return !ascii.includes("mdat") && !ascii.includes("moof");
+        return !bytesContainAscii(buf, "mdat") && !bytesContainAscii(buf, "moof");
       } catch {
         return false; // no se pudo verificar: no bloquear
       }
     }
-    const doManifest = (manifest) => {
-      // DASH con vídeo y audio SEPARADOS (Reddit/Instagram/…): el manifiesto
-      // expone dos listas. Se toma el vídeo de mayor bitrate y el audio de
-      // mayor bitrate y se remuxean con ffmpeg del host (dash-merge).
+
+    // --- Descarga VERIFICADA y honesta ---
+    // Nada se responde { ok: true } sin (1) sondear los bytes reales antes de
+    // descargar (rechazar páginas HTML de error) y (2) esperar el estado final
+    // del gestor de descargas (complete / interrupted). Si el navegador no
+    // puede (anti-hotlink, 403), se encadenan los fallbacks ANTES de rendirse,
+    // y cada error se reporta con su causa real.
+    const attemptBrowserDownload = () =>
+      OperantMedia.probeMedia(url).then(async (probe) => {
+        if (probe.ok) {
+          const verdict = OperantMedia.mediaVerdict(probe);
+          if (verdict === "html") {
+            throw new Error("El servidor devolvió una página HTML en lugar del medio (protección anti-hotlink o URL expirada).");
+          }
+          if (verdict === "manifest") {
+            // El "directo" era en realidad un manifiesto: procesarlo como tal
+            // (el resultado lleva enqueued si acabó en el companion).
+            const m = await OperantMedia.parseManifest(url, probe.contentType, probe.bytes);
+            if (m) return doManifest(m);
+          }
+        }
+        return detectInitOnlyMp4(url).then((isInit) => {
+          if (isInit) throw new Error("init-segment");
+          // La descarga directa la hace el gestor de descargas de Chrome, que
+          // ya envía las cookies del perfil — pero NO el Referer, que es lo
+          // que comprueban la mayoría de los CDN con anti-hotlink. Se mantiene
+          // una regla DNR viva durante toda la descarga para cubrir ese hueco,
+          // y se retira al terminar. Antes solo se cubría el fetch del SW, que
+          // es el camino de reserva: la ruta principal quedaba sin Referer.
+          return withDnrAuth(url, pageUrlOfSender, () =>
+            chrome.downloads
+              .download({ url, filename: filename || undefined, conflictAction: "uniquify" })
+              .then((id) => monitorDownloadId(id))
+              .then((r) => {
+                if (!r.ok) throw new Error(r.error);
+                return r;
+              })
+          );
+        });
+      });
+
+    const doManifest = async (manifest) => {
+      // Manifiesto MEDIA (la URL capturada es la VARIANTE): buscar su master
+      // entre los m3u8 capturados de la pestaña — el audio separado vive en
+      // el master (#EXT-X-MEDIA). Con mux disponible → companion; sin él,
+      // se entrega la variante (la nota de audio honesta la acompaña).
+      if (manifest?.type === "hls") {
+        const tab = tabs.get(sender.tab?.id ?? 0);
+        const candidates = (tab?.items || [])
+          .filter((i) => i.type === "video" && /\.m3u8/i.test(i.url) && i.url !== url)
+          .map((i) => i.url);
+        const found = await OperantMedia.findHlsMaster(url, candidates);
+        if (found?.variant?.audioUrl) {
+          const port = connectNative();
+          if (!port) {
+            return { ok: false, error: "Este stream lleva el audio en una pista separada (HLS): para unir vídeo+audio hace falta el companion (operant-host.exe)." };
+          }
+          port.postMessage({
+            type: "ffmpeg-op",
+            url: found.variant.url,
+            op: "hls-dash",
+            options: { audioUrl: found.variant.audioUrl, filename: base },
+          });
+          return { ok: true, enqueued: true, note: "Descargando vídeo + audio (HLS) y uniéndolos con el companion… El resultado se confirma en el panel." };
+        }
+        return await swFastHls(url, base, sender.tab?.id ?? null);
+      }
+      // DASH con vídeo y audio SEPARADOS (X/Reddit/Instagram en mpd): el
+      // navegador no puede muxear pistas → host (dash-merge). {ok, enqueued}
+      // significa "encolado": el resultado real se reporta al panel.
       if (manifest?.hasSeparateAudio && manifest.segments?.video?.length && manifest.segments?.audio?.length) {
         const bestVideo = manifest.segments.video.reduce((a, b) => (Number(b.id) > Number(a.id) ? b : a));
         const bestAudio = manifest.segments.audio.reduce((a, b) => (Number(b.id) > Number(a.id) ? b : a));
         const port = connectNative();
         if (!port) {
-          sendResponse({ ok: false, error: "El host nativo no está instalado (necesario para unir vídeo+audio de DASH)." });
-          return true;
+          return { ok: false, error: "Este stream tiene vídeo y audio separados (DASH): para unirlos en un solo archivo hace falta el companion (operant-host.exe)." };
         }
         try {
           // Si el parser DASH generó init + media segments (fMP4 de X), pasar
           // las listas completas al host para que las descargue y concatene.
-          const vSegs = buildSegList(bestVideo);
-          const aSegs = buildSegList(bestAudio);
           port.postMessage({
             type: "ffmpeg-op",
             url: bestVideo.url,
@@ -621,82 +1300,161 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               videoUrl: bestVideo.url,
               audioUrl: bestAudio.url,
               filename: base,
-              videoSegments: vSegs,
-              audioSegments: aSegs,
+              videoSegments: buildSegList(bestVideo),
+              audioSegments: buildSegList(bestAudio),
             },
           });
-          sendResponse({ ok: true, note: "Descargando vídeo y audio por separado y uniéndolos (DASH)…" });
+          return { ok: true, enqueued: true, note: "Descargando vídeo+audio por separado y uniéndolos con el companion… El resultado se confirma en el panel." };
         } catch (e) {
-          sendResponse({ ok: false, error: String(e) });
+          return { ok: false, error: String(e) };
         }
-        return true;
       }
+      // HLS (m3u8, muxed): la vía PRINCIPAL es el motor del navegador
+      // (swFastHls): parseo + fetch paralelo + entrega VERIFICADA. No depende
+      // del companion y su resultado es comprobable — el check del overlay
+      // solo aparece cuando el archivo existe de verdad. El host queda como
+      // último recurso (p. ej. motores sin soporte).
+      if (/\.m3u8(?:[?#].*)?$/i.test(url)) {
+        // Masters con audio SEPARADO (X/Twitter, YouTube Live): todas las
+        // variantes vídeo llevan su audio en grupo #EXT-X-MEDIA → sin mux no
+        // hay archivo completo; el navegador no puede muxear → companion.
+        const videoSegs = (manifest?.segments || []).filter((s) => !s.audioOnly && s.url);
+        const needsMux = videoSegs.length > 0 && videoSegs.every((s) => s.audioUrl);
+        if (needsMux) {
+          const port = connectNative();
+          if (!port) {
+            return { ok: false, error: "Este stream lleva el audio en una pista separada (HLS): para unir vídeo+audio hace falta el companion (operant-host.exe)." };
+          }
+          const best = videoSegs.reduce((a, b) => (Number(b.id) > Number(a.id) ? b : a));
+          try {
+            port.postMessage({
+              type: "ffmpeg-op",
+              url: best.url,
+              op: "hls-dash",
+              options: { audioUrl: best.audioUrl, filename: base },
+            });
+            return { ok: true, enqueued: true, note: "Descargando vídeo + audio (HLS) y uniéndolos con el companion… El resultado se confirma en el panel." };
+          } catch (e) {
+            return { ok: false, error: String(e) };
+          }
+        }
+        try {
+          return await swFastHls(url, base, sender.tab?.id ?? null);
+        } catch (eHls) {
+          const port = connectNative();
+          if (port) {
+            try {
+              port.postMessage({ type: "ffmpeg-op", url, op: "hls-dash", options: { filename: base } });
+              return { ok: true, enqueued: true, note: `La ruta rápida falló (${String(eHls?.message || eHls)}). Encolado en el companion; el resultado se confirma en el panel.` };
+            } catch { /* cae al fetch directo */ }
+          }
+          throw eHls;
+        }
+      }
+      // Otros manifiestos (mpd sin audio separado…): host si hay; si no, fetch directo.
       const port = connectNative();
-      // Fallback SIN host nativo: para m3u8, la ruta rápida completa en el SW
-      // (antes solo se descargaba el propio archivo de playlist, inútil sin
-      // el player). Para mpd/otros, el fetch directo de siempre.
-      const manifestFallback = () =>
-        /\.m3u8(?:[?#].*)?$/i.test(url)
-          ? swFastHls(url, base, sender.tab?.id ?? null)
-          : doFetchBlob();
       if (port) {
         try {
           port.postMessage({ type: "ffmpeg-op", url, op: "hls-dash", options: { filename: base } });
-          sendResponse({ ok: true, note: "Convirtiendo stream a MP4 (máxima calidad)…" });
-        } catch (e) {
-          manifestFallback().then(() => sendResponse({ ok: true })).catch((e2) => sendResponse({ ok: false, error: String(e2) }));
-        }
-        return true;
+          return { ok: true, enqueued: true, note: "Encolado en el companion (ffmpeg); el resultado se confirma en el panel." };
+        } catch { /* cae al fetch directo */ }
       }
-      manifestFallback().then((r) => sendResponse(r || { ok: true })).catch((e2) => sendResponse({ ok: false, error: String(e2) }));
-      return true;
+      return doFetchBlob().then(() => ({ ok: true, note: "Descarga completada y verificada." }));
     };
-    const doYtdl = () => {
-      handleYtdl({ url, filename: base, format: null }).then((r) => sendResponse(r));
-      return true;
-    };
+    const doYtdl = () =>
+      handleYtdl({ url, filename: base, format: null }).then((r) =>
+        r?.ok ? { ok: true, enqueued: true, note: "Enviado a yt-dlp… El resultado se confirma en el panel (requiere acceso a la página; en X suele necesitar las cookies del navegador)." } : r
+      );
 
-    OperantMedia.classifyDownload(url, kind).then((c) => {
-      if (c.strategy === "manifest") return doManifest(c.manifest);
-      if (c.strategy === "ytdl") return doYtdl();
-      if (c.strategy === "direct") {
-        // Si el "directo" resultó ser un init segment (metadata vacía), no
-        // entregar el archivo roto: caer a yt-dlp (X/Instagram se resuelven ahí).
-        doDirect()
-          .then(() => sendResponse({ ok: true }))
-          .catch((e) => {
-            if (/init segment/i.test(String(e?.message || e))) {
-              doYtdl();
-            } else {
-              sendResponse({ ok: false, error: String(e?.message || e) });
+    OperantMedia.classifyDownload(url, kind).then(async (c) => {
+      try {
+        if (c.strategy === "manifest") {
+          sendResponse(await doManifest(c.manifest));
+          return;
+        }
+        if (c.strategy === "ytdl") {
+          sendResponse(await doYtdl());
+          return;
+        }
+        // direct | unknown: descarga verificada con cadena de fallback honesta.
+        try {
+          const r = await attemptBrowserDownload();
+          sendResponse(
+            r && r.enqueued
+              ? r
+              : { ok: true, note: `Descarga completada y verificada (${formatBytesKB(r.bytes)}).` }
+          );
+        } catch (e1) {
+          const m1 = String(e1?.message || e1);
+          if (/init-segment/i.test(m1)) {
+            sendResponse(await doYtdl());
+            return;
+          }
+          // El navegador no pudo (403 / anti-hotlink / URL con cookie de sesión):
+          // capturar con el Referer real de la página antes de rendirse.
+          try {
+            await swFetchAndDownload(url, filename, sender.tab?.url || "");
+            sendResponse({ ok: true, note: "Descarga completada vía el navegador (con Referer de la página)." });
+          } catch (e2) {
+            const m2 = String(e2?.message || e2);
+            if (/init segment|metadata de stream/i.test(m2)) {
+              sendResponse(await doYtdl());
+              return;
             }
-          });
-        return true;
+            // Último recurso para vídeo y recursos sin firma: yt-dlp.
+            if (kind === "video" || c.strategy === "unknown") {
+              sendResponse(await doYtdl());
+              return;
+            }
+            sendResponse({ ok: false, error: m2 || m1 });
+          }
+        }
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message || e) });
       }
-      // unknown: intentar directo; si falla, yt-dlp.
-      doDirect().then(() => sendResponse({ ok: true })).catch(() => doYtdl());
-      return true;
     });
     return true;
 
     // Fetch+blob del manifiesto (fallback sin host nativo).
     async function doFetchBlob() {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 30000);
-      const res = await fetch(url, { signal: ctrl.signal, cache: "force-cache" });
-      clearTimeout(timer);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      const objUrl = URL.createObjectURL(blob);
-      await chrome.downloads.download({ url: objUrl, filename: filename || undefined, conflictAction: "uniquify" });
-      setTimeout(() => URL.revokeObjectURL(objUrl), 60000);
+      // Se reutiliza swFetchAsDataUrl: mismo|Referer/credenciales, mismo
+      // límite de bytes comprobado ANTES de materializar, y nombre saneado a
+      // partir de Content-Disposition cuando el servidor lo propone.
+      const { bytes, mime, fileName } = await swFetchAsDataUrl(url, pageUrlOfSender, 128 * 1024 * 1024);
+      if (bytes.byteLength === 0) throw new Error("El servidor no devolvió datos");
+      const objUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
+      const name = safeDownloadName(filename || fileName, url, "", mime);
+      const id = await chrome.downloads.download({ url: objUrl, filename: name, conflictAction: "uniquify" });
+      const r = await monitorDownloadId(id);
+      // El blob URL se revoca DESPUÉS de que la escritura termine, no con un
+      // temporizador de reloj de pared iniciado antes: con archivos grandes la
+      // escritura sigue viva cuando el temporizador dispara y Chrome falla con
+      // ERR_FILE_NOT_FOUND. Un listener de descargas es el que dice "ya está".
+      revokeBlobUrlWhenDone(objUrl, id);
+      if (!r.ok) throw new Error(r.error);
+      return r;
     }
   }
   if (msg?.type === "overlay-download-blob") {
-    // Blob capturado DESDE EL CONTEXTO DE LA PÁGINA (con cookies/Referer de
-    // sesión — para servidores con protección anti-hotlink por Referer). El SW de MV3 NO tiene
-    // URL.createObjectURL, así que se reenvía al PANEL (que sí lo tiene y
-    // además tiene chrome.downloads) para que lo entregue.
+    // Blob capturado DESDE EL CONTEXTO DE LA PÁGINA: el content script hizo
+    // `fetch(url, {credentials:"include"})` con la sesión real del sitio
+    // (cookies HttpOnly incluidas, porque las adjunta el navegador para el
+    // origen de la página) y reenvía los bytes. El SW de MV3 NO tiene
+    // URL.createObjectURL, así que se entrega por data URL desde aquí.
+    // Atajo honesto: un data URL listo (p.ej. fotograma capturado) se
+    // descarga directamente — sin reconstrucción ambigua de bytes.
+    if (typeof msg.dataUrl === "string" && msg.dataUrl.startsWith("data:")) {
+      const name = safeDownloadName(msg.filename, "", "png");
+      (async () => {
+        try {
+          const id = await chrome.downloads.download({ url: msg.dataUrl, filename: name, conflictAction: "uniquify" });
+          sendResponse(await monitorDownloadId(id));
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e) });
+        }
+      })();
+      return true;
+    }
     let data = msg.data;
     if (!data) {
       sendResponse({ ok: false, error: "Sin datos" });
@@ -723,21 +1481,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
     }
-    const name = msg.filename || "descarga.mp4";
     const mime = msg.mime || "video/mp4";
+    const name = safeDownloadName(msg.filename, "", "", mime);
     if (bytes.length > 128 * 1024 * 1024) {
       sendResponse({ ok: false, error: `El blob (${(bytes.length / 1048576).toFixed(0)} MB) supera el límite de entrega (128 MB). Descárgalo desde el panel (cola por chunks).` });
       return;
     }
     (async () => {
       try {
-        const CHUNK = 0x8000; // 32KB por chunk de conversión
-        let b64 = "";
-        for (let i = 0; i < bytes.length; i += CHUNK) {
-          b64 += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CHUNK, bytes.length)));
-        }
-        b64 = btoa(b64);
-        const dataUrl = `data:${mime};base64,${b64}`;
+        const dataUrl = bytesToDataUrl(bytes, mime);
         await chrome.downloads.download({ url: dataUrl, filename: name, conflictAction: "uniquify" });
         sendResponse({ ok: true });
       } catch (e) {
@@ -749,76 +1501,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "sw-fetch-blob") {
     // Nivel A del fallback anti-hotlink (GENÉRICO): el SW hace el fetch (sin
     // CORS con <all_urls>) con el Referer REAL de la página inyectado por una
-    // regla DNR EFÍMERA por descarga (no hay lista de sitios). Resuelve servidores
-    // cross-origin que responden sin cabeceras permisivas donde el content script muere por CORS.
+    // regla DNR EFÍMERA por descarga. Resuelve servidores cross-origin que
+    // responden sin cabeceras permisivas donde el content script muere por CORS.
+    // La implementación es swFetchAndDownload (verificación de bytes y estado
+    // final incluidos) — la misma que usa la descarga honesta del overlay.
     const { url, filename } = msg;
     const pageUrl = msg.pageUrl || sender.tab?.url || "";
     if (!url) {
       sendResponse({ ok: false, error: "Sin URL" });
       return;
     }
-    (async () => {
-      const ruleId = await dnrSetRefererRule(url, pageUrl);
-      try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 120000);
-        const res = await fetch(url, {
-          referrer: pageUrl,
-          referrerPolicy: "unsafe-url",
-          cache: "no-store",
-          signal: ctrl.signal,
-        });
-        clearTimeout(timer);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const buf = await res.arrayBuffer();
-        // Defensa ANTI-INIT (CRITERIO SEGURO): solo se rechaza si el archivo
-        // TOTAL es diminuto (<50KB) y es un MP4 sin datos (ftyp/moov sin
-        // mdat/moof). Un vídeo real pesa MB — su primer fragmento puede tener
-        // moov sin mdat todavía; bloquear por los primeros KB daría falsos
-        // positivos (el bug "ya no se descarga"). Un init segment pesa <1KB.
-        if (buf.byteLength < 50 * 1024) {
-          const head = new Uint8Array(buf);
-          const ascii = String.fromCharCode(...head);
-          const isInitOnly = (ascii.includes("ftyp") || ascii.includes("moov")) && !ascii.includes("mdat") && !ascii.includes("moof");
-          if (isInitOnly) {
-            throw new Error("El recurso es metadata de stream (init segment), no un vídeo. Descarga el stream completo (manifiesto) o usa yt-dlp.");
-          }
-        }
-        const name = filename || urlBasename(url) || "descarga.mp4";
-        const mime = res.headers.get("content-type") || "application/octet-stream";
-        // El SW de MV3 no tiene URL.createObjectURL. La única vía para entregar
-        // el blob capturado es un data URL, PERO con límites reales:
-        //  - `String.fromCharCode.apply` sobre el buffer completo revienta por
-        //    stack overflow con >~50MB (verificado: RangeError con 100MB).
-        //  - Los navegadores tienen un límite de tamaño de data URL (en la
-        //    práctica ~64MB-1GB según máquina).
-        // Por eso: base64 POR CHUNKS (32KB) para evitar el stack overflow, y un
-        // TOPE de 128MB para el data URL (el tamaño de vídeo razonable; por
-        // encima, el data URL puede fallar/congelar el navegador).
-        // No hay transferencia binaria SW->panel: chrome.runtime.sendMessage no
-        // serializa ArrayBuffer (llega {}), revienta con arrays planos grandes
-        // y no serializa Uint8Array >64MB (todo verificado en pruebas).
-        if (buf.byteLength > 128 * 1024 * 1024) {
-          throw new Error(
-            `El vídeo (${(buf.byteLength / 1048576).toFixed(0)} MB) supera el límite de entrega por data URL (128 MB). Descárgalo desde el panel (cola por chunks) o con yt-dlp.`
-          );
-        }
-        const bytes = new Uint8Array(buf);
-        const CHUNK = 0x8000; // 32KB por chunk de conversión
-        let b64 = "";
-        for (let i = 0; i < bytes.length; i += CHUNK) {
-          b64 += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CHUNK, bytes.length)));
-        }
-        b64 = btoa(b64);
-        const dataUrl = `data:${mime};base64,${b64}`;
-        await chrome.downloads.download({ url: dataUrl, filename: name, conflictAction: "uniquify" });
-        sendResponse({ ok: true });
-      } catch (e) {
-        sendResponse({ ok: false, error: String(e?.message || e) });
-      } finally {
-        if (ruleId) dnrClearRefererRule(url); // regla efímera: limpiar al terminar
-      }
-    })();
+    swFetchAndDownload(url, filename, pageUrl).then(
+      (r) => sendResponse(r),
+      (e) => sendResponse({ ok: false, error: String(e?.message || e) })
+    );
+    return true; // respuesta asíncrona
+  }
+  if (msg?.type === "fetch-blob-data") {
+    // Devuelve el recurso como data URL al llamador (overlay/panel) para
+    // operaciones LOCALES: captura de fotogramas y copiar al portapapeles en
+    // CDNs cross-origin cuyo canvas queda contaminado (CORS). Límite 64MB:
+    // es captura de medios puntuales, no descargas grandes.
+    const url = msg.url || "";
+    const pageUrl = msg.pageUrl || sender.tab?.url || "";
+    if (!/^https?:/.test(url)) {
+      sendResponse({ ok: false, error: "URL no válida para captura" });
+      return;
+    }
+    swFetchAsDataUrl(url, pageUrl, 64 * 1024 * 1024).then(
+      ({ bytes, mime }) => sendResponse({ ok: true, dataUrl: bytesToDataUrl(bytes, mime), size: bytes.byteLength }),
+      (e) => sendResponse({ ok: false, error: String(e?.message || e) })
+    );
     return true; // respuesta asíncrona
   }
   if (msg?.type === "capture-in-page") {
@@ -853,35 +1566,54 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg?.type === "overlay-download-audio") {
-    // Extraer SOLO el audio de un vídeo, con lógica inteligente:
-    //  - URL directa (mp4/webm/mov): ffmpeg del host (extract-mp3, 192k).
-    //  - URL no-directa (plataformas de vídeo o streaming protegido): yt-dlp con -x
-    //    (extracción de audio profesional por extractor).
+    // Extraer SOLO el audio, con VERIFICACIÓN PREVIA y honestidad:
+    //   - blob: sin URL de red → error honesto (el host no puede leer blobs).
+    //   - Vídeo directo: se comprueba la pista de audio REAL (cajas MP4 hdlr
+    //     "soun" / CodecID WebM). Los GIF de X son MP4 mudos: no se encola
+    //     una extracción que solo puede producir un archivo sin sentido.
+    //   - Manifiesto/plataforma: yt-dlp -x (bestaudio) decide el audio real.
+    // {ok:true} significa "encolado en el procesador local", NUNCA "terminado".
     const url = msg.url || "";
     if (!url) {
       sendResponse({ ok: false, error: "Sin URL" });
       return;
     }
-    const isDirectVideo = /\.(mp4|webm|mov|mkv|m4v|ogv|3gp)(?:[?#].*)?$/i.test(url);
+    if (url.startsWith("blob:")) {
+      sendResponse({ ok: false, error: "El vídeo está en memoria (blob:). Reprodúcelo para que se capture el stream y vuelve a intentarlo." });
+      return;
+    }
     const port = connectNative();
     if (!port) {
       sendResponse({ ok: false, error: "El host nativo no está instalado (necesario para extraer audio)." });
       return;
     }
+    const isDirectVideo = /\.(mp4|webm|mov|mkv|m4v|ogv|3gp)(?:[?#].*)?$/i.test(url);
     if (isDirectVideo) {
-      // Vídeo directo: ffmpeg extrae el audio a mp3.
-      try {
-        port.postMessage({ type: "ffmpeg-op", url, op: "extract-mp3", options: {} });
-        sendResponse({ ok: true, note: "Extrayendo audio con ffmpeg del host…" });
-      } catch (e) {
-        sendResponse({ ok: false, error: String(e) });
-      }
-      return;
+      // IIFE async: el listener es síncrono; la verificación de pista de
+      // audio es asíncrona → respuesta diferida (return true más abajo).
+      (async () => {
+        try {
+          const audio = await OperantMedia.hasAudioTrack(url);
+          if (audio === false) {
+            sendResponse({ ok: false, error: "Este medio NO tiene pista de audio (es un GIF o un vídeo mudo). No hay audio que extraer." });
+            return;
+          }
+          port.postMessage({ type: "ffmpeg-op", url, op: "extract-mp3", options: {} });
+          sendResponse({
+            ok: true,
+            note: audio === true
+              ? "Extrayendo audio con ffmpeg del host…"
+              : "Extrayendo audio con ffmpeg (no se pudo verificar la pista de audio; si el vídeo es mudo, el host lo reportará).",
+          });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e) });
+        }
+      })();
+      return true; // respuesta asíncrona
     }
-    // No-directo/plataforma: yt-dlp extrae el audio (bestaudio -> mp3).
     try {
       port.postMessage({ type: "ytdl", url, filename: msg.filename || "", format: "bestaudio/best" });
-      sendResponse({ ok: true, note: "Extrayendo audio con yt-dlp…" });
+      sendResponse({ ok: true, note: "Extrayendo audio con yt-dlp (bestaudio)…" });
     } catch (e) {
       sendResponse({ ok: false, error: String(e) });
     }
@@ -889,9 +1621,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "overlay-download-gif-video") {
     // GIF como vídeo (webm): lo convierte el host nativo con ffmpeg.
+    // Guard honesto: un blob: de la página no es accesible para el host.
     const url = msg.url || "";
     if (!url) {
       sendResponse({ ok: false, error: "Sin URL" });
+      return;
+    }
+    if (url.startsWith("blob:")) {
+      sendResponse({ ok: false, error: "El GIF está en memoria (blob:). Reprodúcelo para que se capture el stream y vuelve a intentarlo." });
       return;
     }
     const port = connectNative();
@@ -951,11 +1688,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: false, error: "Sin URL" });
       return;
     }
-    dnrSetRefererRule(url, pageUrl || "").then((ruleId) => sendResponse({ ok: !!ruleId, ruleId }));
+    dnrSetAuthRule(url, pageUrl || "")
+      .then((ok) => sendResponse({ ok }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
     return true; // respuesta asíncrona
   }
   if (msg?.type === "clear-dnr-referer") {
-    if (msg.url) dnrClearRefererRule(msg.url);
+    if (msg.url) dnrClearAuthRule(msg.url);
     sendResponse({ ok: true });
     return;
   }
@@ -984,6 +1723,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: false, error: "URL no válida" });
     }
     return;
+  }
+  if (msg?.type === "auth-permission-changed") {
+    // El panel acaba de conceder (o revocar) el permiso opcional `cookies`.
+    // Se invalida el estado cacheado para que la siguiente regla DNR incluya
+    // la cabecera Cookie, y se retiran las reglas vivas que se instalaron sin
+    // ella: si no, el Referer se iría solo y la descarga de un recurso
+    // autenticado seguiría fallando.
+    (async () => {
+      cookiesPermGranted = await hasCookiesPermission();
+      const stale = [...dnrAuthRules.keys()];
+      for (const key of stale) await dnrRemoveAuthRule(key);
+      sendResponse({ ok: true, cookies: cookiesPermGranted });
+    })();
+    return true;
   }
   if (msg?.type === "upload-tmp") {
     // Sube un blob (frame capturado / imagen local) a LITTERBOX (catbox
@@ -1098,6 +1851,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "rec-relay") {
     // Datos y eventos del recorder (MAIN world) llegados vía content script.
     const p = msg.payload || {};
+    if (p.type === "started" && p.drm) {
+      // Honestidad inmediata: la página usa EME/DRM — la grabación interna
+      // no puede capturar contenido cifrado. Fallar la sesión ya.
+      recFail(p.error || "Esta página usa DRM (EME): la grabación interna no puede capturar contenido cifrado.");
+      return;
+    }
     if (!recSession || p.type === "started") return;
     if (p.type === "stats") {
       recBroadcast({ state: "recording", bytes: p.bytes, segments: p.segments, sources: p.sources });
@@ -1131,7 +1890,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 async function handleYtdl(msg) {
   const port = connectNative();
   if (!port) {
-    return { ok: false, error: "El host nativo no está instalado. Ejecuta native-host/operant-host.exe con doble clic." };
+    return { ok: false, error: "El host nativo no está instalado. Descarga operant-host.exe desde la página de Releases del repositorio y ejecútalo con doble clic." };
   }
   try {
     port.postMessage({ type: "ytdl", url: msg.url, filename: msg.filename, format: msg.format || null });
@@ -1179,6 +1938,7 @@ async function swFastHls(url, filename, tabId) {
       url,
       concurrency: 6,
       allowLive: false, // sin botón de parada en el SW: un live no debe colgarse aquí
+      requireAudio: true, // variante muda (audio separado) → error honesto, no vídeo sin sonido
       beforeFetch: async (segUrl) => {
         try {
           const host = new URL(segUrl).hostname;
@@ -1203,18 +1963,48 @@ async function swFastHls(url, filename, tabId) {
       );
     }
     const mime = result.kind === "ts" ? "video/mp2t" : "video/mp4";
-    const name =
-      (filename || urlBasename(url) || "video").replace(/\.(m3u8|mpd)$/i, "") + (result.kind === "ts" ? ".ts" : ".mp4");
-    // base64 por chunks de 32KB: String.fromCharCode.apply con el buffer
-    // completo revienta por stack overflow (verificado en el proyecto).
-    const CHUNK = 0x8000;
-    let b64 = "";
-    for (let i = 0; i < bytes.length; i += CHUNK) {
-      b64 += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CHUNK, bytes.length)));
+    // Nombre de archivo: los manifiestos suelen llamarse playlist/master/
+    // dynamic — con nombre genérico se usa el TÍTULO de la pestaña (genérico
+    // para cualquier web, sin listas de sitios). El título lo controla la
+    // página, así que pasa por el saneador como cualquier otro nombre.
+    let baseName = filename || urlBasename(url) || "video";
+    if (/^(playlist|master|index|manifest|dynamic)$/i.test(baseName.replace(/\.(m3u8|mpd)$/i, ""))) {
+      try {
+        if (tabId != null) {
+          const t = await chrome.tabs.get(tabId);
+          if (t?.title) baseName = String(t.title).slice(0, 120);
+        }
+      } catch {
+        /* pestaña cerrada mientras se descargaba */
+      }
     }
-    const dataUrl = `data:${mime};base64,${btoa(b64)}`;
-    await chrome.downloads.download({ url: dataUrl, filename: name, conflictAction: "uniquify" });
-    return { ok: true, note: `Descargado por ruta rápida (${result.segments} segmentos).` };
+    const name = safeDownloadName(
+      baseName.replace(/\.(m3u8|mpd)$/i, ""),
+      url,
+      result.kind === "ts" ? "ts" : "mp4"
+    );
+    const dataUrl = bytesToDataUrl(bytes, mime);
+    const downloadId = await chrome.downloads.download({ url: dataUrl, filename: name, conflictAction: "uniquify" });
+    const delivered = await monitorDownloadId(downloadId); // honesto hasta el final
+    if (!delivered.ok) throw new Error(delivered.error);
+    const mb = (result.bytes / 1048576).toFixed(1);
+    // Verificación honesta de pista de audio (las cajas moov/trak van al
+    // principio, así que basta con mirar la cabeza).
+    //
+    // Solo tiene sentido en fMP4: en MPEG-TS no existe la caja `hdlr`, luego el
+    // test era siempre falso y además sería imposible. Antes la comprobaba para
+    // los dos formatos, así que TODA descarga TS avisaba de "sin pista de
+    // audio" aunque fuera un stream normal con sonido. Y el `...bytes.subarray`
+    // de 3 MB lanzaba RangeError por límite de argumentos, es decir, después
+    // de que la descarga ya se hubiera entregado: el usuario veía "falló" en
+    // una descarga completada.
+    const noAudio =
+      result.kind !== "ts" && !bytesContainAscii(bytes, "soun", 3 * 1024 * 1024);
+    return {
+      ok: true,
+      note: `Descarga completada y verificada: ${result.segments} segmentos, ${mb} MB.` +
+        (noAudio ? " ATENCIÓN: sin pista de audio (variante con audio separado — se necesita el companion para unirlo)." : ""),
+    };
   } finally {
     // Reglas DNR efímeras: limpiar SIEMPRE (éxito, fallo o cancelación).
     for (const host of hostRules) dnrClearRefererHostRule(host);
@@ -1258,27 +2048,76 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
+// --- Auto-reparación de content scripts huérfanos ---
+// Tras recargar la extensión, las pestañas abiertas conservan content scripts
+// de la generación anterior (canal chrome.runtime muerto → "Extension
+// context invalidated" en cada interacción). Cuando el SW toca una pestaña
+// (panel, escaneo) y esta no responde, re-inyecta los content scripts de la
+// generación actual: la pestaña se auto-repara sin recargar la página.
+async function tabAlive(tabId) {
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "ping" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function reinjectContentScripts(tabId) {
+  if (!chrome.scripting?.executeScript) return false;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["shared/icons.js", "shared/dl-indicator.js", "content.js"],
+    });
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        files: ["recorder-main.js"],
+      });
+    } catch {
+      /* MAIN world no inyectable en algunas páginas: la parte aislada ya está */
+    }
+    return true;
+  } catch {
+    return false; // páginas no inyectables (chrome://, webstore, PDF viewer…)
+  }
+}
+
 async function handleGetState(tabId) {
   const tab = ensureTab(tabId);
   try {
     const stored = await chrome.storage.session.get(keyFor(tabId));
     if (stored[keyFor(tabId)] && tab.items.length === 0) {
       tab.items = stored[keyFor(tabId)];
+      // El contador de seq es de proceso: tras un reinicio del SW debe
+      // continuar por encima del máximo restaurado (sin colisiones).
+      for (const it of tab.items) {
+        if (typeof it.seq === "number" && it.seq >= seqCounter) seqCounter = it.seq + 1;
+      }
     }
   } catch {
     /* sin persistencia */
   }
   // Pide un escaneo fresco al content script (si existe) y mezcla.
+  // RESPUESTA INMEDIATA: el estado actual ya es fiel. Esperar aquí a la
+  // enriqueción de tamaños (GET por item; cientos en páginas grandes) era la
+  // causa del ciclo de carga infinito del panel. La enriqueción continúa en
+  // background y su progreso llega por broadcasts state-updated (throttled).
+  // Antes de escanear: si la pestaña tiene un content script huérfano
+  // (extensión recargada), se re-inyecta — auto-reparación transparente.
   try {
+    if (!(await tabAlive(tabId))) await reinjectContentScripts(tabId);
     const res = await chrome.tabs.sendMessage(tabId, { type: "scan" });
     if (res?.items) {
       const byUrl = new Map(tab.items.map((it) => [it.url.split("#")[0], it]));
-      for (const item of res.items) byUrl.set(item.url.split("#")[0], item);
+      for (const item of res.items) byUrl.set(item.url.split("#")[0], withSeq(item));
       tab.items = [...byUrl.values()].slice(0, MAX_ITEMS_PER_TAB);
     }
-    await enrichMissing(tabId); // esperar: los items vuelven con tamaño, no con "?"
     updateBadge(tabId);
     persistTab(tabId);
+    enrichMissing(tabId); // sin await: tamaños en vivo vía broadcast
     return { items: tab.items, reachable: true };
   } catch {
     return { items: tab.items, reachable: false };
@@ -1287,19 +2126,19 @@ async function handleGetState(tabId) {
 
 async function requestScan(tabId) {
   try {
-    await chrome.tabs.sendMessage(tabId, { type: "ping" });
+    if (!(await tabAlive(tabId))) await reinjectContentScripts(tabId);
     // force-rescan (no "scan"): re-ejecuta fullScan para que el progreso real
     // del barrido de estilos fluya al panel con el botón «Actualizar».
     const res = await chrome.tabs.sendMessage(tabId, { type: "force-rescan" });
     const tab = ensureTab(tabId);
     if (res?.items) {
       const byUrl = new Map(tab.items.map((it) => [it.url.split("#")[0], it]));
-      for (const item of res.items) byUrl.set(item.url.split("#")[0], item);
+      for (const item of res.items) byUrl.set(item.url.split("#")[0], withSeq(item));
       tab.items = [...byUrl.values()].slice(0, MAX_ITEMS_PER_TAB);
     }
-    await enrichMissing(tabId); // esperar: los items vuelven con tamaño, no con "?"
     updateBadge(tabId);
     persistTab(tabId);
+    enrichMissing(tabId); // sin await: progreso en vivo, respuesta inmediata
     return { items: tab.items };
   } catch {
     return { items: ensureTab(tabId).items };
@@ -1364,7 +2203,7 @@ async function nativeHealthcheck() {
 function sendNativeToolAction(action, tool) {
   const port = connectNative();
   if (!port) {
-    return { ok: false, error: "El host nativo no está instalado. Ejecuta native-host/operant-host.exe con doble clic." };
+    return { ok: false, error: "El host nativo no está instalado. Descarga operant-host.exe desde la página de Releases del repositorio y ejecútalo con doble clic." };
   }
   try {
     port.postMessage({ type: action, tool });

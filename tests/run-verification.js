@@ -3,7 +3,7 @@
 // deterministas + sitios públicos reales), valida lo detectado por el content
 // script / webRequest y escribe resultados en tests/results/.
 //
-// Uso: node tests/run-verification.js [--public] [--no-screenshots]
+// Uso: node tests/run-verification.js [--public] [--no-screenshots] [--strict]
 
 const puppeteer = require("puppeteer-core");
 const { resolveBuildId, install, computeExecutablePath } = require("@puppeteer/browsers");
@@ -20,6 +20,8 @@ const CFT_CACHE = path.join(__dirname, ".chrome");
 
 const WITH_PUBLIC = process.argv.includes("--public");
 const SCREENSHOTS = !process.argv.includes("--no-screenshots");
+// En CI, un WARN tambien es un fallo: ver el cierre del harness.
+const STRICT = process.argv.includes("--strict");
 
 // Chrome Stable 137+ ignora --load-extension: para cargar la extension en
 // pruebas hace falta un build de Chrome for Testing (ver TESTING.md).
@@ -196,9 +198,10 @@ async function runCase(browser, sw, c) {
   await page.close();
 
   fs.writeFileSync(path.join(RESULTS, `${c.id}.json`), JSON.stringify(record, null, 2));
-  const fails = record.checks.filter((x) => !x.pass).length;
+  const failedChecks = record.checks.filter((x) => !x.pass && !x.warn).length;
+  const warnedChecks = record.checks.filter((x) => !x.pass && x.warn).length;
   console.log(
-    `${record.verdict.padEnd(6)} ${c.id}  (${record.count ?? "?"} items, ${fails} check(s) fallidos)  ${c.name}`
+    `${record.verdict.padEnd(6)} ${c.id}  (${record.count ?? "?"} items, ${failedChecks} check(s) fallidos, ${warnedChecks} con aviso)  ${c.name}`
   );
   return record;
 }
@@ -399,17 +402,26 @@ const cases = [
           }
         })()`
       );
-      // Si el host nativo está instalado y registrado, responde pong con los tools.
-      // Si el host no está instalado (p.ej. entorno limpio), desconecta limpio sin romper la extensión.
+      // El CONTRATO que hay que verificar es: o bien el host responde pong, o
+      // bien se desconecta limpiamente sin romper. Lo que NO es un test es lo
+      // que afirmaba el nombre del caso ("con host NO instalado"): ese nombre
+      // mentia, y TESTING.md llego a afirmar lo contrario de lo que registraba
+      // el propio artefacto (tests/results/10-native-host.json decia
+      // "conectado y respondiendo pong"). El caso se llama por lo que
+      // comprueba, no por el escenario que el autor imagino.
       const valid = (r.connected && r.msg?.type === "pong") || (!r.connected && !r.timeout);
       return [
-        expect(valid, `native host verificado correctamente (${r.connected ? "conectado y respondiendo pong" : "desconectado limpiamente: " + (r.error || "ok")})`),
+        expect(
+          valid,
+          `native host responde o falla limpio (${r.connected ? "conectado y respondiendo pong" : "desconectado limpiamente: " + (r.error || "ok")})`
+        ),
       ];
     },
     extraNotes() {
       return [
-        "Si el usuario NO tiene el host, connectNative falla limpio: el panel oculta el boton yt-dlp (healthcheck devuelve installed:false, cache 30 s).",
-        "Con el host instalado y registrado, responde pong{ytDlp,ffmpeg} — probado manualmente contra operant_host.py en la fase 4.",
+        "Contrato verificado: connectNative() o bien obtiene pong, o bien devuelve connected:false sin timeout. Ambos resultados son correctos; lo que no lo seria es colgarse.",
+        "Este caso NO comprueba que el host este instalado: el entorno de test puede no tenerlo. Para eso esta host-e2e.py (npm run host:test).",
+        "Con el host instalado y registrado, responde pong{ytDlp,ffmpeg}.",
       ];
     },
   },
@@ -587,6 +599,17 @@ const publicCases = [
   console.log(`\n${all.length - fails - warns} PASS / ${warns} WARN / ${fails} FAIL  (resultados en tests/results/)`);
 
   await browser.close();
+  // --strict: en CI un WARN también es un fallo. Localmente los WARN son
+  // informativos (p.ej. un sitio público que devuelve 403 por anti-bot no debe
+  // bloquear el desarrollo), pero en un pipeline un WARN sin tratar se
+  // normaliza hasta ser invisible.
+  if (STRICT) {
+    if (warns || fails) {
+      console.error(`\n--strict: ${warns} WARN + ${fails} FAIL -> la CI falla.`);
+      process.exit(1);
+    }
+    console.log("--strict: sin WARN ni FAIL.");
+  }
   process.exit(fails ? 1 : 0);
 })().catch((e) => {
   console.error("Fallo del harness:", e);

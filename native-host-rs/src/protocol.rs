@@ -1,6 +1,6 @@
+use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
-use serde::{de::DeserializeOwned, Serialize};
 
 #[derive(Clone)]
 pub struct MessageSender {
@@ -15,8 +15,8 @@ impl MessageSender {
     }
 
     pub fn send<T: Serialize>(&self, msg: &T) -> io::Result<()> {
-        let payload = serde_json::to_vec(msg)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let payload =
+            serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let len = payload.len() as u32;
         let mut out = self.stdout.lock().unwrap();
         out.write_all(&len.to_le_bytes())?;

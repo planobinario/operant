@@ -16,6 +16,8 @@ import { OperantMedia } from "../shared/media-core.js";
 // Ruta rápida HLS 100% en navegador (sin host nativo): parseo + fetch paralelo
 // + AES-128 (WebCrypto) + concat binaria fMP4/TS. Mismo motor que el SW.
 import { HLSFast } from "../shared/hls-fast.js";
+// ÚNICA FUENTE DE VERDAD de nombres de archivo (compartida con el SW).
+import { sanitizeFileName, ensureExtension, zipEntryName } from "../shared/filename.js";
 
 // CSS del indicador de descarga (componente compartido con el overlay).
 const dlCss = window.OperantDLIndicatorCSS || window.NTDLIndicatorCSS;
@@ -24,6 +26,45 @@ if (dlCss && !document.getElementById("operant-dl-style")) {
   st.id = "operant-dl-style";
   st.textContent = dlCss();
   document.head.appendChild(st);
+}
+
+// Iconos de botones ESTÁTICOS: inyectados desde el set compartido
+// (shared/icons.js) para que todo el panel use la misma geometría que el
+// overlay. Los ids mapean a nombres del set; los cierres genéricos de
+// diálogo (.mini-btn) se normalizan a la X.
+const STATIC_ICON_BUTTONS = {
+  btnRefresh: "refresh",
+  btnClearSel: "x",
+  btnStopScan: "x",
+  lbZoomOut: "zoomOut",
+  lbZoomIn: "zoomIn",
+  lbReset: "reset",
+  lbDownload: "download",
+  lbOpen: "external",
+  lbClose: "x",
+  lbPrev: "chevL",
+  lbNext: "chevR",
+  vdPrev: "chevL",
+  vdNext: "chevR",
+  vdPopout: "expand",
+  vdDownload: "download",
+  vdOpen: "external",
+  vdClose: "x",
+  adDownload: "download",
+  adOpen: "external",
+  adClose: "x",
+  pdfDownload: "download",
+  pdfOpen: "external",
+  pdfClose: "x",
+};
+if (window.OperantIcons || window.NTIcons) {
+  for (const [id, name] of Object.entries(STATIC_ICON_BUTTONS)) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = iconSvg(name);
+  }
+  document.querySelectorAll("dialog .mini-btn").forEach((b) => {
+    b.innerHTML = iconSvg("x", 11);
+  });
 }
 
 const grid = document.getElementById("grid");
@@ -112,6 +153,9 @@ const lbDownload = document.getElementById("lbDownload");
 const lbOpen = document.getElementById("lbOpen");
 const lbClose = document.getElementById("lbClose");
 const videoDialog = document.getElementById("videoDialog");
+const vdPrev = document.getElementById("vdPrev");
+const vdNext = document.getElementById("vdNext");
+const vdPopout = document.getElementById("vdPopout");
 const vdTitle = document.getElementById("vdTitle");
 const vdMeta = document.getElementById("vdMeta");
 const vdEl = document.getElementById("vdEl");
@@ -134,12 +178,15 @@ const TAB_LABELS = { image: "Imágenes", video: "Vídeos", audio: "Audio", file:
 
 const state = {
   tabId: null,
+  pageUrl: "", // URL REAL de la pestaña objetivo (para Referer DNR, capturas…)
   items: [],
   tab: "image", // image | video | audio | file
   selected: new Set(), // urls seleccionadas
   rendered: 0,
   masonryCols: null, // columnas flex activas en vista masonry
   activeSentinel: null, // sentinel observado para el lazy-render
+  visibleList: null, // snapshot de la lista del ciclo de render en curso
+  cardEls: new Map(), // url -> card del DOM (actualización in-place de metadatos)
   selHydrated: false,
   native: { installed: false, checkedAt: 0, tools: null },
 };
@@ -220,24 +267,46 @@ function formatBytes(bytes) {
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
+// Sistema de iconos compartido (shared/icons.js): geometría Lucide 24×24,
+// trazo 1.75 — el MISMO set que usa el overlay. Fallback silencioso: sin el
+// módulo se conservan los glifos tipográficos existentes.
+function iconSvg(name, size = 13) {
+  const I = window.OperantIcons || window.NTIcons;
+  return I ? I.svg(name, size) : "";
+}
+
+// Estado visual normalizado de un botón de selección (+ / ✓).
+function paintSelBtn(btn, selected) {
+  btn.innerHTML = selected ? iconSvg("check") : iconSvg("plus");
+  btn.classList.toggle("sel-on", selected);
+}
+
+// Nombre legible de un item. Devuelve SIEMPRE un nombre de archivo SEGURO.
+//
+// `item.name` / `item.title` vienen del `alt` de una imagen o del `<title>` de
+// la página: los controla el sitio, así que no son de fiar. Antes de este
+// cambio el nombre iba tal cual a chrome.downloads.download y a las
+// entradas del ZIP, donde un "../" es un zip-slip y un nombre reservado de
+// Windows es un dispositivo. Ahora todo pasa por el saneador compartido.
 function itemName(item) {
-  if (item.name) return item.name;
-  if (item.title) return item.title;
+  if (item.name || item.title) {
+    const cleaned = sanitizeFileName(item.name || item.title, { fallback: "" });
+    if (cleaned) return ensureExtension(cleaned, item.ext);
+  }
   if (item.url && item.url.startsWith("data:")) {
     const ext = item.ext || "jpg";
     return `image_${(item.w && item.h) ? `${item.w}x${item.h}_` : ""}${Math.abs(item.url.length)}.${ext}`;
   }
   try {
     const u = new URL(item.url);
-    let last = decodeURIComponent(u.pathname.split("/").filter(Boolean).pop() || "");
-    if (last && item.ext && !last.toLowerCase().endsWith(`.${item.ext}`)) {
-      if (!/\.[a-z0-9]{2,5}$/i.test(last)) {
-        last = `${last}.${item.ext}`;
-      }
-    }
-    return last || u.hostname;
+    const last = sanitizeFileName(decodeURIComponent(u.pathname.split("/").filter(Boolean).pop() || ""), {
+      fallback: "",
+    });
+    if (last) return ensureExtension(last, item.ext);
+    // Sin basename utilizable: el host sigue siendo mejor que la URL entera.
+    return sanitizeFileName(u.hostname, { fallback: "descarga" });
   } catch {
-    return item.url;
+    return sanitizeFileName(item.url, { fallback: "descarga", maxBytes: 120 });
   }
 }
 
@@ -273,6 +342,37 @@ function isSmallMedia(it) {
 }
 
 // --- Filtrado + ordenación ---
+
+// Previews rotos (URLs cuya imagen falló al cargar en el panel): no se
+// reintentan (no se crea <img>) y se muestran al FINAL de la lista. Es un
+// registro de sesión: si un recurso vuelve a funcionar (p.ej. tras re-escanear
+// con la página viva), desaparece del conjunto al cargar correctamente.
+const badPreviews = new Set();
+let previewErrTimer = null;
+
+function markPreviewError(url) {
+  if (!url || !/^https?:/.test(url)) return;
+  if (badPreviews.has(url)) return;
+  badPreviews.add(url);
+  const it = state.items.find((i) => i.url === url);
+  if (it) it._previewError = true;
+  // Re-render aplazado: el orden se estabiliza (los rotos bajan al final)
+  // sin reshuffle en cada fallo individual durante el lazy-render. Va por el
+  // flujo atómico: solo re-render si el orden de la lista cambia de verdad.
+  clearTimeout(previewErrTimer);
+  previewErrTimer = setTimeout(() => {
+    if (!loading) applyStateUpdate();
+  }, 1200);
+}
+
+// Nivel de calidad de preview para la ordenación:
+//   0 = OK · 1 = pequeña (solo en el orden "smart") · 2 = preview roto/no cargable.
+function previewTier(it, includeSmall = true) {
+  if (badPreviews.has(it.url) || it._previewError) return 2;
+  if (includeSmall && isSmallMedia(it)) return 1;
+  return 0;
+}
+
 function sortedItems() {
   const q = search.value.trim().toLowerCase();
   const minKb = Number(fMinSize.value || 0) || 0;
@@ -284,6 +384,10 @@ function sortedItems() {
     // Init segments de fMP4 (X/Instagram): metadata sin vídeo — no son
     // descargables y no deben mostrarse como medios.
     if (it.method === "init") return false;
+    // Componentes de stream (variantes solo-vídeo, pistas de audio, inits)
+    // ya RELACIONADOS con su master: ocultos — el panel muestra UNA entrada
+    // por vídeo (el master, que muxea con el companion).
+    if (it.component) return false;
     // Tamaño desconocido (?): NUNCA se excluye por filtros de tamaño. Un item
     // sin tamaño no es "0 KB", es "no aplicable" — el usuario debe verlo con
     // su badge "?" y decidir, no desaparece silenciosamente.
@@ -298,16 +402,18 @@ function sortedItems() {
 
   const s = viewPrefs.sort || "smart";
   if (s === "smart") {
-    // Orden de la web: imágenes grandes/pesadas primero en su orden de aparición visual,
-    // y los iconos / elementos decorativos pequeños abajo (también en orden).
+    // Orden de la web: imágenes grandes/pesadas primero en su orden de
+    // aparición real (seq estable del SW), iconos pequeños después y los
+    // previews rotos SIEMPRE al final — en primera línea solo alta calidad.
     list.sort((a, b) => {
-      const aSmall = isSmallMedia(a) ? 1 : 0;
-      const bSmall = isSmallMedia(b) ? 1 : 0;
-      if (aSmall !== bSmall) return aSmall - bSmall;
-      return (a._idx ?? 0) - (b._idx ?? 0);
+      const t = previewTier(a) - previewTier(b);
+      if (t) return t;
+      return seqOf(a) - seqOf(b);
     });
   } else if (s === "size") {
     list.sort((a, b) => {
+      const t = previewTier(a, false) - previewTier(b, false);
+      if (t) return t;
       const sizeA = a.sizeKB ?? -1;
       const sizeB = b.sizeKB ?? -1;
       if (sizeA !== sizeB && sizeA >= 0 && sizeB >= 0) {
@@ -319,20 +425,32 @@ function sortedItems() {
       const dimsA = (a.w && a.h) ? a.w * a.h : -1;
       const dimsB = (b.w && b.h) ? b.w * b.h : -1;
       if (dimsA !== dimsB) return dimsB - dimsA;
-      return (a._idx ?? 0) - (b._idx ?? 0);
+      return seqOf(a) - seqOf(b);
     });
   } else if (s === "dims") {
     const d = (it) => (it.w && it.h ? it.w * it.h : -1);
     list.sort((a, b) => {
+      const t = previewTier(a, false) - previewTier(b, false);
+      if (t) return t;
       const dimsA = d(a);
       const dimsB = d(b);
       if (dimsA !== dimsB) return dimsB - dimsA;
       return (b.sizeKB ?? -1) - (a.sizeKB ?? -1);
     });
   } else if (s === "detect") {
-    list.sort((a, b) => (a._idx ?? 0) - (b._idx ?? 0));
+    list.sort((a, b) => {
+      const t = previewTier(a, false) - previewTier(b, false);
+      if (t) return t;
+      return seqOf(a) - seqOf(b);
+    });
   } else if (s === "domain") {
-    list.sort((a, b) => (a.domain || "").localeCompare(b.domain || ""));
+    list.sort((a, b) => {
+      const t = previewTier(a, false) - previewTier(b, false);
+      if (t) return t;
+      const dc = (a.domain || "").localeCompare(b.domain || "");
+      if (dc) return dc;
+      return seqOf(a) - seqOf(b);
+    });
   }
   return list;
 }
@@ -367,9 +485,13 @@ function dupKeysOf(items) {
 }
 
 // --- Estado de items (única vía de entrada, evita arrays rotos) ---
+// El ORDEN ESTABLE lo fija el SW con `seq` (secuencia monotónica asignada
+// UNA vez, al primer avistamiento del item). El panel NO reasigna posición
+// por índice de mensaje: los _idx reasignados en cada state-updated eran la
+// causa raíz de que el orden "saltara" al cambiar de pestaña y volver.
 function setItems(items) {
   state.items = (Array.isArray(items) ? items : []).map((it, idx) => {
-    if (it._idx === undefined) it._idx = idx;
+    if (it.seq === undefined && it._idx === undefined) it._idx = idx; // último recurso (tests)
     return it;
   });
   const valid = new Set(state.items.map((it) => it.url));
@@ -377,6 +499,13 @@ function setItems(items) {
     if (!valid.has(u)) state.selected.delete(u);
   }
   populateExtOptions();
+}
+
+// Clave de orden inmutable: seq del SW, con _idx/index como fallback.
+function seqOf(it) {
+  if (it.seq !== undefined) return it.seq;
+  if (it._idx !== undefined) return it._idx;
+  return Number.MAX_SAFE_INTEGER;
 }
 
 // Etiqueta del método de detección para la transparencia de la jerarquía
@@ -437,29 +566,126 @@ function bestImageUrl(item) {
   return url;
 }
 
-// Captura el frame actual de un <video> o <img> (GIF animado) a PNG/JPEG
-// usando un <canvas> oculto. Devuelve la URL del blob para descargar.
-function captureFrame(srcEl, mime = "image/png") {
-  return new Promise((resolve, reject) => {
+// Espera a que un <video> tenga un fotograma REAL decodificado
+// (requestVideoFrameCallback cuando existe; fallback loadeddata/readyState).
+function waitForVideoFrame(el, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    if (el.readyState >= 2 && el.videoWidth > 0) return resolve(true);
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      resolve(!!v);
+    };
+    const t = setTimeout(() => finish(el.readyState >= 2 && el.videoWidth > 0), timeoutMs);
     try {
-      const canvas = document.createElement("canvas");
-      const w = srcEl.videoWidth || srcEl.naturalWidth || srcEl.width;
-      const h = srcEl.videoHeight || srcEl.naturalHeight || srcEl.height;
-      if (!w || !h) return reject(new Error("Sin dimensiones de frame"));
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return reject(new Error("Canvas 2D no disponible"));
-      // Para vídeo: dibujar el frame actual. Para GIF: el frame visible.
-      ctx.drawImage(srcEl, 0, 0, w, h);
-      canvas.toBlob((blob) => {
-        if (!blob) return reject(new Error("toBlob falló"));
-        resolve(blob);
-      }, mime, 0.92);
-    } catch (e) {
-      reject(e);
-    }
+      if (typeof el.requestVideoFrameCallback === "function") el.requestVideoFrameCallback(() => finish(true));
+    } catch { /* sin rVFC */ }
+    el.addEventListener("loadeddata", () => {
+      try {
+        if (typeof el.requestVideoFrameCallback === "function") el.requestVideoFrameCallback(() => finish(true));
+        else finish(true);
+      } catch { finish(true); }
+    }, { once: true });
+    el.addEventListener("error", () => finish(false), { once: true });
   });
+}
+
+// Captura de fotograma ROBUSTA para las cards del panel (GIF y vídeo).
+// Cadena funcional completa — cada vía se intenta de verdad y los fallos
+// pasan a la siguiente; el error final es el real:
+//   1. Elemento en la card (img del GIF / <video> del hover-preview).
+//   2. Offscreen desde la URL directa (elemento oculto en el panel).
+//   3. Bytes vía el SW (fetch sin CORS + Referer de la página) → blob local
+//      (mismo origen, canvas limpio) → decode → canvas. Cubre CDNs
+//      cross-origin cuyo canvas está contaminado (CORS) — tope 64MB.
+// Devuelve { blob } o lanza el error real (sin capturas mudas).
+async function captureItemFrame(item, card, mime) {
+  const isVideo = item.type === "video";
+  const drawEl = async (el) => {
+    const w = el.videoWidth || el.naturalWidth || el.width;
+    const h = el.videoHeight || el.naturalHeight || el.height;
+    if (!w || !h) throw new Error("noframe");
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas 2D no disponible");
+    ctx.drawImage(el, 0, 0, w, h);
+    return await new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error("taint"))), mime, 0.92));
+  };
+  const decodeAndDraw = async (localUrl) => {
+    if (isVideo) {
+      const v = document.createElement("video");
+      v.muted = true;
+      v.playsInline = true;
+      v.preload = "auto";
+      v.src = localUrl;
+      const ok = await waitForVideoFrame(v, 10000);
+      if (!ok || !v.videoWidth) throw new Error("El vídeo no se pudo decodificar para extraer el fotograma.");
+      return { blob: await drawEl(v) };
+    }
+    const img = new Image();
+    img.src = localUrl;
+    await img.decode().catch(() => { throw new Error("La imagen no se pudo decodificar."); });
+    return { blob: await drawEl(img) };
+  };
+
+  // 1) Elemento ya presente en la card (si el usuario hizo hover).
+  if (card) {
+    const el = isVideo ? card.querySelector("video") : card.querySelector("img");
+    if (el) {
+      try {
+        if (isVideo) {
+          const ok = await waitForVideoFrame(el, 4000);
+          if (!ok) throw new Error("noframe");
+        }
+        return { blob: await drawEl(el) };
+      } catch { /* siguiente vía */ }
+    }
+  }
+
+  // 2) Offscreen desde la URL directa.
+  if (/^https?:/.test(item.url)) {
+    try {
+      if (isVideo) {
+        const v = document.createElement("video");
+        v.muted = true;
+        v.playsInline = true;
+        v.preload = "auto";
+        v.src = item.url;
+        const ok = await waitForVideoFrame(v, 8000);
+        if (ok && v.videoWidth) return { blob: await drawEl(v) };
+        throw new Error("noframe");
+      }
+      const img = new Image();
+      img.referrerPolicy = "no-referrer";
+      img.src = item.url;
+      await img.decode();
+      return { blob: await drawEl(img) };
+    } catch { /* taint o fallo: vía SW */ }
+
+    // 3) Bytes vía el SW → blob local → canvas limpio.
+    const r = await chrome.runtime
+      .sendMessage({ type: "fetch-blob-data", url: item.url, pageUrl: state.pageUrl || "" })
+      .catch(() => null);
+    if (!r?.ok) throw new Error(r?.error || "No se pudo capturar el fotograma (fallo de red).");
+    const localBlob = await fetch(r.dataUrl).then((x) => x.blob());
+    const localUrl = URL.createObjectURL(localBlob);
+    try {
+      return await decodeAndDraw(localUrl);
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(localUrl), 30000);
+    }
+  }
+
+  // blob:/data: de la página: el blob vive en la página y no es accesible.
+  throw new Error(
+    isVideo
+      ? "El vídeo es un stream en memoria (blob:) de la página: usa el overlay sobre el vídeo en la página para capturar el fotograma."
+      : "La imagen está embebida en la página: usa el overlay sobre ella para capturarla."
+  );
 }
 
 // Descarga el frame capturado (blob -> chrome.downloads).
@@ -503,12 +729,15 @@ function quickBtn(glyph, label, opts = {}) {
   b.setAttribute("aria-label", label);
   // Los botones de descarga (act-dl) usan el indicador de motion design
   // compartido (anillo de progreso real/indeterminado, check, error) en vez
-  // del glyph de texto. El resto sigue con texto.
+  // del glyph de texto. El resto acepta SVG del set normalizado (innerHTML)
+  // o glifo tipográfico si el sistema de iconos no está disponible.
   let indicator = null;
   const DLInd = window.OperantDLIndicator || window.NTDLIndicator;
   if (opts.cls === "act-dl" && DLInd) {
     indicator = new DLInd(b);
     b.classList.add("operant-dl-host");
+  } else if (glyph && glyph.startsWith("<svg")) {
+    b.innerHTML = glyph;
   } else {
     b.textContent = glyph;
   }
@@ -582,7 +811,7 @@ function typeActionButtons(item, index, card) {
   if (item.type === "image") {
     // Imagen: "alta calidad" (y captura de frame si es GIF animado).
     btns.push(
-      quickBtn("⬇", "Descargar en alta calidad", {
+      quickBtn(iconSvg("download") || "⬇", "Descargar en alta calidad", {
         cls: "act-dl",
         holdable: true,
         onActivate: (ind) => {
@@ -595,19 +824,13 @@ function typeActionButtons(item, index, card) {
     );
     if (isGif) {
       btns.push(
-        quickBtn("◉", "Descargar frame actual del GIF", {
+        quickBtn(iconSvg("camera") || "◉", "Descargar frame actual del GIF", {
           cls: "act-frame",
           holdable: true,
           onActivate: async () => {
-            const img = card ? card.querySelector(`img[src="${CSS.escape(item.url)}"]`) : null;
-            if (!img) { statusText.textContent = "Frame no disponible (imagen no renderizada)."; return; }
-            try {
-              const blob = await captureFrame(img, "image/png");
-              await downloadFrame(blob, `${itemName(item).replace(/\.[^.]+$/, "")}-frame.png`);
-              toast("Frame guardado");
-            } catch (e) {
-              statusText.textContent = `No se pudo capturar el frame: ${e.message}`;
-            }
+            const { blob } = await captureItemFrame(item, card, "image/png");
+            await downloadFrame(blob, `${itemName(item).replace(/\.[^.]+$/, "")}-frame.png`);
+            toast("Frame guardado");
           },
         })
       );
@@ -615,32 +838,26 @@ function typeActionButtons(item, index, card) {
   } else if (item.type === "video") {
     // Vídeo: descargar (jerarquía) + capturar frame actual.
     btns.push(
-      quickBtn("⬇", "Descargar vídeo", {
+      quickBtn(iconSvg("download") || "⬇", "Descargar vídeo", {
         cls: "act-dl",
         holdable: true,
         onActivate: (ind) => downloadOne(item, ind),
       })
     );
     btns.push(
-      quickBtn("◉", "Descargar frame actual del vídeo", {
+      quickBtn(iconSvg("camera") || "◉", "Descargar frame actual del vídeo", {
         cls: "act-frame",
         holdable: true,
         onActivate: async () => {
-          const v = card ? card.querySelector("video") : null;
-          if (!v) { statusText.textContent = "Frame no disponible (el vídeo no está en el DOM)."; return; }
-          try {
-            const blob = await captureFrame(v, "image/jpeg");
-            await downloadFrame(blob, `${itemName(item).replace(/\.[^.]+$/, "")}-frame.jpg`);
-            toast("Frame guardado");
-          } catch (e) {
-            statusText.textContent = `No se pudo capturar el frame: ${e.message}`;
-          }
+          const { blob } = await captureItemFrame(item, card, "image/jpeg");
+          await downloadFrame(blob, `${itemName(item).replace(/\.[^.]+$/, "")}-frame.jpg`);
+          toast("Frame guardado");
         },
       })
     );
   } else if (item.type === "audio") {
     btns.push(
-      quickBtn("⬇", "Descargar audio", {
+      quickBtn(iconSvg("download") || "⬇", "Descargar audio", {
         cls: "act-dl",
         holdable: true,
         onActivate: (ind) => downloadOne(item, ind),
@@ -648,7 +865,7 @@ function typeActionButtons(item, index, card) {
     );
   } else {
     btns.push(
-      quickBtn("⬇", "Descargar archivo", {
+      quickBtn(iconSvg("download") || "⬇", "Descargar archivo", {
         cls: "act-dl",
         holdable: true,
         onActivate: (ind) => downloadOne(item, ind),
@@ -715,7 +932,8 @@ function emptyReason() {
   return { title: "Nada coincide con los filtros", hint: "Ajusta la búsqueda o los filtros." };
 }
 
-function render() {
+function render(opts = {}) {
+  const preserveScroll = opts.preserveScroll !== false;
   const c = counts();
   document.getElementById("countImage").textContent = c.image;
   document.getElementById("countVideo").textContent = c.video;
@@ -741,11 +959,21 @@ function render() {
 
   const visible = sortedItems();
   lastFiltered = visible;
+  // Snapshot ÚNICO para todo el ciclo de render (chunks incluidos): el
+  // observer de scroll re-renderizaba contra un sortedItems() recién calculado
+  // — si state.items cambió entre chunks, mezclaba dos listas distintas
+  // (duplicados/saltos y aparente "reordenación" al volver de otra pestaña).
+  state.visibleList = visible;
   dupMap = dupKeysOf(visible);
   state.rendered = 0;
   grid.className = "grid" + (viewPrefs.view === "masonry" ? " masonry-view" : " list-view");
   grid.style.setProperty("--thumb", `${viewPrefs.thumb}px`);
+  // Preservar la posición de scroll a través del repaint (p.ej. items nuevos
+  // durante un auto-scroll): sin esto, el salto de scroll hace parecer que la
+  // lista "vuelve atrás".
+  const prevScroll = preserveScroll ? grid.scrollTop : 0;
   grid.textContent = "";
+  state.cardEls = new Map(); // el mapa se reconstruye junto al grid
   // En masonry las cards viven en columnas flex (masonry real estilo Pinterest,
   // scroll vertical). En list-view el sentinel va directo como último hijo.
   const masonry = viewPrefs.view === "masonry";
@@ -788,10 +1016,102 @@ function render() {
   empty.hidden = true;
   renderChunk(visible);
   if (state.activeSentinel) observer.observe(state.activeSentinel);
+  // Restaurar el scroll tras el repaint (el contenido nuevo es prefijo del
+  // anterior en el caso append-only, así que la posición sigue siendo válida).
+  if (prevScroll) grid.scrollTop = prevScroll;
 
   // Si hay items visibles sin tamaño, pedir los tamaños al SW (resuelve los
   // "…" que entraron tarde por cualquier vía).
   if (visible.some((i) => i.sizeKB === null && !i.sizeUnknown)) requestMissingSizes();
+}
+
+// ============================================================================
+// RENDERIZADO ATÓMICO: actualización incremental de la lista visible.
+//   1. Lista idéntica (urls, orden y estado de preview iguales) → CERO cambios
+//      estructurales: solo metadatos in-place (tamaños, dimensiones).
+//   2. Solo se AÑADEN items al final (prefijo idéntico) → append incremental
+//      de las cards nuevas, sin tocar las existentes ni el scroll.
+//   3. Cualquier otro cambio (reorden, borrado, filtros, pestaña) → render
+//      completo con preservación de scroll.
+// Esto elimina la carrera grid-vs-actualizaciones: el "453 detectadas pero
+// veo 90, ahora 120, ahora 90" era el reset completo del grid compitiendo con
+// el lazy-render en cada state-updated.
+// ============================================================================
+
+const brokenPreview = (it) => badPreviews.has(it.url);
+
+function sameVisibleList(a, b) {
+  return (
+    a.length === b.length &&
+    a.every((it, i) => it.url === b[i].url && brokenPreview(it) === brokenPreview(b[i]) && seqOf(it) === seqOf(b[i]))
+  );
+}
+
+function isAppendOnly(prev, next) {
+  return (
+    prev.length > 0 &&
+    next.length > prev.length &&
+    prev.every((it, i) => it.url === next[i].url && brokenPreview(it) === brokenPreview(next[i]) && seqOf(it) === seqOf(next[i]))
+  );
+}
+
+// Actualiza SOLO los metadatos visibles de las cards existentes (tamaños que
+// llegaron tarde, dimensiones) sin reconstruir el grid.
+function updateCardsInPlace(list) {
+  for (const it of list) {
+    const card = state.cardEls.get(it.url);
+    if (!card) continue;
+    const meta = card.querySelector(".card-meta");
+    if (meta) {
+      meta.textContent = metaString(it); // vista card: tamaño · dims · dominio
+      continue;
+    }
+    const lcMeta = card.querySelector(".lc-meta");
+    if (lcMeta) {
+      const dim = lcMeta.querySelector(".lc-badge.dim");
+      if (dim && it.w && it.h) {
+        dim.hidden = false;
+        dim.textContent = `${it.w}×${it.h}`;
+      }
+      const size = lcMeta.querySelector(".lc-badge.size");
+      if (size) size.textContent = formatSize(it.sizeKB, it.sizeUnknown);
+    }
+  }
+}
+
+// Punto único de entrada para actualizaciones de estado sobre el grid.
+function applyStateUpdate() {
+  const next = sortedItems();
+  const prev = state.visibleList;
+  if (prev && sameVisibleList(prev, next)) {
+    updateCardsInPlace(next);
+    state.visibleList = next;
+    lastFiltered = next;
+    return;
+  }
+  if (prev && isAppendOnly(prev, next)) {
+    // Prefijo idéntico: lo ya renderizado sigue siendo válido. Si TODO el
+    // prefijo estaba en el DOM, se añaden solo las cards nuevas; si quedaba
+    // tramo sin renderizar (lazy), el snapshot nuevo gobierna y el observer
+    // sigue rellenando — sin reconstruir nada.
+    state.visibleList = next;
+    lastFiltered = next;
+    dupMap = dupKeysOf(next);
+    const masonry = viewPrefs.view === "masonry";
+    if (state.rendered >= prev.length) {
+      for (let i = prev.length; i < next.length; i++) {
+        if (masonry) masonryHostFor().appendChild(renderCard(next[i], i));
+        else grid.appendChild(renderListCard(next[i], i));
+        state.rendered++;
+      }
+      if (state.rendered >= next.length) observer.disconnect();
+    } else if (state.rendered < next.length) {
+      renderChunk(next); // un empujón; el resto llega con el scroll
+    }
+    if (next.some((i) => i.sizeKB === null && !i.sizeUnknown)) requestMissingSizes();
+    return;
+  }
+  render();
 }
 
 // Crea las columnas del masonry según el ancho del grid (estilo Pinterest).
@@ -865,6 +1185,8 @@ function previewErrEl(title, reason) {
 function renderCard(item, index) {
   const card = document.createElement("article");
   card.className = "card";
+  card.dataset.operantUrl = item.url; // actualización in-place de metadatos
+  state.cardEls.set(item.url, card);
   if (state.selected.has(item.url)) card.classList.add("selected");
   if (viewPrefs.dupes && item.type === "image" && dupMap.has(item.url)) card.classList.add("dup");
 
@@ -879,6 +1201,10 @@ function renderCard(item, index) {
   if (item.type === "image") {
     if (blobUrl) {
       thumb.appendChild(placeholderEl("IMG", "blob:"));
+    } else if (badPreviews.has(item.url)) {
+      // Preview roto conocido: NO reintentar la carga (petición muerta) —
+      // placeholder directo; el item ya ordena al final de la lista.
+      thumb.appendChild(placeholderEl("IMG", "preview no disponible"));
     } else {
       const img = document.createElement("img");
       img.loading = "lazy";
@@ -887,11 +1213,17 @@ function renderCard(item, index) {
       img.alt = "";
       img.src = item.url;
       img.addEventListener("error", () => {
+        markPreviewError(item.url);
         if (item.thumb && img.src !== item.thumb) {
           img.src = item.thumb;
         } else if (img.parentNode) {
           img.replaceWith(placeholderEl("IMG", "preview no disponible"));
         }
+      });
+      img.addEventListener("load", () => {
+        // Carga correcta: la URL sale del registro de previews rotos.
+        badPreviews.delete(item.url);
+        delete item._previewError;
       });
       if (item.w && item.h) {
         img.style.aspectRatio = `${item.w} / ${item.h}`;
@@ -925,19 +1257,28 @@ function renderCard(item, index) {
       }).catch(() => {});
     } else {
       thumb.appendChild(placeholderEl("▶", item.embed || item.ext || "VIDEO"));
+      // Streams (m3u8/mpd): generar POSTER real decodificando el primer frame.
+      // Fallback de geometría 16:9 mientras llega el poster (y su ratio real).
+      if (!item.embed && /\.(m3u8|mpd)(?:[?#].*)?$/i.test(item.url)) {
+        if (!item.w || !item.h) {
+          thumb.classList.add("has-ratio");
+          thumb.style.setProperty("--video-ratio", "16 / 9");
+        }
+        enqueueHlsThumb(item, thumb);
+      }
     }
     if (!item.embed && !blobUrl && !/\.mpd($|[?#])/i.test(item.url)) {
       setupVideoHover(card, thumb, item);
     }
     const play = document.createElement("span");
     play.className = "badge media-play";
-    play.textContent = "▶";
+    play.innerHTML = iconSvg("play", 11) || "▶";
     thumb.appendChild(play);
   } else if (item.type === "audio") {
     thumb.appendChild(placeholderEl("♪", item.ext || "AUDIO"));
     const play = document.createElement("span");
     play.className = "badge media-play";
-    play.textContent = "♪";
+    play.innerHTML = iconSvg("music", 11) || "♪";
     thumb.appendChild(play);
   } else {
     thumb.appendChild(placeholderEl("FILE", item.ext || ""));
@@ -989,7 +1330,7 @@ function renderCard(item, index) {
 
   const preview = document.createElement("button");
   preview.className = "icon-btn";
-  preview.textContent = "⤢";
+  preview.innerHTML = iconSvg("expand") || "⤢";
   preview.title = "Abrir preview";
   preview.setAttribute("aria-label", "Preview");
   preview.addEventListener("click", (ev) => {
@@ -999,15 +1340,13 @@ function renderCard(item, index) {
 
   const sel = document.createElement("button");
   sel.className = "icon-btn";
-  sel.textContent = state.selected.has(item.url) ? "✓" : "+";
+  paintSelBtn(sel, state.selected.has(item.url));
   sel.title = "Seleccionar (Shift+clic = rango, Ctrl+clic = alternar)";
   sel.setAttribute("aria-label", "Seleccionar");
-  if (state.selected.has(item.url)) sel.classList.add("sel-on");
   sel.addEventListener("click", (ev) => {
     ev.stopPropagation();
     handleSelectClick(item.url, index, ev);
-    sel.textContent = state.selected.has(item.url) ? "✓" : "+";
-    sel.classList.toggle("sel-on", state.selected.has(item.url));
+    paintSelBtn(sel, state.selected.has(item.url));
     card.classList.toggle("selected", state.selected.has(item.url));
     updateSelectionUI();
   });
@@ -1023,8 +1362,7 @@ function renderCard(item, index) {
     if (ev.target.closest("button")) return;
     if (ev.ctrlKey || ev.metaKey || ev.shiftKey) {
       handleSelectClick(item.url, index, ev);
-      sel.textContent = state.selected.has(item.url) ? "✓" : "+";
-      sel.classList.toggle("sel-on", state.selected.has(item.url));
+      paintSelBtn(sel, state.selected.has(item.url));
       card.classList.toggle("selected", state.selected.has(item.url));
       updateSelectionUI();
       return;
@@ -1050,7 +1388,8 @@ function lcBadge(text, cls) {
 function lcToolBtn(glyph, label, fn) {
   const b = document.createElement("button");
   b.className = "icon-btn";
-  b.textContent = glyph;
+  if (glyph && glyph.startsWith("<svg")) b.innerHTML = glyph;
+  else b.textContent = glyph;
   b.title = label;
   b.setAttribute("aria-label", label);
   b.addEventListener("click", (ev) => {
@@ -1063,6 +1402,8 @@ function lcToolBtn(glyph, label, fn) {
 function renderListCard(item, index) {
   const card = document.createElement("article");
   card.className = "card list-card";
+  card.dataset.operantUrl = item.url; // actualización in-place de metadatos
+  state.cardEls.set(item.url, card);
   if (state.selected.has(item.url)) card.classList.add("selected");
   if (viewPrefs.dupes && item.type === "image" && dupMap.has(item.url)) card.classList.add("dup");
 
@@ -1090,6 +1431,9 @@ function renderListCard(item, index) {
   if (item.type === "image") {
     if (blobUrl) {
       stage.appendChild(placeholderEl("IMG", "blob:"));
+    } else if (badPreviews.has(item.url)) {
+      // Preview roto conocido: NO reintentar la carga — placeholder directo.
+      stage.appendChild(placeholderEl("IMG", "preview no disponible"));
     } else {
       const img = document.createElement("img");
       img.loading = "lazy";
@@ -1098,6 +1442,7 @@ function renderListCard(item, index) {
       img.alt = "";
       img.src = item.url;
       img.addEventListener("error", () => {
+        markPreviewError(item.url);
         if (item.thumb && img.src !== item.thumb) {
           img.src = item.thumb;
         } else if (img.parentNode) {
@@ -1106,6 +1451,9 @@ function renderListCard(item, index) {
       });
       // Medición real al cargar: rellena el badge de dimensiones si faltaba.
       img.addEventListener("load", () => {
+        // Carga correcta: la URL sale del registro de previews rotos.
+        badPreviews.delete(item.url);
+        delete item._previewError;
         const nw = img.naturalWidth;
         const nh = img.naturalHeight;
         if (!nw || !nh) return;
@@ -1147,6 +1495,15 @@ function renderListCard(item, index) {
       }).catch(() => {});
     } else {
       stage.appendChild(placeholderEl("▶", item.embed || item.ext || "VIDEO"));
+      // Streams (m3u8/mpd): generar POSTER real decodificando el primer frame.
+      // Fallback de geometría 16:9 mientras llega el poster (y su ratio real).
+      if (!item.embed && /\.(m3u8|mpd)(?:[?#].*)?$/i.test(item.url)) {
+        if (!item.w || !item.h) {
+          stage.classList.add("has-ratio");
+          stage.style.setProperty("--video-ratio", "16 / 9");
+        }
+        enqueueHlsThumb(item, stage);
+      }
     }
     if (!item.embed && !blobUrl && !/\.mpd($|[?#])/i.test(item.url)) {
       setupVideoHover(card, stage, item);
@@ -1161,23 +1518,22 @@ function renderListCard(item, index) {
   const tb = document.createElement("div");
   tb.className = "lc-toolbar";
 
-  const sel = lcToolBtn(state.selected.has(item.url) ? "✓" : "+", "Seleccionar", () => {});
-  if (state.selected.has(item.url)) sel.classList.add("sel-on");
+  const sel = lcToolBtn("", "Seleccionar", () => {});
+  paintSelBtn(sel, state.selected.has(item.url));
   sel.addEventListener("click", (ev) => {
     ev.stopPropagation();
     handleSelectClick(item.url, index, ev);
-    sel.textContent = state.selected.has(item.url) ? "✓" : "+";
-    sel.classList.toggle("sel-on", state.selected.has(item.url));
+    paintSelBtn(sel, state.selected.has(item.url));
     card.classList.toggle("selected", state.selected.has(item.url));
     updateSelectionUI();
   });
   tb.appendChild(sel);
-  tb.appendChild(lcToolBtn("↗", "Abrir en pestaña nueva", () => {
+  tb.appendChild(lcToolBtn(iconSvg("external") || "↗", "Abrir en pestaña nueva", () => {
     chrome.tabs.create({ url: item.url }).catch(() => {});
   }));
   // Botones de acción por tipo (descarga / frame) con hover-para-revelar.
   tb.append(...typeActionButtons(item, index, card));
-  tb.appendChild(lcToolBtn("⤢", "Zoom (preview)", () => openPreview(item)));
+  tb.appendChild(lcToolBtn(iconSvg("expand") || "⤢", "Zoom (preview)", () => openPreview(item)));
 
   stage.appendChild(tb);
   card.appendChild(stage);
@@ -1195,8 +1551,7 @@ function renderListCard(item, index) {
     if (ev.target.closest("button")) return;
     if (ev.ctrlKey || ev.metaKey || ev.shiftKey) {
       handleSelectClick(item.url, index, ev);
-      sel.textContent = state.selected.has(item.url) ? "✓" : "+";
-      sel.classList.toggle("sel-on", state.selected.has(item.url));
+      paintSelBtn(sel, state.selected.has(item.url));
       card.classList.toggle("selected", state.selected.has(item.url));
       updateSelectionUI();
       return;
@@ -1278,40 +1633,329 @@ function setupImageHover(card, thumb, item) {
   card.addEventListener("click", cleanup);
 }
 
-// Hover de vídeo: preview mudo en loop (estilo YouTube).
+// Hover de vídeo: reproductor EN SITU con autoplay y controles.
+// PERSISTENCIA (anti-flash-negro): el player (elemento + engine hls.js/dash.js)
+// se CACHEA por URL — al salir del hover se pausa y desmonta, y al volver se
+// REUTILIZA el mismo elemento en su posición actual, sin recrear nada.
+// MUTE/ VOLUMEN PROPAGADOS: si el usuario desmutea un vídeo, los siguientes
+// hovers nacen desmuteados con el mismo volumen (media engagement lo permite).
+const hoverCache = new Map(); // url -> { v, engine } (recencia por inserción)
+const HOVER_CACHE_MAX = 8;
+let hoverMuted = true;
+let hoverVolume = 1;
+
+function hoverAcquire(item) {
+  let entry = hoverCache.get(item.url);
+  if (entry) {
+    hoverCache.delete(item.url);
+    hoverCache.set(item.url, entry); // refrescar recencia
+    return entry;
+  }
+  const v = document.createElement("video");
+  v.className = "hover-video";
+  v.muted = hoverMuted;
+  v.volume = hoverVolume;
+  v.loop = true;
+  v.playsInline = true;
+  v.autoplay = true;
+  v.controls = true;
+  // El fullscreen nativo muere en silencio dentro del side panel: ocultar el
+  // botón roto (la vía real es ⤢ → ⛶ ventana flotante).
+  try {
+    v.controlsList = "nofullscreen";
+  } catch {
+    /* navegadores sin controlsList */
+  }
+  v.addEventListener("volumechange", () => {
+    hoverMuted = v.muted;
+    hoverVolume = v.volume;
+  });
+  let engine = null;
+  if (/\.m3u8($|[?#])/i.test(item.url) && window.Hls && Hls.isSupported()) {
+    engine = new Hls({ autoStartLoad: true, maxBufferLength: 10 });
+    engine.on(Hls.Events.ERROR, (_e, data) => {
+      if (data.fatal) {
+        hoverCache.delete(item.url);
+        v.remove();
+      }
+    });
+    engine.loadSource(item.url);
+    engine.attachMedia(v);
+  } else {
+    v.src = item.url;
+  }
+  entry = { v, engine, item };
+  hoverCache.set(item.url, entry);
+  // Evicción LRU: congelar el frame como poster permanente ANTES de destruir
+  // el player (así la card conserva preview aunque su player sea expulsado).
+  while (hoverCache.size > HOVER_CACHE_MAX) {
+    const oldestKey = hoverCache.keys().next().value;
+    const oldest = hoverCache.get(oldestKey);
+    hoverCache.delete(oldestKey);
+    try {
+      if (oldest.v.readyState >= 2 && oldest.v.videoWidth && !oldest.item.thumb) {
+        const c = document.createElement("canvas");
+        c.width = oldest.v.videoWidth;
+        c.height = oldest.v.videoHeight;
+        c.getContext("2d").drawImage(oldest.v, 0, 0);
+        if (!canvasIsBlank(c)) {
+          oldest.item.thumb = c.toDataURL("image/jpeg", 0.72);
+          oldest.item.w = oldest.v.videoWidth;
+          oldest.item.h = oldest.v.videoHeight;
+          const card = state.cardEls.get(oldest.item.url);
+          const stageEl = card?.querySelector(".lc-stage, .card-thumb");
+          if (stageEl) paintPoster(stageEl, oldest.item);
+        }
+      }
+    } catch { /* frame no extraíble: sin poster */ }
+    try { oldest.engine?.destroy?.(); } catch { /* ya destruido */ }
+    try { oldest.v.remove(); } catch { /* idem */ }
+  }
+  return entry;
+}
+
 function setupVideoHover(card, thumb, item) {
-  let v = null;
+  let current = null; // { v, engine } activo bajo ESTE hover
   const stop = () => {
-    if (v) {
-      v.pause();
-      v.src = "";
-      v.remove();
-      v = null;
-    }
+    if (!current) return;
+    // EL REPRODUCTOR SE QUEDA montado en la card, EN PAUSA: la preview ES el
+    // reproductor. El frame congelado solo actúa como poster cuando la caché
+    // LRU expulsa este player (ver hoverAcquire).
+    current.v.pause();
+    current = null;
   };
   card.addEventListener(
     "mouseenter",
     () => {
-      if (v) return;
-      v = document.createElement("video");
-      v.muted = true;
-      v.loop = true;
-      v.playsInline = true;
-      v.preload = "metadata";
-      v.src = item.url;
-      v.addEventListener("error", stop);
-      v.addEventListener("loadeddata", () => v.play().catch(() => {}));
-      v.addEventListener("playing", () => {
-        const ph = thumb.querySelector(".placeholder");
-        if (ph) ph.remove();
-        if (v && v.parentNode !== thumb) thumb.appendChild(v);
-      });
+      if (current) return;
+      const { v } = hoverAcquire(item);
+      current = { v };
+      // EN SITU: reemplaza al placeholder y hereda la geometría del stage
+      // (el poster ya le dio su relación de aspecto real).
+      thumb.querySelector(".placeholder")?.remove();
       thumb.appendChild(v);
+      const tryPlay = () => {
+        if (!v) return;
+        const p = v.play();
+        if (p) p.catch(() => {
+          // Unmuteado bloqueado por política de autoplay: reintentar mudo.
+          if (!v.muted) {
+            v.muted = true;
+            hoverMuted = true;
+            v.play().catch(() => {});
+          }
+        });
+      };
+      v.addEventListener("loadeddata", tryPlay);
+      v.addEventListener("canplay", tryPlay);
+      tryPlay();
     },
     { passive: true }
   );
   card.addEventListener("mouseleave", stop, { passive: true });
   card.addEventListener("click", stop);
+}
+
+// --- Posters reales para cards de stream (m3u8/mpd) ---
+// Una card m3u8 sin miniatura era una caja vacía: no hay frame estático que
+// robar. Solución experta: decodificar el PRIMER FOTOGRAMA del stream
+// headlessly (hls.js/dash.js → MSE → canvas SIN contaminación — los bytes
+// llegan por buffer, no por src cross-origin) y usarlo como poster. Cola con
+// concurrencia acotada (3) y REINTENTOS reales (los intentos saltados por un
+// re-render no se consumen). Además, el propio hover congela su frame al
+// salir como poster — la preview existe SIEMPRE, hover o no.
+const hlsThumbState = { queue: [], active: 0, max: 3, attempts: new Map() };
+const HLS_THUMB_MAX_ATTEMPTS = 2;
+
+function enqueueHlsThumb(item, stage) {
+  if (!stage || item.thumb) return;
+  const attempts = hlsThumbState.attempts.get(item.url) || 0;
+  if (attempts >= HLS_THUMB_MAX_ATTEMPTS) return;
+  hlsThumbState.attempts.set(item.url, attempts + 1);
+  hlsThumbState.queue.push({ item, stage });
+  pumpHlsThumbs();
+}
+
+function pumpHlsThumbs() {
+  while (hlsThumbState.active < hlsThumbState.max && hlsThumbState.queue.length) {
+    const job = hlsThumbState.queue.shift();
+    if (!job.stage.isConnected) {
+      // La card salió del DOM (re-render): NO consumir el intento — la próxima
+      // renderización re-encola y lo reintenta.
+      hlsThumbState.attempts.delete(job.item.url);
+      continue;
+    }
+    hlsThumbState.active++;
+    captureHlsFrame(job.item).then((frame) => {
+      hlsThumbState.active--;
+      if (frame && !job.item.thumb) {
+        job.item.thumb = frame.dataUrl;
+        if (frame.w) job.item.w = frame.w;
+        if (frame.h) job.item.h = frame.h;
+        // Pintar el poster en la card si sigue conectada (render atómico:
+        // solo este nodo cambia, el grid no se reconstruye).
+        const card = state.cardEls.get(job.item.url);
+        if (card && card.isConnected) {
+          const stageEl = card.querySelector(".lc-stage, .card-thumb");
+          if (stageEl) paintPoster(stageEl, job.item);
+          const dim = card.querySelector(".lc-badge.dim");
+          if (dim && frame.w && frame.h) {
+            dim.hidden = false;
+            dim.textContent = `${frame.w}×${frame.h}`;
+          }
+        }
+      }
+      pumpHlsThumbs();
+    });
+  }
+}
+
+// Pinta el poster de un item en su stage/thumb (idempotente) y fija la
+// relación de aspecto real.
+function paintPoster(stageEl, item) {
+  if (!stageEl || !item.thumb) return;
+  stageEl.querySelector(".placeholder")?.remove();
+  if (stageEl.querySelector("img.poster")) return;
+  const img = document.createElement("img");
+  img.className = "poster";
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.alt = "";
+  img.src = item.thumb;
+  stageEl.insertBefore(img, stageEl.querySelector(".lc-toolbar"));
+  if (item.w && item.h) {
+    stageEl.classList.add("has-ratio");
+    stageEl.style.setProperty("--video-ratio", `${item.w} / ${item.h}`);
+  }
+}
+
+// Vía primaria del poster m3u8 SIN hls.js headless: init + PRIMER segmento
+// de la variante vídeo, concatenados → fragmento fMP4 decodificable en un
+// blob local (mismo principio que el motor de descarga). Ligero (solo el
+// primer trozo) y determinista. Devuelve { dataUrl, w, h } | null.
+async function captureHlsFrameViaSegments(item) {
+  try {
+    const res = await fetch(item.url, { credentials: "omit", cache: "no-store" });
+    if (!res.ok) return null;
+    const text = await res.text();
+    if (!text.includes("#EXTM3U")) return null;
+    let playlistText = text;
+    let playlistUrl = item.url;
+    if (text.includes("#EXT-X-STREAM-INF")) {
+      // Master: elegir la mejor variante vídeo y leer SU media playlist.
+      const m = await OperantMedia.parseManifest(item.url, "application/vnd.apple.mpegurl");
+      const vids = (m?.segments || []).filter((s) => !s.audioOnly && s.url);
+      if (!vids.length) return null;
+      const best = vids.reduce((a, b) => (Number(b.id) > Number(a.id) ? b : a));
+      const res2 = await fetch(best.url, { credentials: "omit", cache: "no-store" });
+      if (!res2.ok) return null;
+      playlistText = await res2.text();
+      playlistUrl = best.url;
+    }
+    const base = playlistUrl.slice(0, playlistUrl.lastIndexOf("/") + 1);
+    const abs = (u) => {
+      try {
+        return new URL(u, base).href;
+      } catch {
+        return null;
+      }
+    };
+    const mapUri = (playlistText.match(/#EXT-X-MAP:URI="([^"]+)"/i) || [])[1];
+    const initUrl = mapUri ? abs(mapUri) : null;
+    let firstSeg = null;
+    for (const l of playlistText.split(/\r?\n/)) {
+      const t = l.trim();
+      if (t && !t.startsWith("#")) {
+        firstSeg = abs(t);
+        break;
+      }
+    }
+    if (!firstSeg) return null;
+    const parts = [];
+    if (initUrl) {
+      const ri = await fetch(initUrl, { credentials: "omit", cache: "no-store" });
+      if (!ri.ok) return null;
+      parts.push(new Uint8Array(await ri.arrayBuffer()));
+    }
+    const rs = await fetch(firstSeg, { credentials: "omit", cache: "no-store" });
+    if (!rs.ok) return null;
+    parts.push(new Uint8Array(await rs.arrayBuffer()));
+    const blob = new Blob(parts, { type: "video/mp4" });
+    const localUrl = URL.createObjectURL(blob);
+    try {
+      const v = document.createElement("video");
+      v.muted = true;
+      v.playsInline = true;
+      v.src = localUrl;
+      const dataUrl = await frameFromVideoElement(v, 8000);
+      return dataUrl ? { dataUrl, w: v.videoWidth, h: v.videoHeight } : null;
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(localUrl), 10000);
+    }
+  } catch {
+    return null;
+  }
+}
+
+function captureHlsFrame(item) {
+  // 1) Vía segmentos (init + primer fragmento, sin hls.js headless).
+  return captureHlsFrameViaSegments(item).then((viaSeg) => {
+    if (viaSeg) return viaSeg;
+    console.warn("[operant] poster m3u8 vía segmentos falló; reintento con engine:", item.url.slice(0, 120));
+    // 2) Respaldo: engine headless (hls.js/dash.js) con vídeo oculto en DOM.
+    return new Promise((resolve) => {
+      const v = document.createElement("video");
+      v.muted = true;
+      v.playsInline = true;
+      v.style.cssText = "position:absolute;width:1px;height:1px;opacity:0;pointer-events:none";
+      document.documentElement.appendChild(v); // en DOM: el camino bien conocido
+      let engine = null;
+      let done = false;
+      const finish = (r) => {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        try { engine?.destroy?.(); } catch { /* ya destruido */ }
+        try { v.remove(); } catch { /* cleanup defensivo */ }
+        resolve(r);
+      };
+      const t = setTimeout(() => finish(null), 12000);
+      try {
+        if (/\.m3u8($|[?#])/i.test(item.url) && window.Hls && Hls.isSupported()) {
+          engine = new Hls({ autoStartLoad: true, maxBufferLength: 2 });
+          engine.on(Hls.Events.ERROR, (_e, data) => {
+            if (data.fatal) finish(null);
+          });
+          engine.loadSource(item.url);
+          engine.attachMedia(v);
+        } else if (/\.mpd($|[?#])/i.test(item.url) && window.dashjs && dashjs.MediaPlayer) {
+          const d = dashjs.MediaPlayer().create();
+          d.on(dashjs.MediaPlayer.events.ERROR, () => finish(null));
+          d.initialize(v, item.url, false);
+          engine = { destroy: () => d.reset() };
+        } else {
+          finish(null);
+          return;
+        }
+        v.addEventListener(
+          "loadeddata",
+          () => {
+            // frameFromVideoElement valida el frame (anti-negro) y hace seek
+            // de recaptura si el primero está en blanco.
+            frameFromVideoElement(v).then((dataUrl) => {
+              if (!dataUrl) return finish(null);
+              finish({ dataUrl, w: v.videoWidth, h: v.videoHeight });
+            });
+          },
+          { once: true }
+        );
+        v.addEventListener("error", () => finish(null), { once: true });
+      } catch (e) {
+        console.warn("[operant] poster m3u8: engine error:", String(e));
+        finish(null);
+      }
+    });
+  });
 }
 
 // --- Selección ---
@@ -1416,6 +2060,7 @@ const SCAN_PHASE_LABELS = {
   enlaces: "Extrayendo enlaces de alta resolución",
   atributos: "Analizando atributos y metadatos",
   medios: "Detectando vídeos y audio",
+  recursos: "Recolectando recursos, CSS y HTML",
   estilos: "Evaluando estilos y fondos CSS",
   done: "Escaneo completado",
 };
@@ -1463,46 +2108,119 @@ function showScanProgress(done, total, phase, found) {
   }, 4000);
 }
 
-// Captura el PRIMER fotograma de un vídeo directo (mp4/webm) para usarlo como
-// thumbnail en la card. Usa un <video> oculto + canvas; devuelve dataURL o null.
-function videoFirstFrame(src) {
+// --- Extracción de fotogramas reales (posters de vídeo) ---
+// Detecta un frame EN BLANCO (todos los píxeles muestreados idénticos): los
+// vídeos arrancan con frames negros antes del primer fotograma real — sin
+// esta validación, los posters salen negros.
+function canvasIsBlank(canvas) {
+  try {
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width;
+    const h = canvas.height;
+    const stepX = Math.max(1, Math.floor(w / 12));
+    const stepY = Math.max(1, Math.floor(h / 12));
+    let first = null;
+    for (let y = 0; y < h; y += stepY) {
+      for (let x = 0; x < w; x += stepX) {
+        const d = ctx.getImageData(x, y, 1, 1).data;
+        const key = `${d[0]},${d[1]},${d[2]}`;
+        if (first === null) first = key;
+        else if (key !== first) return false;
+      }
+    }
+    return true;
+  } catch {
+    return false; // canvas contaminado: tratado como no extraíble
+  }
+}
+
+// Frame de un <video> ya cargado: captura + validación de blanco + RE-BÚSQUEDA
+// (seek al 10% o 0.5s) si el primer frame es negro.
+function frameFromVideoElement(v, timeoutMs = 6000) {
   return new Promise((resolve) => {
-    try {
-      const v = document.createElement("video");
-      v.muted = true;
-      v.playsInline = true;
-      v.preload = "metadata";
-      v.src = src;
-      v.crossOrigin = "anonymous";
-      let done = false;
-      const finish = (url) => {
-        if (done) return;
-        done = true;
-        v.removeAttribute("src");
-        v.load();
-        resolve(url);
-      };
-      const timer = setTimeout(() => finish(null), 8000);
-      v.addEventListener("loadeddata", () => {
-        try {
-          const canvas = document.createElement("canvas");
-          canvas.width = v.videoWidth || 640;
-          canvas.height = v.videoHeight || 360;
-          const ctx = canvas.getContext("2d");
-          if (!ctx) { clearTimeout(timer); finish(null); return; }
-          ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
-          clearTimeout(timer);
-          finish(canvas.toDataURL("image/jpeg", 0.7));
-        } catch {
-          clearTimeout(timer);
-          finish(null);
+    let done = false;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      resolve(r);
+    };
+    const t = setTimeout(() => finish(null), timeoutMs);
+    const capture = () => {
+      try {
+        const w = v.videoWidth;
+        const h = v.videoHeight;
+        if (!w || !h) return finish(null);
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        c.getContext("2d").drawImage(v, 0, 0, w, h);
+        if (!canvasIsBlank(c)) return finish(c.toDataURL("image/jpeg", 0.72));
+        // Frame en blanco: avanzar y recapturar (una vez).
+        if (!v._seekedForFrame) {
+          v._seekedForFrame = true;
+          const target = Math.min(0.5, (isFinite(v.duration) ? v.duration : 2) * 0.1 || 0.2);
+          v.addEventListener(
+            "seeked",
+            () => {
+              try {
+                const c2 = document.createElement("canvas");
+                c2.width = v.videoWidth;
+                c2.height = v.videoHeight;
+                c2.getContext("2d").drawImage(v, 0, 0, v.videoWidth, v.videoHeight);
+                finish(canvasIsBlank(c2) ? null : c2.toDataURL("image/jpeg", 0.72));
+              } catch {
+                finish(null);
+              }
+            },
+            { once: true }
+          );
+          try {
+            v.currentTime = target;
+          } catch {
+            finish(null);
+          }
+          return;
         }
-      }, { once: true });
-      v.addEventListener("error", () => { clearTimeout(timer); finish(null); }, { once: true });
-    } catch {
-      resolve(null);
+        finish(null);
+      } catch {
+        finish(null);
+      }
+    };
+    if (v.readyState >= 2 && v.videoWidth) capture();
+    else {
+      v.addEventListener("loadeddata", capture, { once: true });
+      v.addEventListener("error", () => finish(null), { once: true });
     }
   });
+}
+
+// Frame de un vídeo DIRECTO (mp4/webm). Un <video src> cross-origin CONTAMINA
+// el canvas (imposible extraer el frame, con o sin host permissions). La vía
+// experta: fetch por rangos de los primeros MB (host permissions, sin CORS)
+// → blob URL del MISMO origen → canvas limpio.
+async function videoFirstFrame(src) {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 10000);
+    const res = await fetch(src, {
+      headers: { Range: "bytes=0-2097151" }, // 2MB: moov + primeros GOPs (faststart)
+      cache: "force-cache",
+      signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    if (!res.ok && res.status !== 206) return null;
+    const blob = await res.blob();
+    if (blob.size < 1024) return null;
+    const localUrl = URL.createObjectURL(blob);
+    try {
+      return await frameFromVideoElement(Object.assign(document.createElement("video"), { muted: true, playsInline: true, preload: "auto", src: localUrl }));
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(localUrl), 10000);
+    }
+  } catch {
+    return null;
+  }
 }
 
 // --- Lightbox de imágenes (zoom con rueda / botones + navegación) ---
@@ -1540,6 +2258,7 @@ function lbShow() {
     lbImg.src = "";
   } else {
     lbImg.onerror = () => {
+      markPreviewError(item.url);
       if (item.thumb && lbImg.src !== item.thumb) {
         lbImg.src = item.thumb;
         showLbErr("Mostrando miniatura de la página (el servidor externo bloqueó el acceso por CORS/403).");
@@ -1632,6 +2351,20 @@ lbOpen.addEventListener("click", () => {
 let hlsInstance = null;
 let dashInstance = null;
 let vdItem = null;
+// Navegación ← → sobre los vídeos visibles (paridad con el lightbox de imágenes).
+let vdList = [];
+let vdIndex = -1;
+
+function vdUpdateNav() {
+  vdPrev.hidden = vdIndex <= 0;
+  vdNext.hidden = vdIndex < 0 || vdIndex >= vdList.length - 1;
+}
+
+function vdNav(delta) {
+  const next = vdIndex + delta;
+  if (next < 0 || next >= vdList.length) return;
+  openVideoPlayer(vdList[next]);
+}
 
 function showVdErr(text) {
   vdErr.hidden = false;
@@ -1694,6 +2427,10 @@ async function fetchEmbedMeta(item) {
 
 function openVideoPlayer(item) {
   vdItem = item;
+  // Navegación ← → sobre los vídeos visibles de la vista actual.
+  vdList = lastFiltered.filter((it) => it.type === "video");
+  vdIndex = vdList.findIndex((it) => it.url === item.url);
+  vdUpdateNav();
   vdTitle.textContent = itemName(item);
   vdMeta.textContent = `${item.url} · ${metaString(item)}`;
   vdErr.hidden = true;
@@ -1800,6 +2537,43 @@ function openVideoPlayer(item) {
 }
 
 vdClose.addEventListener("click", () => videoDialog.close());
+// PANTALLA COMPLETA REAL: el side panel no puede ir a fullscreen (superficie
+// del navegador) — el botón nativo del reproductor muere en silencio. Vía
+// experta: intentar fullscreen del elemento y, si la superficie lo bloquea,
+// abrir una VENTANA FLOTANTE con reproductor propio (fullscreen nativo OK).
+function openVideoPopout(item) {
+  const url =
+    chrome.runtime.getURL("panel/player.html") +
+    "?src=" +
+    encodeURIComponent(item.url) +
+    "&name=" +
+    encodeURIComponent(itemName(item));
+  chrome.windows.create({ url, type: "popup", width: 980, height: 620 }).catch(() => {
+    statusText.textContent = "No se pudo abrir la ventana flotante.";
+  });
+}
+vdPopout.addEventListener("click", async () => {
+  if (!vdItem) return;
+  try {
+    await vdEl.requestFullscreen();
+    return; // la superficie lo permite: fullscreen real del elemento
+  } catch {
+    /* side panel: vía popout */
+  }
+  openVideoPopout(vdItem);
+});
+vdPrev.addEventListener("click", () => vdNav(-1));
+vdNext.addEventListener("click", () => vdNav(1));
+// Teclado del reproductor: ← → navegan entre vídeos visibles, Esc cierra.
+videoDialog.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowLeft") {
+    vdNav(-1);
+    e.preventDefault();
+  } else if (e.key === "ArrowRight") {
+    vdNav(1);
+    e.preventDefault();
+  }
+});
 videoDialog.addEventListener("cancel", () => videoDialog.close());
 videoDialog.addEventListener("close", () => {
   if (hlsInstance) {
@@ -2152,12 +2926,80 @@ btnExport.addEventListener("click", async () => {
 });
 
 // --- Descargas ---
+// Observa el estado final REAL de una descarga del gestor de Chrome (igual que
+// el SW): { ok, bytes } al completarse o { ok: false, error } al interrumpirse.
+// Es la pieza que impide afirmar "descargado" cuando el servidor devolvió 403.
+function monitorDownload(id) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (r) => {
+      if (settled) return;
+      settled = true;
+      try { chrome.downloads.onChanged.removeListener(listener); } catch { /* ya removido */ }
+      resolve(r);
+    };
+    const listener = (delta) => {
+      if (delta.id !== id || !delta.state) return;
+      if (delta.state.current === "complete") {
+        chrome.downloads.search({ id }, (r) => {
+          const d = r && r[0];
+          finish({ ok: true, bytes: (d && d.fileSize) || 0 });
+        });
+      } else if (delta.state.current === "interrupted") {
+        chrome.downloads.search({ id }, (r) => {
+          const d = r && r[0];
+          finish({ ok: false, error: `descarga interrumpida (${(d && d.error) || "desconocido"})` });
+        });
+      }
+    };
+    chrome.downloads.onChanged.addListener(listener);
+    // Carrera: el evento pudo dispararse antes de registrar el listener.
+    chrome.downloads.search({ id }, (r) => {
+      const d = r && r[0];
+      if (!d) return finish({ ok: false, error: "la descarga no se pudo iniciar" });
+      if (d.state === "complete") finish({ ok: true, bytes: d.fileSize || 0 });
+      else if (d.state === "interrupted") finish({ ok: false, error: `descarga interrumpida (${d.error || "desconocido"})` });
+    });
+  });
+}
+
 // Jerarquía de descarga de vídeo (PARTE B del rediseño):
 //   1. URL directa (dom / network con .mp4/.webm/.mov…) -> cola por chunks, sin yt-dlp.
 //   2. Manifiesto HLS/DASH (.m3u8/.mpd) -> intentar parseo propio para ofrecer
 //      calidades sin yt-dlp; si el parseo no da una URL descargable, caer a yt-dlp.
 //   3. Embed de plataforma (YouTube/Vimeo…) -> yt-dlp como único camino viable.
+// El permiso `cookies` es OPCIONAL y se pide bajo gesto de usuario (Chrome
+// solo muestra el diálogo la primera vez; después se resuelve al instante).
+//
+// Por qué hace falta: el service worker no puede leer cookies HttpOnly sin ese
+// permiso, así que sus fetch contra contenido autenticado fallan con 403 aunque
+// la página los esté mostrando. `chrome.downloads.download` sí lleva las
+// cookies del perfil (va por la pila de red del navegador), pero el problema
+// típico es el Referer, y de eso se ocupa DNR. Este permiso cierra el hueco
+// restante SIN declararlo como permiso obligatorio: se pide al descargar, que
+// es cuando el usuario tiene contexto para entenderlo, y se puede revocar.
+let cookiesPermAsked = false;
+function ensureCookiesPermission() {
+  if (cookiesPermAsked) return;
+  cookiesPermAsked = true;
+  try {
+    if (!chrome.permissions || !chrome.permissions.request) return;
+    chrome.permissions.request({ permissions: ["cookies"] }, (granted) => {
+      // Si se perdió el gesto, el SW responderá con lastError al comprobarlo:
+      // se ignora y la descarga sigue su curso sin cookies.
+      if (!granted || chrome.runtime.lastError) return;
+      chrome.runtime.sendMessage({ type: "auth-permission-changed" }).catch(() => {});
+    });
+  } catch {
+    /* el panel puede no tener el API de permisos: no es fatal */
+  }
+}
+
 async function downloadOne(item, indicator = null) {
+  // Primera sentencia a propósito: `permissions.request` exige un gesto de
+  // usuario vivo, y cualquier `await` anterior lo consumiría.
+  ensureCookiesPermission();
+
   // 1. IMÁGENES Y ARCHIVOS DIRECTOS:
   // Nunca deben invocar yt-dlp, ffmpeg, DASH, HLS ni selectores de calidad de vídeo.
   if (item.type === "image" || item.type === "file") {
@@ -2174,8 +3016,14 @@ async function downloadOne(item, indicator = null) {
         return;
       }
 
-      await chrome.downloads.download({ url: item.url, filename: itemName(item), conflictAction: "uniquify" });
-      statusText.textContent = `Descarga iniciada: ${itemName(item)}`;
+      await chrome.downloads.download({ url: item.url, filename: itemName(item), conflictAction: "uniquify" }).then(async (id) => {
+        // HONESTIDAD: el id solo significa "descarga iniciada". Se espera el
+        // estado final real antes de afirmar nada; si se interrumpe (403,
+        // anti-hotlink, red), se lanza y se activa la cadena de fallback.
+        const r = await monitorDownload(id);
+        if (!r.ok) throw new Error(r.error);
+        statusText.textContent = `Descarga completada: ${itemName(item)} (${formatBytes(r.bytes)})`;
+      });
       recordHistory(item);
       if (indicator) indicator.success();
       return;
@@ -2203,6 +3051,23 @@ async function downloadOne(item, indicator = null) {
   }
 
   const method = item.method || (item.embed ? "embed" : item.source === "network" ? "network" : "dom");
+
+  // Vídeo blob: (MSE — X/Instagram): el blob vive en la página y ni el panel
+  // ni yt-dlp pueden leerlo. La cadena verificada del SW resuelve la URL de
+  // red real capturada por webRequest (mismo camino que el overlay).
+  if (item.type === "video" && item.url.startsWith("blob:")) {
+    statusText.textContent = `Resolviendo el stream de ${itemName(item)}…`;
+    const r = await chrome.runtime
+      .sendMessage({ type: "overlay-download", url: "", filename: itemName(item), kind: "video", blobOnly: true })
+      .catch((e) => ({ ok: false, error: String(e?.message || e) }));
+    if (r?.ok) {
+      statusText.textContent = r.note || `Descargado: ${itemName(item)}`;
+      recordHistory(item);
+    } else {
+      statusText.textContent = `No se pudo descargar: ${r?.error || "stream no capturado. Reproduce el vídeo en la página e inténtalo de nuevo."}`;
+    }
+    return;
+  }
 
   // Embeds y vídeos de plataforma -> yt-dlp.
   if (method === "embed") {
@@ -2239,6 +3104,26 @@ async function downloadOne(item, indicator = null) {
   // falta el host nativo (ffmpeg no aporta nada en una única calidad: el
   // fMP4 concatenado ya es un MP4 válido).
   if (c.strategy === "manifest" && c.manifest?.type === "hls") {
+    // La URL capturada suele ser la VARIANTE de un master con audio separado
+    // (X/Twitter): resolver el master para muxear vídeo+audio. Sin master o
+    // sin companion, se entrega la variante tal cual con nota honesta.
+    const candidates = state.items
+      .filter((i) => i.type === "video" && /\.m3u8/i.test(i.url) && i.url !== item.url)
+      .map((i) => i.url);
+    const found = await OperantMedia.findHlsMaster(item.url, candidates);
+    if (found?.variant?.audioUrl) {
+      // El companion se decide por la RESPUESTA REAL del SW (la caché de
+      // herramientas puede no estar inicializada en el momento del clic).
+      statusText.textContent = "Descargando vídeo + audio (HLS) y uniéndolos con el companion…";
+      const res = await chrome.runtime.sendMessage({
+        type: "ffmpeg-op",
+        url: found.variant.url,
+        op: "hls-dash",
+        options: { audioUrl: found.variant.audioUrl, filename: itemName(item) },
+      });
+      if (!res?.ok) statusText.textContent = res?.error || "Error al procesar el manifiesto.";
+      return;
+    }
     await runHlsFast(item, item.url);
     return;
   }
@@ -2277,7 +3162,7 @@ async function downloadOne(item, indicator = null) {
     return;
   }
   statusText.textContent = `Descargando ${itemName(item)}… (cola de chunks)`;
-  const pageUrl = state.tab?.url || "";
+  const pageUrl = state.pageUrl || "";
   // Anti-hotlink: si hay una página real de origen, crear la regla DNR efímera
   // que inyecta su Referer a las peticiones de la extensión (verificado: la
   // regla aplica también al fetch del panel — la cola por chunks descarga así
@@ -2328,7 +3213,7 @@ async function downloadInPageFallback(item) {
         type: "sw-fetch-blob",
         url: item.url,
         tabId: state.tabId,
-        pageUrl: state.tab?.url || "",
+        pageUrl: state.pageUrl || "",
         filename: itemName(item),
       }),
       120000
@@ -2370,40 +3255,57 @@ async function downloadInPageFallback(item) {
 // por segmento: cientos de reglas reventarían el límite), entrega como .mp4
 // (fMP4) o .ts (MPEG-TS) vía el createObjectURL del panel.
 // Pausable vía AbortController (downloadHls ya lo soporta); reanudar = reinicio.
+// Devuelve una PROMESA {ok} | {ok:false,error} que se resuelve al terminar el
+// job — permite al flujo de calidades encadenar fallbacks (navegador→host).
 function runHlsFast(item, playlistUrl) {
-  const job = {
-    id: dlNextId++,
-    url: playlistUrl,
-    name: itemName(item).replace(/\.(m3u8|mpd)$/i, ""),
-    status: "queued",
-    received: 0,
-    total: 0,
-    error: null,
-    dnrUrl: null,
-    indicator: null,
-    kind: "hls",
-    ac: new AbortController(),
-    paused: false,
-    failed: false,
-    chunks: null,
-    count: 0,
-    nextChunk: 0,
-    item,
-    hostsTouched: new Set(),
-  };
-  dlJobs.set(job.id, job);
-  dlBroadcast();
-  dlPump();
+  return new Promise((resolve) => {
+    const job = {
+      id: dlNextId++,
+      url: playlistUrl,
+      name: itemName(item).replace(/\.(m3u8|mpd)$/i, ""),
+      status: "queued",
+      received: 0,
+      total: 0,
+      error: null,
+      dnrUrl: null,
+      indicator: null,
+      kind: "hls",
+      ac: new AbortController(),
+      paused: false,
+      failed: false,
+      chunks: null,
+      count: 0,
+      nextChunk: 0,
+      item,
+      hostsTouched: new Set(),
+      _resolve: resolve,
+    };
+    dlJobs.set(job.id, job);
+    dlBroadcast();
+    dlPump();
+  });
 }
 
 async function dlRunHlsJob(job) {
-  const pageUrl = state.tab?.url || "";
+  const pageUrl = state.pageUrl || "";
   const hostsTouched = job.hostsTouched;
+  // ¿El MP4 fMP4 concatenado lleva pista de audio? (scan de cajas en los
+  // primeros 3MB: el init con moov/trak va al principio). Solo para AVISAR
+  // honestamente — el archivo se entrega igual.
+  const blobHasAudioTrack = async (blob) => {
+    try {
+      const ab = await blob.slice(0, 3 * 1024 * 1024).arrayBuffer();
+      return new TextDecoder("latin1").decode(new Uint8Array(ab)).includes("soun");
+    } catch {
+      return true; // no determinar: no avisar en falso
+    }
+  };
   try {
     const result = await HLSFast.downloadHls({
       url: job.url,
       concurrency: 6,
       signal: job.ac.signal,
+      requireAudio: true, // variante muda (audio separado) → error honesto
       beforeFetch: async (segUrl) => {
         try {
           const host = new URL(segUrl).hostname;
@@ -2441,13 +3343,19 @@ async function dlRunHlsJob(job) {
     dlReportIndicator(job, "done");
     dlBroadcast();
     const mb = (result.bytes / 1048576).toFixed(1);
-    statusText.textContent = `Descargado por ruta rápida: ${result.segments} segmentos, ${mb} MB${result.encrypted ? " (AES-128 descifrado)" : ""}.`;
+    const withAudio = await blobHasAudioTrack(result.blob);
+    statusText.textContent = `Descargado por ruta rápida: ${result.segments} segmentos, ${mb} MB${result.encrypted ? " (AES-128 descifrado)" : ""}.` +
+      (withAudio ? "" : " ATENCIÓN: sin pista de audio (esta variante separa el audio — usa las calidades con el companion para unirlo).");
     recordHistory(job.item);
+    job._resolve?.({ ok: true });
+    job._resolve = null;
   } catch (e) {
     if (job.paused && !job.live) {
       // Sin limpiar las reglas DNR por host: la reanudación las reutiliza.
       job.status = "paused";
       dlBroadcast();
+      job._resolve?.({ ok: false, error: "en pausa" });
+      job._resolve = null;
       return;
     }
     if (job.paused && job.live) {
@@ -2455,12 +3363,16 @@ async function dlRunHlsJob(job) {
       // aquí solo llega un error simultáneo — tratar como cierre limpio.
       job.status = "done";
       dlBroadcast();
+      job._resolve?.({ ok: true });
+      job._resolve = null;
       return;
     }
     job.status = "error";
     job.error = String(e?.message || e);
     dlReportIndicator(job, "error");
     statusText.textContent = `Ruta rápida falló: ${job.error}`;
+    job._resolve?.({ ok: false, error: job.error });
+    job._resolve = null;
   }
   dlBroadcast();
   for (const host of hostsTouched) {
@@ -2516,7 +3428,7 @@ function openManifestQuality(item, parsed) {
     rb.value = q.id;
     rb.checked = true;
     const span = document.createElement("span");
-    span.textContent = `${q.label} — ${q.url}`;
+    span.textContent = q.audioUrl ? `${q.label} (audio en pista separada — se une con el companion) — ${q.url}` : `${q.label} — ${q.url}`;
     label.append(rb, span);
     label.addEventListener("click", () => {
       qualityRun.disabled = false;
@@ -2642,6 +3554,26 @@ async function dlPump() {
   }
 }
 
+// Último recurso de la cola: el SW captura el recurso con el Referer real de
+// la página (regla DNR efímera) y lo entrega verificado. Se usa UNA vez por
+// job, solo cuando la cola directa falló — así cualquier medio con
+// anti-hotlink tiene su cadena completa antes de declarar un error.
+async function dlSwFallback(job) {
+  if (!/^https?:/i.test(job.url)) return false;
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: "sw-fetch-blob",
+      url: job.url,
+      tabId: state.tabId,
+      pageUrl: state.pageUrl || "",
+      filename: job.name,
+    });
+    return !!res?.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function dlRunJob(job) {
   if (job.kind === "hls") return dlRunHlsJob(job);
   const signal = job.ac.signal;
@@ -2650,6 +3582,13 @@ async function dlRunJob(job) {
       const probe = await fetch(job.url, { method: "HEAD", cache: "no-store", signal });
       const acceptRanges = (probe.headers.get("accept-ranges") || "").toLowerCase() === "bytes";
       const total = Number(probe.headers.get("content-length") || 0);
+      // Verificación honesta ANTES de descargar: si el servidor responde con
+      // una página HTML (anti-hotlink / sesión / URL expirada), fallar YA con
+      // la causa real — nunca entregar un "vídeo" que es HTML.
+      const probeCt = (probe.headers.get("content-type") || "").toLowerCase();
+      if (/text\/html|application\/xhtml/i.test(probeCt)) {
+        throw new Error("El servidor devolvió una página HTML en lugar del archivo (protección anti-hotlink o sesión requerida).");
+      }
 
       if (!acceptRanges || total <= DL_CHUNK || /^blob:|^data:/.test(job.url)) {
         // Ruta single-shot: sin estado de chunks, la pausa aborta y la
@@ -2657,7 +3596,9 @@ async function dlRunJob(job) {
         job.kind = "single";
         job.total = total || 0;
         const res = await fetch(job.url, { cache: "no-store", signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const blob = await res.blob();
+        if (blob.size === 0) throw new Error("El servidor no devolvió datos");
         job.received = blob.size;
         job.total = blob.size;
         dlBroadcast();
@@ -2706,6 +3647,17 @@ async function dlRunJob(job) {
       return;
     }
     if (job.failed) {
+      // La cola directa falló: capturar con el Referer de la página (SW) antes
+      // de declarar el error — honesto con la causa y con el último recurso.
+      const salvado = await dlSwFallback(job);
+      if (salvado) {
+        job.status = "done";
+        dlClearDnr(job);
+        dlReportIndicator(job, "done");
+        statusText.textContent = `Descargado vía el navegador (con Referer de la página): ${job.name}`;
+        dlBroadcast();
+        return;
+      }
       job.status = "error";
       dlClearDnr(job);
       dlReportIndicator(job, "error");
@@ -2716,6 +3668,16 @@ async function dlRunJob(job) {
   } catch (err) {
     if (job.paused) {
       job.status = "paused";
+      dlBroadcast();
+      return;
+    }
+    // Mismo último recurso en errores no recuperables de la cola directa.
+    const salvado = await dlSwFallback(job);
+    if (salvado) {
+      job.status = "done";
+      dlClearDnr(job);
+      dlReportIndicator(job, "done");
+      statusText.textContent = `Descargado vía el navegador (con Referer de la página): ${job.name}`;
       dlBroadcast();
       return;
     }
@@ -2806,8 +3768,16 @@ async function buildZipFromUrls(urls) {
   const used = new Set();
   let okCount = 0;
   let failCount = 0;
+  let skipped = 0; // streams/blob: excluidos con aviso, no basura silenciosa
 
   for (const item of items) {
+    // Los manifiestos (m3u8/mpd) y los blob: NO son archivos empaquetables:
+    // un .m3u8 en el zip sería un archivo de texto inútil y un blob: es
+    // memoria de la página. Se cuentan y se reportan, no se incrustan.
+    if (/\.(m3u8|mpd)(?:[?#].*)?$/i.test(item.url) || item.url.startsWith("blob:")) {
+      skipped++;
+      continue;
+    }
     try {
       let blob = null;
       try {
@@ -2823,13 +3793,13 @@ async function buildZipFromUrls(urls) {
           }).catch(() => null);
         }
       }
-      if (!blob) throw new Error("fetch-failed");
-      let name = itemName(item);
-      if (!/\.\w+$/.test(name)) name += item.ext ? `.${item.ext}` : "";
-      let unique = name;
-      let n = 1;
-      while (used.has(unique)) unique = name.replace(/(\.\w+)?$/, `_${n++}$1`);
-      used.add(unique);
+      if (!blob || blob.size === 0) throw new Error("fetch-failed");
+      // El ZIP es el ÚNICO punto donde el nombre no pasa por el saneador de
+      // Chrome: la entrada la extrae el usuario con la herramienta que quiera,
+      // y "../" o una ruta absoluta en el nombre es el patrón clásico de
+      // zip-slip. `zipEntryName` garantiza que cada entrada es un nombre plano
+      // dentro de la raíz del archivo, y deduplica preservando la extensión.
+      const unique = zipEntryName(itemName(item), used);
       zip.file(unique, blob);
       okCount++;
     } catch {
@@ -2840,6 +3810,7 @@ async function buildZipFromUrls(urls) {
   return {
     okCount,
     failCount,
+    skipped,
     blob: okCount > 0 ? await zip.generateAsync({ type: "blob" }) : null,
   };
 }
@@ -2851,10 +3822,12 @@ async function downloadZip() {
   statusText.textContent = `Comprimiendo ${total} archivos…`;
   btnZip.disabled = true;
 
-  const { okCount, failCount, blob } = await buildZipFromUrls(urls);
+  const { okCount, failCount, skipped, blob } = await buildZipFromUrls(urls);
 
   if (!blob) {
-    statusText.textContent = "Ningún archivo pudo descargarse (CORS).";
+    statusText.textContent = skipped > 0
+      ? `Ningún archivo pudo descargarse al zip (${skipped} eran streams/blob: — descárgalos individualmente).`
+      : "Ningún archivo pudo descargarse (CORS).";
     btnZip.disabled = false;
     return;
   }
@@ -2863,7 +3836,7 @@ async function downloadZip() {
     const objUrl = URL.createObjectURL(blob);
     await chrome.downloads.download({ url: objUrl, filename: "operant.zip", conflictAction: "uniquify" });
     setTimeout(() => URL.revokeObjectURL(objUrl), 60000);
-    statusText.textContent = `Zip creado (${okCount} ok${failCount ? `, ${failCount} fallidos` : ""}).`;
+    statusText.textContent = `Zip creado (${okCount} ok${failCount ? `, ${failCount} fallidos` : ""}${skipped ? `, ${skipped} streams/blob: excluidos` : ""}).`;
   } catch {
     statusText.textContent = "Error al generar el zip.";
   }
@@ -2871,6 +3844,12 @@ async function downloadZip() {
 }
 
 async function downloadWithYtdl(item) {
+  // Guard honesto: yt-dlp necesita una URL pública; un blob: de la página o
+  // un data: no son resolubles por el extractor.
+  if (/^(blob|data):/i.test(item.url)) {
+    statusText.textContent = "yt-dlp necesita una URL pública: este elemento es un stream en memoria (blob:) de la página. Descárgalo desde la card.";
+    return;
+  }
   statusText.textContent = `Consultando calidades de ${itemName(item)}…`;
   const res = await chrome.runtime.sendMessage({ type: "ytdl-list-formats", url: item.url });
   if (!res?.ok) {
@@ -2943,44 +3922,56 @@ qualityRun.addEventListener("click", async () => {
     manifestQualityData = null;
     qualityDialog.close();
     if (audio && audio.length) {
-      // DASH con audio separado: CON host → remux ffmpeg (vídeo elegido +
-      // audio de mayor bitrate). SIN host → ruta rápida solo vídeo (el
-      // navegador no puede muxear pistas separadas sin ffmpeg).
-      if (native) {
-        const bestAudio = audio.reduce((a, b) => (Number(b.id) > Number(a.id) ? b : a));
-        statusText.textContent = `DASH: descargando vídeo (${q.label}) + audio y uniéndolos…`;
-        const res = await chrome.runtime.sendMessage({
-          type: "ffmpeg-op",
-          url: q.url,
-          op: "dash-merge",
-          options: {
-            videoUrl: q.url,
-            audioUrl: bestAudio.url,
-            filename: itemName(item),
-            videoSegments: buildSegList(q),
-            audioSegments: buildSegList(bestAudio),
-          },
-        });
-        if (!res?.ok) statusText.textContent = res?.error || "Error al unir vídeo+audio (DASH).";
-      } else {
-        statusText.textContent = "Sin host nativo: descargando solo el vídeo (sin audio) por la ruta rápida…";
-        await runHlsFast(item, q.url);
-      }
+      // DASH con audio separado: mux ffmpeg vía companion. El companion se
+      // decide por la RESPUESTA REAL del SW — nunca por el estado de caché
+      // de herramientas (podía no estar inicializado y bloqueaba descargas
+      // con companion presente).
+      const bestAudio = audio.reduce((a, b) => (Number(b.id) > Number(a.id) ? b : a));
+      statusText.textContent = `DASH: descargando vídeo (${q.label}) + audio y uniéndolos…`;
+      const res = await chrome.runtime.sendMessage({
+        type: "ffmpeg-op",
+        url: q.url,
+        op: "dash-merge",
+        options: {
+          videoUrl: q.url,
+          audioUrl: bestAudio.url,
+          filename: itemName(item),
+          videoSegments: buildSegList(q),
+          audioSegments: buildSegList(bestAudio),
+        },
+      });
+      if (!res?.ok) statusText.textContent = res?.error || "Error al unir vídeo+audio (DASH).";
       return;
     }
-    if (native) {
-      statusText.textContent = `Manifiesto: descargando con ffmpeg (${q.label})…`;
+
+    // HLS: variante con audio en pista SEPARADA (X/Twitter, YouTube Live) —
+    // el navegador no puede muxearla → companion (decidido por respuesta real).
+    if (q.audioUrl) {
+      statusText.textContent = `Descargando vídeo + audio (HLS) y uniéndolos con el companion (${q.label})…`;
       const res = await chrome.runtime.sendMessage({
         type: "ffmpeg-op",
         url: q.url,
         op: "hls-dash",
-        options: { sourceUrl, filename: itemName(item) },
+        options: { audioUrl: q.audioUrl, filename: itemName(item) },
       });
       if (!res?.ok) statusText.textContent = res?.error || "Error al procesar el manifiesto.";
-    } else {
-      statusText.textContent = `Ruta rápida del navegador (${q.label}, sin host nativo)…`;
-      await runHlsFast(item, q.url);
+      return;
     }
+
+    // Variante MUXED (audio+video en los segmentos): la RUTA RÁPIDA DEL
+    // NAVEGADOR es la vía principal (entrega verificada); el companion solo
+    // como fallback si falla.
+    statusText.textContent = `Ruta rápida del navegador (${q.label})…`;
+    const r = await runHlsFast(item, q.url);
+    if (r?.ok) return;
+    statusText.textContent = `Ruta rápida falló (${r?.error || "?"}) — reintentando con el companion…`;
+    const res = await chrome.runtime.sendMessage({
+      type: "ffmpeg-op",
+      url: q.url,
+      op: "hls-dash",
+      options: { sourceUrl, filename: itemName(item) },
+    });
+    if (!res?.ok) statusText.textContent = res?.error || "Error al procesar el manifiesto.";
     return;
   }
 
@@ -3009,7 +4000,11 @@ function populateProcSource() {
   none.value = "";
   none.textContent = "Elegir un medio de la página…";
   procSource.appendChild(none);
-  const candidates = state.items.filter((it) => it.type === "image" || it.type === "video" || it.type === "audio");
+  // El host descarga por URL: los blob: (memoria de la página) no son
+  // procesables — se excluyen del selector en lugar de fallar después.
+  const candidates = state.items.filter(
+    (it) => (it.type === "image" || it.type === "video" || it.type === "audio") && !/^blob:/i.test(it.url)
+  );
   for (const it of candidates) {
     const opt = document.createElement("option");
     opt.value = it.url;
@@ -3168,7 +4163,19 @@ dlConcurrency.addEventListener("change", async () => {
 });
 
 // --- Comunicación con el service worker ---
+// Coalescencia de requestState: SPAs y previews (lightbox de imágenes,
+// carruseles) disparan onUpdated en ráfaga; cada petición ponía skeletons y
+// relanzaba el ciclo de carga. Las peticiones concurrentes se fusionan en UNA
+// (con re-ejecución final si llegó alguna durante el vuelo).
+let stateReqInFlight = false;
+let stateReqQueued = false;
+
 async function requestState() {
+  if (stateReqInFlight) {
+    stateReqQueued = true;
+    return;
+  }
+  stateReqInFlight = true;
   loading = true;
   render();
   statusText.textContent = "Escaneando…";
@@ -3178,7 +4185,7 @@ async function requestState() {
   } catch {
     res = null;
   }
-  loading = false;
+  stateReqInFlight = false;
   if (res && Array.isArray(res.items)) {
     setItems(res.items);
     await applyPersistedSelection();
@@ -3190,15 +4197,19 @@ async function requestState() {
   } else {
     // El SW no respondió (MV3 dormido, recarga de extensión…). NO se vacían
     // los items: conservar el último estado conocido evita el "Sin resultados"
-    // falso con contador lleno (bug real v0.4: vaciado prematuro en onUpdated
-    // + wipe en este else desincronizaban grid y contador).
+    // falso con contador lleno.
     if (state.items.length > 0) {
       statusText.textContent = `Fondo no disponible — mostrando ${state.items.length} medios del último escaneo`;
     } else {
       statusText.textContent = "No se pudo contactar con el servicio de fondo. Recarga la extensión.";
     }
   }
+  loading = false;
   render();
+  if (stateReqQueued) {
+    stateReqQueued = false;
+    requestState();
+  }
 }
 
 function populateExtOptions() {
@@ -3253,7 +4264,9 @@ function renderNativeChip() {
   const ytOk = yt.status === "installed" || yt.legacy;
   const ffOk = ff.status === "installed" || ff.legacy;
   nativeChip.innerHTML = `<span class="chip-status-dot on"></span>yt-dlp ${ytOk ? (yt.version || "✓") : "no"} · ffmpeg ${ffOk ? "✓" : "no"}`;
-  btnYtdl.hidden = yt.status !== "installed";
+  // Coherencia con ytOk: un yt-dlp "legacy" (del sistema) SÍ funciona — el
+  // botón no debe quedar oculto como con status !== "installed" a secas.
+  btnYtdl.hidden = !(ytOk);
 }
 
 // --- Dialogo de Herramientas (auto-gestion de yt-dlp / ffmpeg) ---
@@ -3300,7 +4313,7 @@ function renderTools() {
   if (!state.native.installed) {
     if (banner) banner.className = "companion-banner disconnected";
     if (title) title.textContent = "Operant Companion: No detectado";
-    if (desc) desc.textContent = "Haz doble clic en operant-host.exe (carpeta native-host) para activar yt-dlp y ffmpeg sin consola.";
+    if (desc) desc.textContent = "Descarga operant-host.exe desde la página de Releases del repositorio y ábrelo con doble clic para activar yt-dlp y ffmpeg sin consola.";
     if (pulse) pulse.className = "companion-pulse off";
     if (btnReconnect) btnReconnect.hidden = false;
   } else {
@@ -3325,7 +4338,7 @@ function renderTools() {
       stateEl.textContent = "host no instalado";
       stateEl.className = "tool-state err";
       btn.hidden = true;
-      note.textContent = "Ejecuta operant-host.exe con doble clic (una sola vez).";
+      note.textContent = "Ejecuta operant-host.exe (descargado de Releases) con doble clic, una sola vez.";
       continue;
     }
     if (info.unknown && !info.installed && !info.version) {
@@ -3452,6 +4465,7 @@ async function retargetTab() {
       tab = null;
     }
     state.tabId = tab?.id ?? null;
+    state.pageUrl = tab?.url || "";
     console.log(`[operant-panel] retargetTab -> state.tabId=${state.tabId} (pin=${window.__operant?.pin})`);
   }
   if (state.tabId === null) {
@@ -3468,25 +4482,27 @@ async function retargetTab() {
 chrome.tabs.onActivated.addListener(({ tabId }) => {
   if (window.__operant?.pin) return; // tests fijan el tab
   state.tabId = tabId;
+  chrome.tabs.get(tabId).then((t) => { state.pageUrl = t?.url || ""; }).catch(() => {});
   loading = true;
   render();
   requestState();
 });
 
 // Re-aim al navegar dentro de la pestaña (también cubre el caso de que la
-// pestaña cambie de URL sin recarga del panel).
+// pestaña cambie de URL sin recarga del panel). SIN borrado por "loading":
+// las SPAs/previews disparan onUpdated en ráfaga y ese wipe+bucle era el
+// ciclo de carga. La limpieza autoritativa al navegar la hace el SW
+// (mensaje tab-navigated, webNavigation.onCommitted). Los cambios de URL
+// (pushState) refrescan el estado con debounce.
+let navRefreshTimer = null;
+
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (window.__operant?.pin) return;
   if (tabId !== state.tabId) return;
-  if (changeInfo.status === "loading") {
-    // La pestaña está cargando otra URL: limpiar la vista vieja.
-    state.items = [];
-    loading = true;
-    render();
-  } else if (changeInfo.url) {
-    // Cambio de URL (incluye SPA/pushState): refrescar sin vaciar antes
-    // (si el SW no responde, se conserva el último estado — bug v0.4).
-    requestState();
+  if (changeInfo.url) {
+    state.pageUrl = changeInfo.url;
+    clearTimeout(navRefreshTimer);
+    navRefreshTimer = setTimeout(requestState, 500);
   }
 });
 
@@ -3580,7 +4596,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
     btn.setAttribute("aria-selected", "true");
     state.tab = btn.dataset.tab;
     saveViewPrefs();
-    render();
+    render({ preserveScroll: false }); // cambiar de pestaña = volver arriba
   });
 });
 
@@ -3603,7 +4619,7 @@ async function requestMissingSizes() {
       const hasNew = res.items.some((i) => i.sizeKB !== null);
       if (hasNew) {
         setItems(res.items);
-        applyPersistedSelection().then(render);
+        applyPersistedSelection().then(applyStateUpdate);
       }
       // Si quedan nulls y aún no hemos reintentado mucho, volver a pedir:
       // algunos tardan (GET pesado) o entraron tarde.
@@ -3631,7 +4647,8 @@ async function requestMissingSizes() {
 const observer = new IntersectionObserver(
   (entries) => {
     if (entries.some((e) => e.isIntersecting)) {
-      const visible = sortedItems();
+      // Snapshot fijo del ciclo de render actual (ver render()).
+      const visible = state.visibleList || sortedItems();
       if (state.rendered < visible.length) renderChunk(visible);
     }
   },
@@ -3639,6 +4656,8 @@ const observer = new IntersectionObserver(
 );
 
 // --- Listener del service worker (actualizaciones en vivo) ---
+let stateRenderTimer = null;
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg) return;
   if (msg.type === "fast-progress") {
@@ -3692,7 +4711,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "state-updated" && msg.tabId === state.tabId) {
     loading = false; // datos reales: los skeletons nunca se quedan colgados
     setItems(msg.items || []);
-    applyPersistedSelection().then(render);
+    // Render ATÓMICO y debounced: si la lista visible no cambió, cero DOM;
+    // si solo se añadieron items, append incremental; nunca un reset ciego.
+    clearTimeout(stateRenderTimer);
+    stateRenderTimer = setTimeout(() => {
+      applyPersistedSelection().then(applyStateUpdate);
+    }, 250);
     statusText.textContent = `${state.items.length} medios detectados`;
     if (!scanBar.hidden) {
       scanFill.style.width = "100%";
@@ -3775,10 +4799,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       procStatus.textContent = `Listo: ${m.name} (${before} → ${after}). Guardado en ${m.output || "~/Downloads/Operant/"}.`;
       procStatus.className = "proc-status ok";
       procRun.disabled = false;
+      // Reflejo SIEMPRE visible: una op encolada (overlay/calidades) no debe
+      // completarse en silencio.
+      statusText.textContent = `Companion: listo — ${m.name}. Guardado en ${m.output || "~/Downloads/Operant/"}.`;
     } else if (m.type === "ffmpeg-error") {
       procStatus.textContent = `Error: ${m.message || "desconocido"}`;
       procStatus.className = "proc-status err";
       procRun.disabled = false;
+      statusText.textContent = `Companion: error — ${m.message || "desconocido"}`;
     } else if (m.type === "formats") {
       renderFormats(m.formats || []);
     } else if (m.type === "formats-error") {
@@ -3963,7 +4991,28 @@ window.__operant = {
   retargetTab,
   startDl: dlStart,
   dlState: dlSummary,
+  // Replica EXACTAMENTE el camino de un state-updated (setItems → atómico).
+  updateState: (items) => {
+    setItems(Array.isArray(items) ? items : []);
+    return applyPersistedSelection().then(() => {
+      applyStateUpdate();
+      return document.querySelectorAll("#grid .card:not(.skeleton)").length;
+    });
+  },
   getState: () => ({ items: state.items, tab: state.tab, tabId: state.tabId, selected: [...state.selected], loading }),
+  __debug: () => {
+    const next = sortedItems();
+    const prev = state.visibleList;
+    return {
+      same: prev ? sameVisibleList(prev, next) : null,
+      append: prev ? isAppendOnly(prev, next) : null,
+      prevLen: prev ? prev.length : null,
+      nextLen: next.length,
+      p0: prev ? prev[0].url.slice(-8) : null,
+      n0: next[0] ? next[0].url.slice(-8) : null,
+      rendered: state.rendered,
+    };
+  },
   setState(items, opts = {}) {
     state.items = Array.isArray(items) ? items : [];
     loading = false;
@@ -3989,6 +5038,6 @@ window.__operant = {
   // Verifica el contenido del zip (misma lógica que el botón real).
   zipCount: async (urls) => {
     const r = await buildZipFromUrls(urls);
-    return { ok: r.okCount, fail: r.failCount };
+    return { ok: r.okCount, fail: r.failCount, skip: r.skipped };
   },
 };

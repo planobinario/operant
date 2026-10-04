@@ -1,7 +1,6 @@
 node_modules/
 web-ext-artifacts/
 dist-firefox/
-*.zip
 .DS_Store
 
 __pycache__/
@@ -17,3 +16,42 @@ scratchpad/
 # Rust build artifacts
 target/
 native-host-rs/target/
+
+# --- Secretos -------------------------------------------------------------
+# La clave PRIVADA de la extensión no se commitea NUNCA. Con ella, cualquiera
+# que la lea puede publicar actualizaciones de la extensión instalada en el
+# perfil de cualquier usuario (Chrome acepta la firma sin pedir permiso).
+#
+# `src/manifest.json` sí incluye la clave PÚBLICA (campo `key`): eso es lo que
+# fija el ID y debe estar en el repo. La privada vive aquí:
+#
+#   node scripts/gen-extension-key.mjs
+#
+# Si alguna vez estuvo commiteada, no basta con ignorarla: hay que ROTARLA
+# (script de arriba) y PURGAR el historial (git filter-repo / BFG).
+native-host/.secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# --- Ficheros generados que los tests necesitan versionados ----------------
+# El patrón global `*.zip` de antes excluía también los fixtures de test, y el
+# caso 04 del harness verifica precisamente `sample.zip`: en un clon limpio
+# ese test fallaba por no existir el fixture. Se compensa con una excepción
+# explícita en lugar de dejar el patrón global.
+/*.zip
+
+# --- Binarios compilados ---------------------------------------------------
+# `native-host/operant-host.exe` estuvo commiteado: 2.588.160 B, el 23,5 % de
+# todos los bytes del repo, y además desincronizado del `src/` actual (el
+# working tree estaba sucio respecto al binario versionado). Un ejecutable en
+# git no se puede revisar, no se parchea, no se firma de forma fiable y cada
+# clon arrastra 2,5 MB que nadie va a recompilar.
+#
+# El binario es un ARTEFACTO: se compila en CI (`cargo build --release`) y se
+# publica como asset de release con su SHA-256. Para construirlo en local:
+#   npm run host:build
+# que lo deja en `native-host/operant-host.exe` sin trackearlo.
+/native-host/*.exe
+*.msi

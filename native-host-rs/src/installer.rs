@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 pub const HOST_NAME: &str = "com.operant.native_host";
-pub const EXTENSION_ID: &str = "apolplekoldkaignccbfcnejmoochdhf";
+pub const EXTENSION_ID: &str = "ojipilmpchlgciidajpcgjkmfpghccjk";
 pub const GECKO_ID: &str = "operant@operant.dev";
 
 pub fn get_manifest_path() -> PathBuf {
@@ -19,16 +19,21 @@ pub fn get_manifest_path() -> PathBuf {
     #[cfg(not(windows))]
     {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".config").join("operant").join("com.operant.native_host.json")
+        PathBuf::from(home)
+            .join(".config")
+            .join("operant")
+            .join("com.operant.native_host.json")
     }
 }
 
 pub fn install(interactive: bool) -> Result<(), String> {
-    let exe_path = std::env::current_exe().map_err(|e| format!("No se pudo obtener la ruta del ejecutable: {}", e))?;
+    let exe_path = std::env::current_exe()
+        .map_err(|e| format!("No se pudo obtener la ruta del ejecutable: {}", e))?;
     let manifest_path = get_manifest_path();
 
     if let Some(parent) = manifest_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Error creando carpeta del manifest: {}", e))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Error creando carpeta del manifest: {}", e))?;
     }
 
     let manifest_content = serde_json::json!({
@@ -47,8 +52,12 @@ pub fn install(interactive: bool) -> Result<(), String> {
     let json_str = serde_json::to_string_pretty(&manifest_content)
         .map_err(|e| format!("Error generando JSON del manifest: {}", e))?;
 
-    fs::write(&manifest_path, json_str)
-        .map_err(|e| format!("Error escribiendo archivo manifest en {:?}: {}", manifest_path, e))?;
+    fs::write(&manifest_path, json_str).map_err(|e| {
+        format!(
+            "Error escribiendo archivo manifest en {:?}: {}",
+            manifest_path, e
+        )
+    })?;
 
     #[cfg(windows)]
     {
@@ -58,17 +67,22 @@ pub fn install(interactive: bool) -> Result<(), String> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let targets = [
             format!(r"Software\Google\Chrome\NativeMessagingHosts\{}", HOST_NAME),
-            format!(r"Software\Microsoft\Edge\NativeMessagingHosts\{}", HOST_NAME),
+            format!(
+                r"Software\Microsoft\Edge\NativeMessagingHosts\{}",
+                HOST_NAME
+            ),
             format!(r"Software\Mozilla\NativeMessagingHosts\{}", HOST_NAME),
         ];
 
         let manifest_str = manifest_path.to_string_lossy().to_string();
 
         for subkey_path in &targets {
-            let (key, _) = hkcu.create_subkey(subkey_path)
+            let (key, _) = hkcu
+                .create_subkey(subkey_path)
                 .map_err(|e| format!("Error creando clave de registro {}: {}", subkey_path, e))?;
-            key.set_value("", &manifest_str)
-                .map_err(|e| format!("Error escribiendo valor en registro {}: {}", subkey_path, e))?;
+            key.set_value("", &manifest_str).map_err(|e| {
+                format!("Error escribiendo valor en registro {}: {}", subkey_path, e)
+            })?;
         }
     }
 
@@ -107,7 +121,10 @@ pub fn uninstall(interactive: bool) -> Result<(), String> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let targets = [
             format!(r"Software\Google\Chrome\NativeMessagingHosts\{}", HOST_NAME),
-            format!(r"Software\Microsoft\Edge\NativeMessagingHosts\{}", HOST_NAME),
+            format!(
+                r"Software\Microsoft\Edge\NativeMessagingHosts\{}",
+                HOST_NAME
+            ),
             format!(r"Software\Mozilla\NativeMessagingHosts\{}", HOST_NAME),
         ];
 
@@ -134,14 +151,26 @@ pub fn show_message_box(title: &str, message: &str, is_error: bool) {
     {
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK,
+        };
 
         let title_w: Vec<u16> = OsStr::new(title).encode_wide().chain(Some(0)).collect();
         let msg_w: Vec<u16> = OsStr::new(message).encode_wide().chain(Some(0)).collect();
-        let flags = MB_OK | if is_error { MB_ICONERROR } else { MB_ICONINFORMATION };
+        let flags = MB_OK
+            | if is_error {
+                MB_ICONERROR
+            } else {
+                MB_ICONINFORMATION
+            };
 
         unsafe {
-            MessageBoxW(std::ptr::null_mut(), msg_w.as_ptr(), title_w.as_ptr(), flags);
+            MessageBoxW(
+                std::ptr::null_mut(),
+                msg_w.as_ptr(),
+                title_w.as_ptr(),
+                flags,
+            );
         }
     }
     #[cfg(not(windows))]

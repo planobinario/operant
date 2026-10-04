@@ -1,0 +1,123 @@
+# Release de Operant
+#
+# POR QUÉ EXISTE
+# --------------
+# `native-host/operant-host.exe` estuvo commiteado durante meses: 2.588.160 B,
+# el 23,5 % de todos los bytes del repo, y además desincronizado del `src/`
+# actual (el binario versionado no correspondía al código, porque cada cambio
+# en Rust dejaba el working tree "sucio" con un exe distinto al guardado).
+#
+# Un ejecutable dentro de git es un problema con cuatro consecuencias:
+#   1. No se puede revisar. Un binario no se lee en un diff.
+#   2. No se puede parchear. Cualquier corrección obliga a un commit de 2,5 MB.
+#   3. No se puede firmar de forma fiable. Firma y binario viajan juntos, así que
+#      cualquiera con permiso de escritura puede cambiar el binario y la firma.
+#   4. Cada `git clone` descarga 2,5 MB que nadie recompila.
+#
+# QUÉ HACE ESTE WORKFLOW
+# ---------------------
+# Compila el host en un runner NATIVO de Windows (no cruzado), comprueba que los
+# tests siguen verdes contra ese binario, genera el SHA-256 y publica el
+# ejecutable como asset del release con su checksum al lado.
+#
+# Por qué `windows-latest` y no cross-compilar desde Linux: el host usa
+# diálogos Win32 y enlaces a `kernel32`/`user32` a través del crate `windows`.
+# `x86_64-pc-windows-gnu` desde Ubuntu puede compilar, pero el resultado no es
+# el que se firmaría ni se distribuiría, y sus fallos (subsistema GUI, recursos
+# incrustados, firma Authenticode) no aparecerían hasta que un usuario lo
+# ejecutase. Compilar donde se ejecuta es más lento y es la verdad.
+#
+# La clave privada de la extensión NO está aquí ni debe estar: la rotación de
+# claves es un proceso manual documentado en README.md, porque cambiar el
+# `key` del manifest cambia el ID de la extensión y obliga a reinstalar el host
+# nativo en el perfil de cada usuario.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag a publicar (vX.Y.Z)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  host:
+    name: Host nativo (Windows) + checksum
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar el toolchain de Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Comprobar coherencia de versiones
+        # Un tag v0.5.0 con un Cargo.toml en 0.4.1 produciría un host que se
+        # identifica con otra versión que la extensión que lo llama.
+        run: node scripts/check-version.mjs
+
+      - name: Tests del host
+        run: cargo test --manifest-path native-host-rs/Cargo.toml
+
+      - name: Compilar en release
+        run: cargo build --release --locked --manifest-path native-host-rs/Cargo.toml
+
+      - name: Calcular el SHA-256
+        # El checksum es lo que permite al usuario verificar que el binario que
+        # descarga es el que publicó este tag, y no una reempaquetada.
+        shell: pwsh
+        run: |
+          $exe = "native-host-rs\target\release\operant-host.exe"
+          if (-not (Test-Path $exe)) { throw "no se ha generado $exe" }
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
+          "$hash  operant-host.exe" | Out-File -Encoding ascii operant-host.exe.sha256
+          Write-Host "SHA-256: $hash"
+          Get-Item $exe | Select-Object Name, Length
+
+      - name: Comprobar que el binario no está en el índice de git
+        # Cinturón y tirantes: si alguien lo commitea, el tag no debe distribuirlo
+        # dos veces ni publicar algo que no se puede revisar.
+        shell: pwsh
+        run: |
+          $tracked = git ls-files | Select-String -Pattern '\.(exe|dll|msi)$'
+          if ($tracked) {
+            Write-Host "::error::hay binarios en el índice: $tracked"
+            exit 1
+          }
+
+      - name: Publicar el release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: Operant ${{ github.event.inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            native-host-rs/target/release/operant-host.exe
+            operant-host.exe.sha256
+          body: |
+            ## Host nativo de Windows
+
+            `operant-host.exe` — binario autónomo (Rust puro, sin Python ni
+            consola). Se ejecuta con doble clic y registra el host de Native
+            Messaging en el Registro de Windows.
+
+            ### Verificación
+
+            ```
+            certutil -hashfile operant-host.exe SHA256
+            ```
+
+            El resultado debe coincidir con el de `operant-host.exe.sha256`.
+
+            ### Firma
+
+            Este build **no está firmado con Authenticode**, así que Windows
+            SmartScreen lo mostrará como editor desconocido. La firma exige un
+            certificado de firma de código; mientras tanto, verifica el SHA-256
+            antes de ejecutarlo.

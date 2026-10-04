@@ -15,6 +15,14 @@
 //
 // Limitación documentada: EME/DRM no es capturable (los buffers llegan
 // cifrados desde el CDM). Solo MSE de contenido claro.
+//
+// EPOCH: el mundo MAIN es COMPARTIDO entre generaciones de content script
+// (tras recargar la extensión y reinyectar, window persiste). El epoch
+// garantiza que solo la ÚLTIMA generación activa el hook y procesa comandos:
+// las envolturas viejas quedan encadenadas por debajo (inofensivas) y sus
+// entregas se descartan por falta de epoch.
+
+const REC_EPOCH = "r2";
 
 (function () {
   "use strict";
@@ -22,8 +30,9 @@
   // Si chrome.runtime.id existe somos el mundo ISOLATED (fallback en Gecko
   // < 128, que ignora "world"): no hacer nada en ese caso.
   if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) return;
-  if (window.__operantRecorderInstalled) return;
+  if (window.__operantRecEpoch === REC_EPOCH) return; // misma generación ya instalada
   window.__operantRecorderInstalled = true;
+  window.__operantRecEpoch = REC_EPOCH;
 
   const CHUNK_RAW = 600 * 1024; // bytes por chunk base64 (< 1 MB del host)
 
@@ -33,6 +42,25 @@
     sources: new Map(), // msId -> { id, tracks: Map<track, {init, segments, bytes, mimeType}> }
     statsTimer: null,
   };
+
+  // --- Detección proactiva de DRM (EME) ---
+  // Con EME/Widevine, appendBuffer recibe los segmentos TODAVÍA CIFRADOS (el
+  // CDM descifra dentro del pipeline, no en el SourceBuffer): grabarlos
+  // produciría un archivo inútil. Se engancha requestMediaKeySystemAccess
+  // (este script corre en document_start, antes que la página) para avisar
+  // AL INICIO en lugar de fallar al ensamblar.
+  let drmDetected = false;
+  try {
+    if (navigator.requestMediaKeySystemAccess) {
+      const origReq = navigator.requestMediaKeySystemAccess.bind(navigator);
+      navigator.requestMediaKeySystemAccess = function (...args) {
+        drmDetected = true;
+        return origReq(...args);
+      };
+    }
+  } catch {
+    /* el hook de detección nunca debe romper la página */
+  }
 
   function trackKind(mimeType) {
     return /^audio\//i.test(mimeType || "") ? "audio" : "video";
@@ -105,6 +133,7 @@
 
   function send(msg) {
     msg.__operantRec = true;
+    msg.epoch = REC_EPOCH;
     window.postMessage(msg, window.location.origin);
   }
 
@@ -194,10 +223,21 @@
 
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
+    if (window.__operantRecEpoch !== REC_EPOCH) return; // solo la última generación
     const msg = event.data;
-    if (!msg || !msg.__operantRecCmd) return;
+    if (!msg || !msg.__operantRecCmd || msg.epoch !== REC_EPOCH) return;
     try {
       if (msg.cmd === "start") {
+        if (drmDetected) {
+          // Honestidad inmediata: EME detectado → la grabación interna no
+          // puede producir contenido descifrado. No se inicia sesión.
+          send({
+            type: "started",
+            drm: true,
+            error: "Esta página usa DRM (EME): la grabación interna no puede capturar contenido cifrado.",
+          });
+          return;
+        }
         if (state.capturing) {
           send({ type: "started", already: true });
           return;

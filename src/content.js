@@ -20,6 +20,76 @@ function classify(url) {
   return null;
 }
 
+// ============================================================================
+// GUARDIA DE CONTEXTO (auto-reparación ante recargas de la extensión)
+// Tras recargar la extensión, las pestañas abiertas conservan content scripts
+// de la generación anterior cuyo canal chrome.runtime está MUERTO — toda
+// interacción fallaba con "Extension context invalidated". Con la guardia:
+//   1. ctxSend() detecta el contexto muerto y lanza un error HUMANO.
+//   2. La UI de Operant se retira de la página (DOM puro, sin chrome).
+//   3. El SW re-inyecta los content scripts al tocar la pestaña (scripting),
+//      y cada nueva generación expulsa a la anterior con __operant-shutdown.
+// ============================================================================
+const CTX_MSG = "Operant se ha recargado: recarga esta página (F5) para reactivarla aquí.";
+let contextDead = false;
+
+function contextIsAlive() {
+  if (contextDead) return false;
+  try {
+    return !!(chrome.runtime && chrome.runtime.id);
+  } catch {
+    return false;
+  }
+}
+
+// Envío con guardia: async a propósito — todo fallo de contexto se convierte
+// en rechazo con mensaje humano, capturable por .catch y por await por igual.
+async function ctxSend(msg) {
+  if (!contextIsAlive()) {
+    contextDead = true;
+    shutdownOperantUI();
+    throw new Error(CTX_MSG);
+  }
+  try {
+    return await chrome.runtime.sendMessage(msg);
+  } catch (e) {
+    if (/Extension context invalidated|Receiving end does not exist/i.test(String(e?.message || e))) {
+      contextDead = true;
+      shutdownOperantUI();
+      throw new Error(CTX_MSG);
+    }
+    throw e;
+  }
+}
+
+// Retirada limpia de TODA la UI de Operant en la página (solo DOM: funciona
+// aunque el canal chrome esté muerto).
+function shutdownOperantUI() {
+  try {
+    hidePageOverlay();
+  } catch {
+    /* cierre defensivo */
+  }
+  for (const id of ["operant-page-overlay", "operant-popover", "operant-overlay-toast"]) {
+    document.getElementById(id)?.remove();
+  }
+  document.getElementById("operant-page-overlay-style")?.remove();
+}
+
+// Expulsar generaciones anteriores (reinyección tras recargar la extensión):
+// la generación previa —si su código ya soporta el evento— retira su UI y
+// queda inerte; el DOM queda limpio para ESTA generación. El listener propio
+// se registra DESPUÉS del dispatch para no expulsarnos a nosotros mismos.
+try {
+  document.dispatchEvent(new CustomEvent("__operant-shutdown"));
+} catch {
+  /* entornos sin CustomEvent */
+}
+document.addEventListener("__operant-shutdown", () => {
+  contextDead = true;
+  shutdownOperantUI();
+});
+
 function extOf(url) {
   if (url && url.startsWith("data:image/")) {
     const m = url.match(/^data:image\/([a-zA-Z0-9\+\-]+);/);
@@ -118,7 +188,7 @@ function notify() {
     for (const item of store.values()) {
       if (item.sizeBytes === null) item.sizeBytes = perfSizeBytes(item.url);
     }
-    chrome.runtime.sendMessage({ type: "media-updated", items: [...store.values()] }).catch(() => {});
+    ctxSend({ type: "media-updated", items: [...store.values()] }).catch(() => {});
   }, 350);
 }
 
@@ -531,15 +601,13 @@ function reportProgress(force = false, phase = "estilos") {
   const now = Date.now();
   if (!force && now - lastProgressAt < 80) return;
   lastProgressAt = now;
-  chrome.runtime
-    .sendMessage({
-      type: "scan-progress",
-      done: scanDone,
-      total: scanTotal,
-      phase: (scanTotal > 0 && scanDone >= scanTotal) ? "done" : phase,
-      found: store.size,
-    })
-    .catch(() => {});
+  ctxSend({
+    type: "scan-progress",
+    done: scanDone,
+    total: scanTotal,
+    phase: (scanTotal > 0 && scanDone >= scanTotal) ? "done" : phase,
+    found: store.size,
+  }).catch(() => {});
 }
 
 function getBackgroundCandidates() {
@@ -596,6 +664,91 @@ function scanBackgroundImages(candidates = null, baseDone = 0, targetTotal = 0) 
     scanDone = scanTotal;
     reportProgress(true, "done");
     notify();
+  }
+}
+
+// ============================================================================
+// FASES DE EXHAUSTIVIDAD EXTRA (clase ImageEye)
+// El escaneo DOM/computed-style se queda corto (~350 en páginas con ~1000
+// medios reales). Estas tres fases cubren lo que ningún selector alcanza:
+//   1. Resource Timing: TODO recurso ya cargado por el navegador (imgs
+//      perezosas fuera del DOM, fondos CSS, <link rel=preload>, respuestas
+//      fetch/XHR) — sin peticiones extra.
+//   2. Reglas CSS completas: url(...) en reglas no aplicadas aún (@media,
+//      :hover, ::before/::after, @keyframes) que getComputedStyle no ve.
+//   3. Barrido textual del HTML: cualquier URL de medio embebida en
+//      preload/microdata/JSON de scripts/atributos arbitrarios.
+// ============================================================================
+
+// 1. Recursos registrados por el navegador (Performance API).
+function scanResourceTiming() {
+  let entries = [];
+  try {
+    entries = performance.getEntriesByType("resource");
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const url = e.name || "";
+    if (!/^https?:/i.test(url)) continue;
+    const kind = classify(url);
+    if (kind) add(url, kind, { source: "resource" });
+  }
+}
+
+// 2. url(...) en todas las reglas CSS accesibles (recursivo: media/supports/
+// keyframes contienen reglas de estilo anidadas).
+function collectCssRuleUrls(rules) {
+  for (const rule of rules) {
+    try {
+      if (rule.type === 1 /* STYLE_RULE */) {
+        const text = rule.cssText || "";
+        if (!text.includes("url(")) continue;
+        let m;
+        URL_RE.lastIndex = 0;
+        while ((m = URL_RE.exec(text))) {
+          if (m[2] && !m[2].startsWith("data:")) add(m[2], "image");
+        }
+      } else if (rule.cssRules) {
+        collectCssRuleUrls(rule.cssRules);
+      }
+    } catch {
+      /* regla malformada */
+    }
+  }
+}
+
+function scanStylesheetUrls() {
+  for (const sheet of document.styleSheets) {
+    let rules = null;
+    try {
+      rules = sheet.cssRules;
+    } catch {
+      continue; // cross-origin sin CORS: cubierto por webRequest
+    }
+    if (rules) collectCssRuleUrls(rules);
+  }
+}
+
+// 3. Barrido textual del HTML (limitado: como mucho una vez cada 5s, es la
+// fase más pesada y el MutationObserver re-dispara fullScan a menudo).
+let lastTextScanAt = 0;
+
+function scanDocumentTextUrls() {
+  const now = Date.now();
+  if (now - lastTextScanAt < 5000) return;
+  lastTextScanAt = now;
+  const html = document.documentElement.outerHTML || "";
+  if (!html || html.length > 12e6) return; // cota de seguridad en páginas enormes
+  const re = /https?:\/\/[^\s"'<>`\\)]+/g;
+  let m;
+  let hits = 0;
+  while ((m = re.exec(html))) {
+    const kind = classify(m[0]);
+    if (kind) {
+      add(m[0], kind, { source: "html" });
+      if (++hits >= 4000) break;
+    }
   }
 }
 
@@ -771,15 +924,93 @@ const OBSERVER_OPTS = {
   attributeFilter: ["src", "srcset", "data-src", "data-lazy-src", "data-original", "data-url", "data-image", "style", "href", "poster"],
 };
 
+// Nodos de la PÁGINA sobre los que Operant escribe atributos (hoja de estilos
+// inline). Un WeakSet: no mantiene referencias fuertes, así que no puede
+// impedir la recolección de los nodos. Existe para el filtro del observer: si
+// el observer se disparara por estas escrituras propias, escribir el
+// `anchor-name` de un elemento provocaría un re-escaneo completo, que volvería
+// a escribir el `anchor-name`… bucle infinito.
+const operantMutatedPageNodes = new WeakSet();
+
+// ¿El nodo (o su ancestro más cercano) pertenece a la UI propia de Operant
+// (overlay, popover, toast, hoja de estilos)?
+//
+// Imprescindible en cuanto se observa `document`: los nodos de Operant viven
+// dentro del árbol observado y el overlay escribe `style.top`/`style.left` en
+// CADA mousemove. Sin este filtro, cada movimiento del ratón generaría una
+// mutación que dispararía un re-escaneo completo, que a su vez recolocaría el
+// overlay... es decir, un bucle de realimentación que deja la página
+// inutilizable.
+function isOwnUiNode(node) {
+  let el = node;
+  if (el && el.nodeType !== 1) el = el.parentElement; // nodos de texto
+  let hops = 0;
+  while (el && hops++ < 8) {
+    const id = el.id || "";
+    if (id.startsWith("operant-")) return true;
+    const cls = typeof el.className === "string" ? el.className : "";
+    if (cls && cls.split(/\s+/).some((c) => c.startsWith("operant-"))) return true;
+    el = el.parentElement;
+  }
+  return false;
+}
+
+// El observer de re-escaneo debe ignorar tanto los nodos propios como los
+// nodos de la página en los que Operant escribe estilos.
+function isOperantOwnMutation(target) {
+  if (!target) return false;
+  if (operantMutatedPageNodes.has(target)) return true;
+  return isOwnUiNode(target);
+}
+
 // Detectar contenido cargado dinámicamente (infinite scroll, SPAs).
-const observer = new MutationObserver(() => scheduleRescan());
+const observer = new MutationObserver((records) => {
+  for (const r of records) {
+    if (r.type === "attributes") {
+      if (isOperantOwnMutation(r.target)) continue;
+    } else {
+      const touched = [...r.addedNodes, ...r.removedNodes];
+      if (touched.length > 0 && touched.every((n) => isOperantOwnMutation(n))) continue;
+    }
+    scheduleRescan();
+    return; // una sola señal basta: no hace falta recorrer el resto
+  }
+});
 const observedRoots = new Set();
 
 function ensureObserved() {
-  for (const root of [...allShadowRoots(), ...allIframeDocs()]) {
-    if (observedRoots.has(root)) continue;
+  // `document` es la raíz OBLIGATORIA y es la que faltaba. Sin ella, el
+  // observer solo veía shadow roots abiertos y documentos de iframe
+  // same-origin, así que en cualquier página sin esos nodos no observaba
+  // NADA: infinite scroll, rutas de SPA y feeds virtualizados (que viven en el
+  // light DOM) no provocaban ningún re-escaneo automático. Solo se observan
+  // raíces accesibles: los shadow roots cerrados y los iframes cross-origin no
+  // lo son por diseño de la plataforma.
+  for (const root of [document, ...allShadowRoots(), ...allIframeDocs()]) {
+    if (!root || observedRoots.has(root)) continue;
     observedRoots.add(root);
-    observer.observe(root, OBSERVER_OPTS);
+    try {
+      observer.observe(root, OBSERVER_OPTS);
+    } catch {
+      observedRoots.delete(root); // raíz ya desconectada: no insistimos
+    }
+  }
+  // Podar raíces desconectadas. `observedRoots` es un Set de referencias
+  // FUERTES: sin poda, cada ruta SPA que monta y desmonta un web component, y
+  // cada navegación de iframe same-origin (que crea un Document nuevo), deja
+  // una entrada más y un observer vivo sobre un árbol que ya no existe.
+  if (observedRoots.size > 32) {
+    for (const root of [...observedRoots]) {
+      if (root === document) continue;
+      if (root.isConnected === false) {
+        observedRoots.delete(root);
+        try {
+          observer.unobserve(root);
+        } catch {
+          /* ya no estaba observando */
+        }
+      }
+    }
   }
 }
 
@@ -817,7 +1048,17 @@ function fullScan() {
   scanDone += (linkCount - Math.round(linkCount / 2)) + mediaCount;
   reportProgress(true, "medios");
 
-  // Fase 5: Estilos y fondos CSS con fluid steps
+  // Fase 5: exhaustividad extra (clase ImageEye) — recursos del navegador,
+  // reglas CSS completas y barrido textual del HTML. Baratos y deduplicados
+  // por el store; el textual va limitado a una pasada cada 5s.
+  scanResourceTiming();
+  scanStylesheetUrls();
+  scanDocumentTextUrls();
+  scanDone += 1;
+  scanTotal += 1;
+  reportProgress(true, "recursos");
+
+  // Fase 6: Estilos y fondos CSS con fluid steps
   const baseDone = scanDone;
   scanBackgroundImages(bgCandidates, baseDone, scanTotal);
 
@@ -826,10 +1067,53 @@ function fullScan() {
 }
 
 let rescanTimer = null;
+let rescanFirstPendingAt = 0;
+// Backoff ADAPTATIVO del re-escaneo (genérico, sin listas de sitios): en
+// páginas con tormentas de mutaciones (lightboxes, carruseles, feeds
+// virtualizados) el re-escaneo a intervalo fijo consumía CPU y saturaba la
+// tubería. Si un re-escaneo no aporta items nuevos, se duplica el intervalo
+// (800ms → 6.4s máx.); con novedad, vuelve al inmediato.
+let rescanBackoffMs = 800;
+let lastRescanStoreSize = -1;
+// Duración real del último fullScan. Se usa para poner un TECHO ADAPTATIVO al
+// tiempo entre escaneos: es lo que hace seguro observar `document`.
+let lastScanMs = 0;
+// Techo base entre escaneos cuando el escaneo es barato.
+const RESCAN_MIN_WAIT_MS = 2000;
 
 function scheduleRescan() {
+  const now = Date.now();
+  if (!rescanFirstPendingAt) rescanFirstPendingAt = now;
+
+  // Un debounce puro es INSUFICIENTE ahora que se observa `document`: cualquier
+  // página que mute `style` de forma continua (carrusel con autoplay, barra de
+  // progreso de vídeo, runtime CSS-in-JS) reinicia el temporizador para siempre
+  // y `fullScan()` no llega a ejecutarse ni una sola vez.
+  //
+  // El techo se calcula a partir del COSTE REAL de la última pasada: no se
+  // permite gastar más del ~50 % del tiempo de reloj escaneando. Con un escaneo
+  // de 50 ms el techo es el mínimo (2 s); con uno de 6 s (página grande) el
+  // techo sube a 12 s en lugar de provocar un escaneo cada 2 s y bloquear la
+  // página. Así el re-escaneo nunca es la causa de que la web se sienta lenta.
+  const maxWait = Math.min(15000, Math.max(RESCAN_MIN_WAIT_MS, lastScanMs * 2));
+  const waited = now - rescanFirstPendingAt;
+  const delay = Math.max(0, Math.min(rescanBackoffMs, maxWait - waited));
+
   clearTimeout(rescanTimer);
-  rescanTimer = setTimeout(fullScan, 800);
+  rescanTimer = setTimeout(() => {
+    rescanFirstPendingAt = 0;
+    const before = store.size;
+    const t0 = performance.now();
+    fullScan();
+    lastScanMs = performance.now() - t0;
+    ensureObserved();
+    if (store.size === before && before === lastRescanStoreSize) {
+      rescanBackoffMs = Math.min(6400, rescanBackoffMs * 2);
+    } else {
+      rescanBackoffMs = 800;
+    }
+    lastRescanStoreSize = store.size;
+  }, delay);
 }
 
 // --- Re-escaneo tras interacción (clicks en botones tipo "cargar más") ---
@@ -881,7 +1165,7 @@ let activeScan = null; // { cancelled: boolean, originalScrollY }
 const SCROLL_STEP_WAIT = 400; // ms de espera tras cada salto (lazy-load)
 
 function scanProgressMsg(done, total, phase) {
-  chrome.runtime.sendMessage({ type: "scan-progress", done, total, phase }).catch(() => {});
+  ctxSend({ type: "scan-progress", done, total, phase }).catch(() => {});
 }
 
 async function autoScrollScan() {
@@ -987,9 +1271,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "rec-start" || msg?.type === "rec-stop" || msg?.type === "rec-cancel") {
     // Puente SW → recorder (mundo MAIN) vía postMessage entre mundos.
     const cmd = msg.type === "rec-start" ? "start" : msg.type === "rec-stop" ? "stop" : "cancel";
-    const installed = !!window.__operantRecorderInstalled;
+    const installed = !!window.__operantRecorderInstalled && window.__operantRecEpoch === REC_EPOCH;
     if (installed) {
-      window.postMessage({ __operantRecCmd: true, cmd }, "*");
+      window.postMessage({ __operantRecCmd: true, cmd, epoch: REC_EPOCH }, "*");
     }
     sendResponse({ ok: true, installed });
     return;
@@ -997,13 +1281,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // --- Puente del modo grabación: recorder (mundo MAIN) → SW ---
-// Todos los mensajes del recorder llevan __operantRec (los comandos del otro
-// sentido llevan __operantRecCmd y no se retransmiten).
+// Todos los mensajes del recorder llevan __operantRec y EPOCH (solo se
+// retransmite la generación vigente; las entregas de generaciones huérfanas
+// se descartan). Los comandos del otro sentido llevan __operantRecCmd.
+const REC_EPOCH = "r2"; // mantener en sincronía con recorder-main.js
+
 window.addEventListener("message", (event) => {
   if (event.source !== window) return;
   const msg = event.data;
-  if (!msg || !msg.__operantRec) return;
-  chrome.runtime.sendMessage({ type: "rec-relay", payload: msg }).catch(() => {});
+  if (!msg || !msg.__operantRec || msg.epoch !== REC_EPOCH) return;
+  ctxSend({ type: "rec-relay", payload: msg }).catch(() => {});
 });
 
 // Escaneo inicial (document_idle: DOM ya disponible).
@@ -1017,13 +1304,20 @@ if (performance.setResourceTimingBufferSize) {
     /* algunos entornos no permiten ampliarlo */
   }
 }
-fullScan();
+{
+  // La primera pasada fija la escala del techo adaptativo de scheduleRescan:
+  // sin ella, el primer re-escaneo usaría el mínimo (2 s) aunque la página sea
+  // lo bastante grande como para que un escaneo completo tarde segundos.
+  const t0 = performance.now();
+  fullScan();
+  lastScanMs = performance.now() - t0;
+}
 console.log("[operant-content] tras fullScan inicial:", store.size, "items en", location.href);
 
 // Handshake: el SW puede haber capturado streams (m3u8/mpd/ts) antes de que
 // este content script se inyectara; se los pedimos para no perderlos.
 setTimeout(() => {
-  chrome.runtime.sendMessage({ type: "content-ready" }).catch(() => {});
+  ctxSend({ type: "content-ready" }).catch(() => {});
 }, 150);
 
 // ============================================================================
@@ -1152,6 +1446,9 @@ function overlayAnchorNameFor(el) {
   const name = `--operant-anchor-${++overlayAnchorSeq}`;
   overlayAnchorCache.set(el, name);
   try {
+    // Se registra ANTES de escribir: el observer ignora este nodo para no
+    // encadenar un re-escaneo completo con nuestra propia escritura de estilo.
+    operantMutatedPageNodes.add(el);
     el.style.setProperty("anchor-name", name);
   } catch {
     /* navegador sin soporte: no pasa nada */
@@ -1247,39 +1544,25 @@ function overlayTypeOf(el) {
   return "image";
 }
 
-// Iconos SVG inline (stroke actualColor, geometría milimétrica en viewBox 20×20,
-// trazo 1.5 UNIFORME en todo el set, estilo outline consistente estilo Lucide).
+// Iconos del overlay: sistema NORMALIZADO compartido (shared/icons.js,
+// rejilla Lucide 24×24, trazo 1.75 — la misma geometría exacta que el panel).
+// Alias semánticos del overlay → nombres del set.
+const OVERLAY_ICON_ALIASES = {
+  download: "download",
+  frame: "camera",
+  image: "image",
+  audio: "music",
+  audioOnly: "headphones",
+  videoFile: "video",
+  file: "file",
+  search: "search",
+  copy: "copy",
+};
+
 function overlayIcon(name) {
-  const paths = {
-    // Descargar: flecha hacia abajo dentro de una bandeja.
-    download:
-      '<path d="M10 3.5v8.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M6.6 8.4 10 11.8l3.4-3.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 13.2v1.6a1.6 1.6 0 0 0 1.6 1.6h8.8a1.6 1.6 0 0 0 1.6-1.6v-1.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
-    // Fotograma: cámara con círculo de lente centrado.
-    frame:
-      '<rect x="2.8" y="4.6" width="14.4" height="11.6" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="10" cy="10" r="2.6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7.6 3h4.8M10 3v1.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
-    // Imagen: marco con montaña y sol (composición clásica).
-    image:
-      '<rect x="2.6" y="4.4" width="14.8" height="11.2" rx="1.8" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="7.6" cy="8.6" r="1.3" fill="currentColor"/><path d="M3.4 14.2l4.2-4.2 3.2 3.2 2.4-2.4 3.4 3.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>',
-    // Audio: altavoz Lucide (cuerpo con fill + onda con stroke) — correcto.
-    audio:
-      '<path d="M11 5.2 6.4 8.6H3.4a.6.6 0 0 0-.6.6v1.6a.6.6 0 0 0 .6.6h3L11 14.8V5.2z" fill="currentColor" stroke="none"/><path d="M13.4 7.2a4.6 4.6 0 0 1 0 5.6M15.8 5.2a7.6 7.6 0 0 1 0 9.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
-    // Solo audio: NOTA MUSICAL (corchea Lucide: plica + corchea + 2 círculos).
-    audioOnly:
-      '<path d="M9 17.6V5.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M9 5.2 16.6 3.4v11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6.8" cy="17.6" r="2.2" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="14.4" cy="16.6" r="2.2" fill="none" stroke="currentColor" stroke-width="1.5"/>',
-    // Vídeo: marco con triángulo de reproducción.
-    videoFile:
-      '<rect x="2.6" y="4.6" width="14.8" height="10.8" rx="1.8" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8.6 7.6l4.4 2.4-4.4 2.4z" fill="currentColor"/>',
-    // Archivo: documento con esquina doblada.
-    file:
-      '<path d="M6.2 3h5.6l4 4v9.4a1.2 1.2 0 0 1-1.2 1.2H6.2a1.2 1.2 0 0 1-1.2-1.2V4.2A1.2 1.2 0 0 1 6.2 3z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M11.8 3v4h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>',
-    // Lupa (búsqueda inversa): círculo + mango, estilo Lucide.
-    search:
-      '<circle cx="9" cy="9" r="5.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M13.2 13.2 17 17" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
-    // Copiar: dos rectángulos superpuestos (portapapeles).
-    copy:
-      '<rect x="6.5" y="6.5" width="9" height="9" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M13.5 4.5H5.5a1.6 1.6 0 0 0-1.6 1.6v8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
-  };
-  return `<svg viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" focusable="false" aria-hidden="true">${paths[name] || paths.download}</svg>`;
+  const I = window.OperantIcons || window.NTIcons;
+  if (I) return I.svg(OVERLAY_ICON_ALIASES[name] || name, 15);
+  return ""; // sin sistema de iconos no se pinta un sustituto tipográfico
 }
 
 // --- Búsqueda inversa de imagen ---
@@ -1295,7 +1578,7 @@ const SEARCH_ENGINES = [
 
 function openSearchEngine(engine, imageUrl) {
   try {
-    chrome.runtime.sendMessage({ type: "open-tab", url: engine.url(imageUrl) }).catch(() => {
+    ctxSend({ type: "open-tab", url: engine.url(imageUrl) }).catch(() => {
       window.open(engine.url(imageUrl), "_blank", "noopener");
     });
   } catch {
@@ -1318,7 +1601,7 @@ async function uploadToTmpHost(blob) {
   // a veces como objeto plano que el SW debe reconstruir). Un frame PNG es
   // ~1MB -> ~1.4MB en base64, muy por debajo del límite de 64MiB por mensaje.
   const b64 = await blobToBase64(blob);
-  const res = await chrome.runtime.sendMessage({
+  const res = await ctxSend({
     type: "upload-tmp",
     data: b64,
     mime: blob.type || "image/png",
@@ -1465,7 +1748,7 @@ async function copyImageToClipboard(imgEl) {
     } else {
       // Dibujar el <img> ya cargado en el DOM a un canvas (sin re-fetch, que
       // moriría por CORS en imágenes cross-origin). Si el canvas se contamina
-      // (imagen sin CORS del sitio), toBlob falla y se reporta con mensaje claro.
+      // (imagen sin CORS del sitio), toBlob falla y se recurre al SW.
       const w = imgEl.videoWidth || imgEl.naturalWidth || imgEl.width;
       const h = imgEl.videoHeight || imgEl.naturalHeight || imgEl.height;
       if (!w || !h) throw new Error("Sin dimensiones para copiar");
@@ -1479,7 +1762,27 @@ async function copyImageToClipboard(imgEl) {
     await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
     return true;
   } catch (e) {
-    throw new Error(`No se pudo copiar: ${e.message}`);
+    // Fallback FUNCIONAL para CDNs que contaminan el canvas (sin CORS):
+    // los bytes llegan por el SW (fetch sin CORS + Referer real) como blob
+    // local, que sí puede pintarse y copiarse.
+    const url = imgEl instanceof HTMLImageElement ? imgEl.currentSrc || imgEl.src || "" : "";
+    if (!/^https?:/.test(url)) throw new Error(`No se pudo copiar: ${e.message}`);
+    const localBlob = await fetchBlobViaSw(url);
+    const localUrl = URL.createObjectURL(localBlob);
+    try {
+      const img = new Image();
+      img.src = localUrl;
+      await img.decode().catch(() => { throw new Error("La imagen no se pudo decodificar"); });
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      canvas.getContext("2d").drawImage(img, 0, 0);
+      const png = await new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error("No se pudo generar el PNG"))), "image/png"));
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+      return true;
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(localUrl), 30000);
+    }
   }
 }
 
@@ -1595,12 +1898,19 @@ function overlayButtonsFor(el) {
   // producía el bug del "vídeo de 786B". Preferir el manifiesto (m3u8/mpd):
   // el SW lo convierte con init+media y verifica el resultado.
   if (url.startsWith("blob:")) {
-    let manifest = null;
+    let m3u8 = null;
+    let mpd = null;
     let fallback = null;
     for (const it of store.values()) {
       if (it.source === "network" && it.type === "video" && it.url.startsWith("http")) {
-        if (/\.(m3u8|mpd)(?:[?#].*)?$/i.test(it.url)) {
-          manifest = manifest || it.url;
+        // Preferir M3U8 (HLS muxed: se descarga íntegro en el navegador);
+        // el MPD de X trae audio separado y exige remux con el companion.
+        if (/\.m3u8(?:[?#].*)?$/i.test(it.url)) {
+          m3u8 = m3u8 || it.url;
+          continue;
+        }
+        if (/\.mpd(?:[?#].*)?$/i.test(it.url)) {
+          mpd = mpd || it.url;
           continue;
         }
         // Manifiestos aparte; el filtro de init (nombre o tamaño diminuto)
@@ -1613,23 +1923,36 @@ function overlayButtonsFor(el) {
         }
       }
     }
-    // Preferir el manifiesto si no hay un directo REAL (no-init).
-    if (url.startsWith("blob:") && manifest) url = manifest;
+    // Orden de preferencia: directo REAL (no-init) → m3u8 → mpd.
     if (url.startsWith("blob:") && fallback) url = fallback;
+    if (url.startsWith("blob:") && (m3u8 || mpd)) url = m3u8 || mpd;
   }
   // URL no resoluble: el vídeo blob: no tiene stream de red capturado aún
   // (no se ha reproducido). El botón debe avisar, no mandar el blob: al SW.
   const blobUnresolved = url.startsWith("blob:");
   const isGif = type === "image" && /\.gif($|[?#])/i.test(url);
+  // Los GIF de X/Twitter se sirven como MP4 MUDO (ruta tweet_video): no hay
+  // audio que extraer. La verificación definitiva la hace el SW leyendo las
+  // cajas MP4 al hacer click (cubriría cualquier otro vídeo mudo).
+  const xGifNoAudio = type === "video" && /video\.twimg\.com\/tweet_video\//i.test(url);
+
+  // Ejecuta una acción SW y traduce su respuesta real a resultado:
+  // { ok, note? } | { ok: false, error }. NADA de éxito falso. ctxSend
+  // traduce el contexto muerto a un mensaje humano.
+  const swAction = (payload) =>
+    ctxSend(payload)
+      .catch((e) => ({ ok: false, error: String(e?.message || e) }))
+      .then((r) => {
+        if (!r?.ok) throw new Error(r?.error || "No se pudo completar la acción.");
+        return r;
+      });
 
   if (type === "image") {
     btns.push({
       icon: overlayIcon("image"),
       label: "Descargar imagen",
-      action: () => {
-        if (!url) return;
-        chrome.runtime.sendMessage({ type: "overlay-download", url: overlayBestUrl(url), filename: (el instanceof HTMLImageElement && el.alt) || "" }).catch(() => {});
-      },
+      action: () =>
+        swAction({ type: "overlay-download", url: overlayBestUrl(url), filename: (el instanceof HTMLImageElement && el.alt) || "" }),
     });
     btns.push({
       icon: overlayIcon("copy"),
@@ -1661,11 +1984,9 @@ function overlayButtonsFor(el) {
       // GIF: descargar como GIF (animación) o como VÍDEO (webm).
       btns.push({
         icon: overlayIcon("videoFile"),
-        label: "Descargar como vídeo",
-        action: () => {
-          if (!url) return;
-          chrome.runtime.sendMessage({ type: "overlay-download-gif-video", url, filename: (el instanceof HTMLImageElement && el.alt) || "" }).catch(() => {});
-        },
+        label: "Descargar como vídeo (ffmpeg local)",
+        action: () =>
+          swAction({ type: "overlay-download-gif-video", url, filename: (el instanceof HTMLImageElement && el.alt) || "" }),
       });
       btns.push({
         icon: overlayIcon("frame"),
@@ -1677,29 +1998,24 @@ function overlayButtonsFor(el) {
     btns.push({
       icon: overlayIcon("download"),
       label: "Descargar vídeo",
-      action: () => {
+      action: async () => {
         if (blobUnresolved) {
           // Sin URL de red: pedir al SW que re-consulte (el stream pudo
           // cargarse entre el hover y el click) antes de rendirse.
-          chrome.runtime.sendMessage({ type: "overlay-download", url: "", filename: "", kind: "video", blobOnly: true }).catch(() => {});
-          return;
+          return swAction({ type: "overlay-download", url: "", filename: "", kind: "video", blobOnly: true });
         }
-        if (!url) return;
-        // Primero intentar la descarga DESDE LA PÁGINA (fetch con cookies y
-        // Referer de sesión — necesario para servidores con anti-hotlink por Referer,
-        // que devuelven 403/410 al SW o al download directo). Si falla, el
-        // fallback interno envía overlay-download al SW.
-        overlayDownloadInPage(url, "");
+        if (!url) throw new Error("El elemento no expone una URL descargable.");
+        // Ruta verificada: SW con Referer → cadena honesta del SW.
+        return overlayDownloadInPage(url, "");
       },
     });
-    btns.push({
-      icon: overlayIcon("audioOnly"),
-      label: "Descargar solo el audio",
-      action: () => {
-        if (!url) return;
-        chrome.runtime.sendMessage({ type: "overlay-download-audio", url, filename: "" }).catch(() => {});
-      },
-    });
+    if (!xGifNoAudio) {
+      btns.push({
+        icon: overlayIcon("audioOnly"),
+        label: "Descargar solo el audio",
+        action: () => swAction({ type: "overlay-download-audio", url, filename: "" }),
+      });
+    }
     btns.push({
       icon: overlayIcon("frame"),
       label: "Descargar el fotograma actual",
@@ -1718,73 +2034,225 @@ function overlayButtonsFor(el) {
     btns.push({
       icon: overlayIcon("audio"),
       label: "Descargar audio",
-      action: () => {
-        if (!url) return;
-        chrome.runtime.sendMessage({ type: "overlay-download", url, filename: "" }).catch(() => {});
-      },
+      action: () => swAction({ type: "overlay-download", url, filename: "" }),
     });
   } else if (type === "file") {
     btns.push({
       icon: overlayIcon("file"),
       label: "Descargar archivo",
-      action: () => {
-        if (!url) return;
-        chrome.runtime.sendMessage({ type: "overlay-download", url, filename: "" }).catch(() => {});
-      },
+      action: () => swAction({ type: "overlay-download", url, filename: "" }),
     });
   }
   return btns;
 }
 
-// Captura el frame actual de un <video>/<img> con canvas y lo descarga.
+// Espera a que el <video> tenga un fotograma REAL decodificado. Con
+// requestVideoFrameCallback (Chrome) la captura es determinista: el callback
+// solo se dispara cuando un frame llega al compositor (evita frames negros).
+// Fallback: loadeddata + sondeo de readyState. Devuelve true/false.
+function waitForVideoFrame(el, timeoutMs = 6000) {
+  return new Promise((resolve) => {
+    if (el.readyState >= 2 && el.videoWidth > 0) return resolve(true);
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      resolve(!!v);
+    };
+    const t = setTimeout(() => finish(el.readyState >= 2 && el.videoWidth > 0), timeoutMs);
+    try {
+      if (typeof el.requestVideoFrameCallback === "function") el.requestVideoFrameCallback(() => finish(true));
+    } catch { /* sin rVFC: fallback por eventos */ }
+    el.addEventListener("loadeddata", () => {
+      try {
+        if (typeof el.requestVideoFrameCallback === "function") el.requestVideoFrameCallback(() => finish(true));
+        else finish(true);
+      } catch { finish(true); }
+    }, { once: true });
+    el.addEventListener("error", () => finish(false), { once: true });
+  });
+}
+
+// Descarga un blob vía el SW como data URL (fetch sin CORS + Referer real).
+// Es el ÚNICO camino para capturar fotogramas/copiar en CDNs cross-origin:
+// su canvas queda contaminado (tainted) y toBlob/getImageData fallan.
+async function fetchBlobViaSw(url) {
+  const r = await ctxSend({ type: "fetch-blob-data", url, pageUrl: location.href }).catch(() => null);
+  if (!r?.ok) throw new Error(r?.error || "No se pudo capturar el medio (fallo de red o tamaño).");
+  const res = await fetch(r.dataUrl);
+  return res.blob();
+}
+
+// Captura el frame actual de un <video>/<img> y lo descarga vía el SW
+// (overlay-download-blob con data URL → estado final verificado).
+// Devuelve { ok, note } o { ok: false, error } — el llamador refleja el
+// resultado REAL, sin check de éxito falso.
 async function overlayCaptureFrame(el, mime) {
-  try {
+  const tryDraw = async (source, w, h) => {
     const canvas = document.createElement("canvas");
-    const w = el.videoWidth || el.naturalWidth || el.width;
-    const h = el.videoHeight || el.naturalHeight || el.height;
-    if (!w || !h) return;
     canvas.width = w;
     canvas.height = h;
     const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.drawImage(el, 0, 0, w, h);
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, mime, 0.92));
-    if (!blob) return;
-    const objUrl = URL.createObjectURL(blob);
-    chrome.runtime.sendMessage({ type: "overlay-download", url: objUrl, filename: `frame-${Date.now()}.${mime === "image/png" ? "png" : "jpg"}` }).catch(() => {});
-    setTimeout(() => URL.revokeObjectURL(objUrl), 60000);
+    if (!ctx) throw new Error("Canvas 2D no disponible");
+    ctx.drawImage(source, 0, 0, w, h);
+    return await new Promise((res, rej) =>
+      canvas.toBlob((b) => (b ? res(b) : rej(new Error("taint"))), mime, 0.92)
+    );
+  };
+
+  let blob = null;
+  let w = el.videoWidth || el.naturalWidth || el.width;
+  let h = el.videoHeight || el.naturalHeight || el.height;
+  if (!w || !h) throw new Error("El medio aún no ha decodificado ningún fotograma. Reprodúcelo e inténtalo de nuevo.");
+
+  // 1) Captura directa del elemento (funciona con MSE/blob: y medios
+  //    same-origin o con CORS). Los <video> esperan un frame decodificado.
+  try {
+    if (el instanceof HTMLVideoElement) {
+      const ready = await waitForVideoFrame(el);
+      if (!ready) throw new Error("taint");
+      w = el.videoWidth || w;
+      h = el.videoHeight || h;
+    }
+    blob = await tryDraw(el, w, h);
   } catch {
-    /* canvas no disponible */
+    // 2) Fallback funcional: bytes vía SW → blob local (mismo origen) →
+    //    decode → canvas limpio. Funciona con cualquier CDN ≤64MB.
+    const url = overlayUrlOf(el);
+    if (!/^https?:/.test(url || "")) {
+      throw new Error("El servidor del medio bloquea la captura (CORS) y el elemento no expone una URL de red.");
+    }
+    const localBlob = await fetchBlobViaSw(url);
+    const localUrl = URL.createObjectURL(localBlob);
+    try {
+      if (el instanceof HTMLVideoElement) {
+        const v = document.createElement("video");
+        v.muted = true;
+        v.playsInline = true;
+        v.preload = "auto";
+        v.src = localUrl;
+        const ok = await waitForVideoFrame(v, 10000);
+        w = v.videoWidth;
+        h = v.videoHeight;
+        if (!ok || !w || !h) throw new Error("El vídeo descargado no se pudo decodificar para extraer el fotograma.");
+        blob = await tryDraw(v, w, h);
+      } else {
+        const img = new Image();
+        img.src = localUrl;
+        await img.decode().catch(() => { throw new Error("La imagen descargada no se pudo decodificar."); });
+        w = img.naturalWidth;
+        h = img.naturalHeight;
+        if (!w || !h) throw new Error("La imagen no expone dimensiones.");
+        blob = await tryDraw(img, w, h);
+      }
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(localUrl), 30000);
+    }
   }
+
+  if (!blob || blob.size < 64) throw new Error("El fotograma capturado está vacío.");
+  // Entrega POR EL SW (data URL + monitor de finalización): el blob del
+  // content script no es accesible desde chrome.downloads.
+  const b64 = await blobToBase64(blob);
+  const ext = mime === "image/png" ? "png" : "jpg";
+  const r = await ctxSend({
+    type: "overlay-download-blob", dataUrl: `data:${mime};base64,${b64}`, mime, filename: `frame-${Date.now()}.${ext}`,
+  }).catch((e) => ({ ok: false, error: String(e?.message || e) }));
+  if (!r?.ok) throw new Error(r?.error || "No se pudo guardar el fotograma.");
+  return { ok: true, note: "Fotograma guardado." };
 }
 
-// Descarga DESDE EL CONTEXTO DE EXTENSIÓN (el SW), nunca desde la página:
-// un fetch aquí (content script) comparte la pila de red de la página y queda
-// sujeto a CORS real — por eso los servidores con comprobación estricta de cabecera bloqueaban la lectura con
-// "ERR_FAILED". El SW con <all_urls> no tiene CORS y declarativeNetRequest le
-// inyecta el Referer de la página (regla efímera por descarga). El blob vuelve
-// al panel vía download-blob -> chrome.downloads.
-// Devuelve una promesa {ok} / {ok:false,error} para el handler capture-in-page.
-async function overlayDownloadInPage(url, filename) {
-  try {
-    const res = await chrome.runtime.sendMessage({
-      type: "sw-fetch-blob",
-      url,
-      filename: filename || url.split("/").filter(Boolean).pop() || "descarga",
-      pageUrl: location.href, // Referer real de la página (lo usa la regla DNR)
-    });
-    if (res?.ok) return { ok: true };
-    throw new Error(res?.error || "fallback no disponible");
-  } catch (e) {
-    // Si el SW no pudo (cookies HttpOnly / DNR no aplica), caer al flujo normal
-    // del SW (directo/manifiesto/yt-dlp). NUNCA fetch desde content.js.
-    chrome.runtime.sendMessage({ type: "overlay-download", url, filename, kind: "video" }).catch(() => {});
-    return { ok: false, error: String(e?.message || e) };
+// Captura REAL desde el contexto de la página.
+//
+// Esto es lo que la documentación siempre prometió ("capturar el recurso DESDE
+// la página, con cookies + Referer de sesión") y lo que no existía: la
+// implementación anterior delegaba de vuelta en el service worker, que es
+// justo donde las cookies HttpOnly NO están disponibles. El resultado era que
+// el "Nivel B" no aportaba nada que el "Nivel A" no tuviera ya.
+//
+// Un fetch desde un content script:
+//   · sale con el ORIGEN de la página, así que el navegador adjunta las
+//     cookies del sitio — incluidas las HttpOnly, porque el navegador las
+//     añade, no nosotros;
+//   · envía `Referer` = la URL de la página, sin que nadie lo falsifique;
+//   · está sujeto a CORS de la página: si el CDN no manda ACAO, morimos aquí
+//     (y para eso está el Nivel A, que usa <all_urls> desde el SW).
+//
+// Por eso esta vía es un COMPLEMENTO del Nivel A, no un sustituto, y por eso
+// tiene un tope: el transporte de vuelta es un data URL en un único mensaje,
+// que a partir de cierto tamaño es una boga de memoria.
+const IN_PAGE_CAPTURE_MAX = 16 * 1024 * 1024;
+
+async function captureInPage(url, filename) {
+  const res = await fetch(url, {
+    credentials: "include",
+    referrer: location.href,
+    referrerPolicy: "unsafe-url",
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const declared = Number(res.headers.get("content-length") || 0);
+  if (declared > IN_PAGE_CAPTURE_MAX) {
+    throw new Error(
+      `El recurso mide ${(declared / 1048576).toFixed(0)} MB y la captura en página está limitada a ${(IN_PAGE_CAPTURE_MAX / 1048576).toFixed(0)} MB. Descárgalo desde el panel (cola por chunks).`
+    );
   }
+  const blob = await res.blob();
+  if (!blob.size) throw new Error("La página recibió una respuesta vacía");
+  if (blob.size > IN_PAGE_CAPTURE_MAX) {
+    throw new Error(
+      `El recurso mide ${(blob.size / 1048576).toFixed(0)} MB y la captura en página está limitada a ${(IN_PAGE_CAPTURE_MAX / 1048576).toFixed(0)} MB. Descárgalo desde el panel.`
+    );
+  }
+  const mime = blob.type || "application/octet-stream";
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("No se pudo leer el recurso"));
+    reader.readAsDataURL(blob);
+  });
+  if (!dataUrl.startsWith("data:")) throw new Error("No se pudo preparar el recurso");
+  // El SW entrega el data URL al gestor de descargas y espera su estado final.
+  await ctxSend({ type: "overlay-download-blob", dataUrl, filename, mime });
+  return { ok: true, note: "Capturado desde la página con la sesión del sitio." };
+}
+
+// Descarga desde el content script. Cadena de tres niveles, cada uno con una
+// ventaja distinta sobre el anterior (no tres intentos de lo mismo):
+//   1. sw-fetch-blob — el SW hace el fetch con <all_urls> (sin CORS) y Referer
+//      inyectado por DNR. Es el más general: funciona con cualquier CDN. Si el
+//      usuario concedió el permiso opcional `cookies`, el SW además inyecta la
+//      cabecera Cookie, y entonces cubre también el contenido autenticado.
+//   2. capture-in-page — fetch desde la página: cookies HttpOnly y Referer
+//      reales, sin necesidad de ningún permiso. Limitado a 16 MB y a CDNs que
+//      manden ACAO.
+//   3. overlay-download — la cadena completa del SW (sondeo → descarga del
+//      navegador monitorizada → Referer → yt-dlp), que además sabe resolver
+//      blob: buscando el stream real entre los capturados por webRequest.
+// Devuelve el resultado REAL del nivel que funcionó, para el indicador.
+async function overlayDownloadInPage(url, filename) {
+  const res = await ctxSend({
+    type: "sw-fetch-blob",
+    url,
+    filename,
+    pageUrl: location.href,
+  }).catch((e) => ({ ok: false, error: String(e?.message || e) }));
+  if (res?.ok) return { ok: true, note: res.note };
+
+  const pageRes = await captureInPage(url, filename).catch((e) => ({
+    ok: false,
+    error: String(e?.message || e),
+  }));
+  if (pageRes?.ok) return pageRes;
+
+  const r2 = await ctxSend({ type: "overlay-download", url, filename, kind: "video" })
+    .catch((e) => ({ ok: false, error: String(e?.message || e) }));
+  return r2 || { ok: false, error: `Sin respuesta del service worker (sw: ${res?.error || "?"}; página: ${pageRes?.error || "?"})` };
 }
 
 function showPageOverlay(el) {
-  if (!overlayAllowedFor(location)) return;
+  if (contextDead || !overlayAllowedFor(location)) return;
   if (!overlayTargetEligible(el)) return; // filtros configurables (tamaño/SVG)
   const btns = overlayButtonsFor(el);
   if (!btns.length) return;
@@ -1813,7 +2281,7 @@ function showPageOverlay(el) {
     } else {
       btn.innerHTML = b.icon;
     }
-    btn.addEventListener("click", (ev) => {
+    btn.addEventListener("click", async (ev) => {
       ev.stopPropagation();
       ev.preventDefault();
       // Acciones que abren popover (búsqueda) o copian no deben marcar busy
@@ -1834,21 +2302,39 @@ function showPageOverlay(el) {
       if (indicator) {
         indicator.setProgress(undefined); // indeterminado: anillo rotando
       }
+      // HONESTIDAD: se ESPERA el resultado real de la acción (el SW responde
+      // tras verificar los bytes y el estado final de la descarga, o con un
+      // error con su causa). El check SOLO aparece con éxito verificado.
+      let outcome = { ok: true };
       try {
-        b.action(btn);
+        outcome = (await b.action(btn)) || { ok: true };
       } catch (e) {
-        /* la acción nunca debe romper el overlay */
-        if (indicator) indicator.error();
+        outcome = { ok: false, error: String(e?.message || e) };
       }
       clearTimeout(overlayHideTimer);
-      // Si hay indicador, completar con check antes de ocultar (estado 4:
-      // vuelve a idle si el cursor sigue encima — el overlay no desaparece).
+      if (outcome.ok === false) {
+        if (indicator) indicator.error();
+        toastMsg(outcome.error || "No se pudo completar la acción");
+        overlayHideTimer = setTimeout(() => {
+          ov.classList.remove("operant-ov-busy");
+          hidePageOverlay();
+        }, 2400);
+        return;
+      }
+      // "ENCOLADO" (companion/yt-dlp): el resultado REAL llegará al panel —
+      // declararlo como éxito verificado sería mentir. Toast informativo,
+      // SIN check.
+      if (outcome.enqueued) {
+        toastMsg(outcome.note || "Enviado al procesador local… El resultado se confirma en el panel.");
+        overlayHideTimer = setTimeout(() => hidePageOverlay(), 1400);
+        return;
+      }
+      // Éxito verificado (archivo entregado al gestor de descargas).
       if (indicator) {
-        setTimeout(() => {
-          indicator.success();
-          overlayHideTimer = setTimeout(() => hidePageOverlay(), 1400);
-        }, 900);
+        indicator.success();
+        overlayHideTimer = setTimeout(() => hidePageOverlay(), 1200);
       } else {
+        toastMsg(outcome.note || "Descarga completada.");
         overlayHideTimer = setTimeout(() => hidePageOverlay(), 900);
       }
     });
@@ -1984,7 +2470,7 @@ function overlayInPopover(x, y) {
 }
 
 function handleOverlayMove(x, y) {
-  if (!overlayAllowedFor(location)) return;
+  if (contextDead || !overlayAllowedFor(location)) return;
   // Mientras el overlay esté "ocupado" (acción en curso tras un click),
   // no ocultarlo: el feedback de procesando debe completarse.
   if (pageOverlay && !pageOverlay.hidden && pageOverlay.classList.contains("operant-ov-busy")) return;
@@ -2196,7 +2682,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // Diseño milimétrico: contenedor compacto, transparencia base, hover estable
 // (sin scale que tambalee), animación de pulsación sobria y feedback de acción.
 // Incluye el CSS del indicador de descarga compartido (anillo/check/error).
-if (!document.getElementById("operant-page-overlay-style")) {
+// REMOVE-then-CREATE: una nueva generación siempre impone SU css (la de una
+// generación previa pudo quedar huérfana tras recargar la extensión).
+{
+  document.getElementById("operant-page-overlay-style")?.remove();
   const style = document.createElement("style");
   style.id = "operant-page-overlay-style";
   const indCss = window.OperantDLIndicatorCSS || window.NTDLIndicatorCSS;

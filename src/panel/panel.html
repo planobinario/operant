@@ -5,19 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Operant</title>
     <link rel="stylesheet" href="panel.css" />
-    <script>
-      (() => {
-        try {
-          const stored = localStorage.getItem('theme');
-          const theme = stored === 'light' || stored === 'dark'
-            ? stored
-            : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
-          document.documentElement.dataset.theme = theme;
-        } catch {
-          document.documentElement.dataset.theme = 'dark';
-        }
-      })();
-    </script>
+    <!-- Tema antes del primer pintado. Antes era un <script> inline, que la CSP
+         por defecto de MV3 prohíbe (addons-linter: INLINE_SCRIPT). Sigue siendo
+         síncrono y en <head>, así que no hay destello de color. -->
+    <script src="theme-boot.js"></script>
   </head>
   <body>
     <!-- Fila única consolidada: Selección + Buscador + Zip + Vista + Acciones -->
@@ -33,7 +24,7 @@
 
       <!-- Buscador integrado -->
       <div class="search-box">
-        <svg class="search-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+        <svg class="search-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
         <input
           id="search"
           class="search"
@@ -47,7 +38,7 @@
       <!-- Acciones de cabecera: Zip normalizado + Vista + Acciones rápidas -->
       <div class="top-actions">
         <button id="btnZip" class="chip-btn primary zip-btn" disabled title="Descargar elementos seleccionados en archivo zip">
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
           <span class="zip-text">Zip</span>
         </button>
         <select id="layoutSel" class="ctl view-select" title="Vista">
@@ -56,12 +47,10 @@
         </select>
         <button id="btnRefresh" class="icon-btn" title="Re-escaneo manual (muestra progreso)" aria-label="Actualizar">⟳</button>
         <button id="btnCompanionHeader" class="icon-btn" title="Operant Companion (yt-dlp / ffmpeg)" aria-label="Operant Companion">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="M6 10l3 3-3 3M13 16h5"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><path d="M12 19h8"/></svg>
         </button>
         <button id="btnRecord" class="icon-btn" title="Grabar vídeo (buffers MSE, requiere host nativo)" aria-label="Grabar vídeo" aria-pressed="false">
-          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-            <circle cx="8" cy="8" r="5" fill="currentColor" />
-          </svg>
+          <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/></svg>
         </button>
         <button
           id="btnFilter"
@@ -70,9 +59,9 @@
           aria-label="Ajustes"
           aria-expanded="false"
         >
-          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="3"></circle>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a2 2 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a2 2 0 0 0 1.82.33H9a2 2 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a2 2 0 0 0 1 1.51 2 2 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a2 2 0 0 0-.33 1.82V9a2 2 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
           </svg>
         </button>
       </div>
@@ -122,13 +111,13 @@
         <span class="pop-label">Tema</span>
         <div class="theme-segmented">
           <button type="button" class="theme-segment-btn" data-theme-val="dark" title="Tema oscuro (Warm Ink)">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg> Oscuro
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg> Oscuro
           </button>
           <button type="button" class="theme-segment-btn" data-theme-val="light" title="Tema claro (Paper Light)">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2"/></svg> Blanco
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2"/></svg> Blanco
           </button>
           <button type="button" class="theme-segment-btn" data-theme-val="system" title="Detectar según el sistema">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg> Auto
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg> Auto
           </button>
         </div>
       </div>
@@ -249,13 +238,16 @@
       <div class="player-head">
         <div class="lb-title" id="vdTitle"></div>
         <div class="lb-tools">
+          <button id="vdPopout" class="icon-btn" title="Ventana flotante (pantalla completa real)" aria-label="Ventana flotante">⛶</button>
           <button id="vdDownload" class="chip-btn" title="Descargar">↓</button>
           <button id="vdOpen" class="chip-btn" title="Abrir en pestaña nueva">↗</button>
           <button id="vdClose" class="icon-btn" title="Cerrar (Esc)">✕</button>
         </div>
       </div>
       <div class="player-stage">
+        <button id="vdPrev" class="icon-btn lb-nav" title="Anterior (←)" aria-label="Anterior" hidden>‹</button>
         <video id="vdEl" controls playsinline preload="metadata"></video>
+        <button id="vdNext" class="icon-btn lb-nav" title="Siguiente (→)" aria-label="Siguiente" hidden>›</button>
         <div id="vdEmbed" hidden></div>
         <div id="vdErr" class="preview-err" hidden></div>
       </div>
@@ -424,6 +416,7 @@
     <script src="../vendor/jszip.min.js"></script>
     <script src="../vendor/hls.min.js"></script>
     <script src="../vendor/dash.all.min.js"></script>
+    <script src="../shared/icons.js"></script>
     <script src="../shared/dl-indicator.js"></script>
     <script type="module" src="panel.js"></script>
   </body>

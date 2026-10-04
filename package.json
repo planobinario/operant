@@ -1,6 +1,6 @@
 {
   "name": "operant",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "license": "GPL-3.0-or-later",
   "description": "Operant — Extensión multi-navegador con Native Messaging, media scraping, ffmpeg, yt-dlp y base para agentes de navegación.",
@@ -9,14 +9,23 @@
     "dev:firefox": "node scripts/build-firefox.mjs && web-ext run --source-dir=./dist-firefox",
     "build": "web-ext build --source-dir=./src --artifacts-dir=./web-ext-artifacts --overwrite-dest",
     "build:firefox": "node scripts/build-firefox.mjs && web-ext build --source-dir=./dist-firefox --artifacts-dir=./web-ext-artifacts --overwrite-dest",
+    "lint": "node scripts/check-syntax.mjs",
+    "lint:web-ext": "web-ext lint --source-dir=./src --warnings-as-errors",
+    "test:unit": "node --test tests/unit/filename.test.js tests/unit/icons.test.js tests/unit/media-core.test.js tests/unit/hls-fast.test.js tests/unit/extension-id.test.js",
+    "test": "npm run lint && npm run test:unit",
     "test:verify": "node tests/run-verification.js",
     "test:verify:public": "node tests/run-verification.js --public",
+    "test:verify:strict": "node tests/run-verification.js --strict",
     "test:audit": "node tests/run-panel-audit.js",
     "test:fixtures": "node tests/generate-fixtures.js",
     "host:build": "cargo build --release --manifest-path native-host-rs/Cargo.toml && powershell -Command Copy-Item native-host-rs/target/release/operant-host.exe native-host/operant-host.exe -Force",
-    "host:test": "python tests/host-e2e.py --skip-ytdlp-download --skip-ffmpeg-download"
+    "host:test": "python tests/host-e2e.py --skip-ytdlp-download --skip-ffmpeg-download",
+    "host:lint": "cargo fmt --manifest-path native-host-rs/Cargo.toml -- --check && cargo clippy --manifest-path native-host-rs/Cargo.toml --all-targets -- -D warnings",
+    "keygen": "node scripts/gen-extension-key.mjs",
+    "key:verify": "node scripts/gen-extension-key.mjs --verify"
   },
   "devDependencies": {
+    "acorn": "8.18.0",
     "puppeteer-core": "25.4.0",
     "web-ext": "^8.3.0"
   },

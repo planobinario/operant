@@ -45,7 +45,7 @@ Incorpora un **Side Panel profesional** de alta densidad visual, descargas optim
 * **Miniatura Local como Respaldo Seguro**: Cada imagen de alta resolución conserva su miniatura funcional en el DOM (`item.thumb`). Si un servidor externo deniega el acceso o la URL remota expira, el panel y el Lightbox conmutan automáticamente a la miniatura local sin mostrar carteles de error ni dejar tarjetas rotas.
 
 ### 5. Operant Companion — Host Nativo Autónomo en Rust Puro
-* **Binario Standalone Ligero (2.5 MB)**: Implementado en Rust (`native-host-rs/`), compilado en `native-host/operant-host.exe`. **Cero dependencias de Python, sin necesidad de consola.**
+* **Binario Standalone Ligero (2.5 MB)**: Implementado en Rust (`native-host-rs/`) y publicado como artefacto de release (no versionado en git). **Cero dependencias de Python, sin necesidad de consola.**
 * **Registro en 1 Doble Clic**: Ejecutar `operant-host.exe` abre un asistente nativo con interfaz Win32 que detecta automáticamente los navegadores instalados (Chrome, Edge, Firefox) y registra el manifiesto de Native Messaging en el Registro de Windows.
 * **Auto-Gestión de `yt-dlp` y `ffmpeg`**: Detecta versiones instaladas en el sistema (PATH) o en su directorio aislado (`~/Operant/bin/`). Descarga, verifica y actualiza binarios oficiales de forma atómica y silenciosa.
 * **Procesado Multimedia de Alto Rendimiento**: Remux a MP4 sin pérdida, compresión H.264/AAC con CRF configurable, extracción de audio MP3 y reescalado de vídeo.
@@ -78,10 +78,10 @@ operant/
 │   └── icons/                         # Identidad visual de la extensión (16, 48, 128 px)
 │
 ├── native-host/                       # Aplicación satélite Native Messaging
-│   ├── operant-host.exe               # Binario autónomo compilado en Rust (Windows)
 │   ├── operant_host.py                # Host de referencia en Python (stdlib pura)
 │   ├── install_host.bat / .sh         # Scripts de registro multiplataforma
 │   └── operant_host_manifest.json     # Plantilla de manifiesto Native Messaging
+│                                        # (el .exe NO se versiona: es artefacto de release)
 │
 ├── native-host-rs/                    # Código fuente en Rust del Operant Companion
 │   ├── Cargo.toml                     # Configuración del paquete Cargo y dependencias
@@ -115,8 +115,15 @@ operant/
 
 ### 2. Activar el Operant Companion (Host Nativo)
 * **En Windows (Recomendado)**:
-  1. Ve a la carpeta `native-host/` y haz **doble clic en `operant-host.exe`**.
-  2. Un cuadro de diálogo confirmará la vinculación con Chrome, Edge y Firefox automáticamente.
+  1. Descarga `operant-host.exe` desde la sección **Releases** del repositorio
+     (GitHub → *Releases* → el tag que estés usando). Verifica el SHA-256 con
+     `operant-host.exe.sha256`, también incluido en el release.
+  2. Haz **doble clic en `operant-host.exe`**.
+  3. Un cuadro de diálogo confirmará la vinculación con Chrome, Edge y Firefox automáticamente.
+
+  El binario **no está en el repositorio a propósito**: es un artefacto compilado
+  por CI en un runner nativo de Windows. Compílalo tú mismo con `npm run host:build`
+  si prefieres revisar el código antes de ejecutarlo (el fuente está en `native-host-rs/`).
 * **En Linux / macOS (o usando Python)**:
   ```bash
   cd native-host

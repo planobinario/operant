@@ -1,0 +1,24 @@
+{
+  "_commento": [
+    "Baseline de avisos de addons-linter para el build de Firefox.",
+    "Un aviso NUEVO o un recuento que suba hace fallar la CI: el baseline solo congela",
+    "la deuda conocida y revisada, no silencia el linter.",
+    "",
+    "Deuda aceptada y por qué:",
+    "  DANGEROUS_EVAL (4) — vendor/dash.all.min.js y vendor/jszip.min.js.",
+    "    Bibliotecas de terceros minificadas. No se pueden parchear sin dejar de",
+    "    distribuirlas. Sustituirlas es una decisión de producto, no de lint.",
+    "",
+    "  UNSAFE_VAR_ASSIGNMENT (16) — content.js, panel/panel.js, shared/dl-indicator.js.",
+    "    TODAS son `el.innerHTML = iconSvg(...)` o `el.innerHTML = \"\"`.",
+    "    El valor es un SVG estático producido por src/shared/icons.js, y el punto",
+    "    único de interpolación (size) está coaccionado a entero acotado.",
+    "    La invariante la comprueba tests/unit/icons.test.js: gramática SVG",
+    "    estricta, sin atributos on*, sin javascript:, sin referencias externas.",
+    "    Ver ese test antes de tocar este número."
+  ],
+  "vendorDANGEROUS_EVAL": 4,
+  "ownUNSAFE_VAR_ASSIGNMENT": 16,
+  "total": 20,
+  "errors": 0
+}

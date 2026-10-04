@@ -1,12 +1,12 @@
+use base64::prelude::*;
+use regex::Regex;
+use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use base64::prelude::*;
-use regex::Regex;
-use serde_json::json;
 
 use crate::ffmpeg_ops::looks_like_real_media;
 use crate::protocol::MessageSender;
@@ -56,11 +56,14 @@ impl RecorderManager {
         let _ = fs::File::create(&audio_path);
 
         let mut map = self.sessions.lock().unwrap();
-        map.insert(session_id.clone(), RecSession {
-            dir: temp_dir,
-            video_path,
-            audio_path,
-        });
+        map.insert(
+            session_id.clone(),
+            RecSession {
+                dir: temp_dir,
+                video_path,
+                audio_path,
+            },
+        );
 
         let _ = sender.send(&json!({
             "type": "rec-beginned",
@@ -100,7 +103,11 @@ impl RecorderManager {
             }
         };
 
-        let mut file = match OpenOptions::new().create(true).append(true).open(target_path) {
+        let mut file = match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(target_path)
+        {
             Ok(f) => f,
             Err(e) => {
                 let _ = sender.send(&json!({
@@ -225,7 +232,16 @@ fn finish_recording(sess: RecSession, filename: &str, sender: MessageSender) {
         cmd.args(["-i", &sess.audio_path.to_string_lossy()]);
     }
 
-    cmd.args(["-c", "copy", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", &out_path.to_string_lossy()]);
+    cmd.args([
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        &out_path.to_string_lossy(),
+    ]);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -126,7 +126,19 @@ const panelEval = (p, expr, label, ms = 12000) =>
       await sleep(800);
       await panel.screenshot({ path: path.join(RESULTS, `screenshot-${view}.png`) });
     }
-    check(true, `capturas: screenshot-grid/list/masonry.png en tests/results/`);
+  // AVISOS QUE ESTE HARNESS DABA POR BUENOS Y NO LO ERAN
+  // -----------------------------------------------------
+  // 1) `check(true, ...)` incondicional: sumaba un PASS al recuento sin
+  //    comprobar nada. Ahora se comprueba que los ficheros existen de verdad.
+  const expectedShots = ["screenshot-grid.png", "screenshot-list.png", "screenshot-masonry.png"];
+  const missingShots = expectedShots.filter((f) => !fs.existsSync(path.join(RESULTS, f)));
+  check(
+    missingShots.length === 0,
+    `capturas generadas (faltan: ${missingShots.join(", ") || "ninguna"})`
+  );
+  if (missingShots.length === 0) {
+    console.log(`  [INFO] capturas: ${expectedShots.join(", ")} en tests/results/`);
+  }
   }
   if (panelErrors.length) console.log("  [WARN] errores del panel:", panelErrors.join(" | "));
   await panel.close().catch(() => {});
@@ -147,12 +159,22 @@ const panelEval = (p, expr, label, ms = 12000) =>
     if (jobs.length >= 3 && jobs.every((j) => j.status === "done" || j.status === "error")) break;
   }
   check(jobs.length >= 3, `3 jobs creados (${jobs.length})`);
-  check(jobs.every((j) => j.status === "done"), `todos completados (${jobs.map((j) => j.status).join(",")})`);
+  // 2) `[].every(...)` es TRUE sobre un array vacío: con 0 jobs, "todos
+  //    completados" y "progreso al 100%" pasaba sin comprobar nada. Ese bug
+  //    llegó a grabarse como evidencia en tests/results/A2-dl-queue.json con
+  //    verdict PASS. Ahora se exige que haya jobs y que ninguno esté en error.
+  const notDone = jobs.filter((j) => j.status !== "done");
+  check(jobs.length > 0 && notDone.length === 0, `todos completados (${jobs.map((j) => j.status).join(",") || "sin jobs"})`);
   if (jobs.some((j) => j.status === "error")) {
     console.log("  [INFO] errores de job:", [...new Set(jobs.map((j) => j.error || "?"))].join(" | "));
   }
-  check(jobs.every((j) => j.progress === 100), `progreso real al 100% (${jobs.map((j) => j.progress).join(",")})`);
-  check(jobs.every((j) => j.total === 12 * 1024 * 1024), `tamano total 12 MB correcto (${jobs[0]?.total || "?"})`);
+  const notFull = jobs.filter((j) => j.progress !== 100);
+  check(jobs.length > 0 && notFull.length === 0, `progreso real al 100% (${jobs.map((j) => j.progress).join(",") || "sin jobs"})`);
+  const wrongSize = jobs.filter((j) => j.total !== 12 * 1024 * 1024);
+  check(
+    jobs.length > 0 && wrongSize.length === 0,
+    `tamano total 12 MB correcto (${jobs.map((j) => j.total).join(",") || "sin jobs"})`
+  );
   await panel2.close().catch(() => {});
 
   // ============ A3: sincronizacion entre pestanas ============
