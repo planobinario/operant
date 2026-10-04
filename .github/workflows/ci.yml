@@ -173,7 +173,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: extension-packages
-          path: web-ext-artifacts/*.zip
+          # `chromium/` y `firefox/` van en directorios distintos A PROPÓSITO:
+          # web-ext nombra el zip por nombre+versión, así que con un solo
+          # directorio los dos builds se pisan y el paquete de Chrome se
+          # pierde en silencio. Se detectó al inspeccionar los zips.
+          path: web-ext-artifacts/
           retention-days: 14
           if-no-files-found: ignore
 

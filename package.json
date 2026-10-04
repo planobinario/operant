@@ -7,8 +7,8 @@
   "scripts": {
     "dev": "web-ext run --target=chromium --source-dir=./src",
     "dev:firefox": "node scripts/build-firefox.mjs && web-ext run --source-dir=./dist-firefox",
-    "build": "web-ext build --source-dir=./src --artifacts-dir=./web-ext-artifacts --overwrite-dest",
-    "build:firefox": "node scripts/build-firefox.mjs && web-ext build --source-dir=./dist-firefox --artifacts-dir=./web-ext-artifacts --overwrite-dest",
+    "build": "web-ext build --source-dir=./src --artifacts-dir=./web-ext-artifacts/chromium --overwrite-dest",
+    "build:firefox": "node scripts/build-firefox.mjs && web-ext build --source-dir=./dist-firefox --artifacts-dir=./web-ext-artifacts/firefox --overwrite-dest",
     "lint": "node scripts/check-syntax.mjs",
     "lint:web-ext": "web-ext lint --source-dir=./src --warnings-as-errors",
     "test:unit": "node --test tests/unit/filename.test.js tests/unit/icons.test.js tests/unit/media-core.test.js tests/unit/hls-fast.test.js tests/unit/extension-id.test.js",
