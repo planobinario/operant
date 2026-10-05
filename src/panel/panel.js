@@ -4511,6 +4511,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // Modo grabación: captura los buffers MSE del reproductor de la pestaña y los
 // ensambla con ffmpeg del host nativo. Estado gestionado por el SW.
 let recState = "idle";
+// Id de la petición `rec-end` que lanzó el ensamblado con ffmpeg, o null si no
+// hay ninguno (o si el host es viejo y no devuelve ids). Ver el manejador de
+// mensajes "native".
+let recAssembleJobId = null;
 btnRecord.addEventListener("click", async () => {
   if (recState === "recording" || recState === "starting") {
     chrome.runtime.sendMessage({ type: "record-stop" }).catch(() => {});
@@ -4746,6 +4750,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "rec") {
     // Estado del modo grabación (buffers MSE → host nativo).
     recState = msg.state || "idle";
+    // `jobId` es el id de la petición `rec-end` que lanzó el ensamblado. Los
+    // mensajes que lleguen con ese id son del ensamblado; el resto son de
+    // descargas en curso y no deben escribirse en la barra de la grabación.
+    recAssembleJobId = msg.jobId || null;
     btnRecord.classList.toggle("recording", recState === "recording" || recState === "starting");
     btnRecord.setAttribute("aria-pressed", String(recState === "recording" || recState === "starting"));
     if (recState === "starting") statusText.textContent = "Iniciando grabación de buffers MSE…";
@@ -4760,7 +4768,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg.type === "native") {
     const m = msg.msg || msg;
-    if (recState === "assembling") {
+    // Un mensaje es del ensamblado de la grabación si su `id` es el de la
+    // petición `rec-end` que lo lanzó.
+    //
+    // Antes la condición era solo `recState === "assembling"`, y eso atendía
+    // CUALQUIER `ffmpeg-progress` que llegara: el de una descarga en curso
+    // escribía "Ensamblando grabación… 40%" en la barra de estado. Y al revés:
+    // si `recState` ya había vuelto a "idle" mientras el ensamblado seguía vivo,
+    // su progreso caía en el diálogo "Descargando a tu PC…" y lo pisaba.
+    //
+    // Con host v2 la atribución es por `id` y no depende de `recState`, que es
+    // una pista de UI y no un hecho del job. Con un host viejo, que no devuelve
+    // ids, se conserva la condición anterior: no se puede distinguir, y es
+    // preferible a descartar el mensaje.
+    const isAssembly = recAssembleJobId
+      ? msg.id === recAssembleJobId
+      : recState === "assembling";
+    if (isAssembly) {
       // Progreso del ffmpeg que ensambla la grabación (el diálogo de
       // procesado no está abierto: todo va a la barra de estado).
       if (m.type === "ffmpeg-progress") {

@@ -99,6 +99,16 @@ jobs:
 
 
 
+      - name: Contrato del protocolo nativo (binario real)
+        # Requiere compilar el host: testear una reimplementación en JS del
+        # protocolo solo comprobaría que el JS coincide consigo mismo. El
+        # contrato tiene dos formas vivas (v1 plano y v2 envelope) y hay
+        # usuarios con un .exe viejo instalado, así que la compatibilidad se
+        # verifica contra el binario que se distribuye.
+        run: |
+          cargo build --release --locked --manifest-path native-host-rs/Cargo.toml
+          node tests/native/contract.mjs native-host-rs/target/release/operant-host.exe
+
       - name: Subir resultados de los tests
         if: always()
         uses: actions/upload-artifact@v4

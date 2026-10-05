@@ -70,17 +70,43 @@ if (Array.isArray(manifest.permissions)) {
 // fichero por su equivalente de Gecko, de modo que el XPI no contiene NINGUNA
 // referencia a una API que Firefox no implementa (y addons-linter deja de
 // marcar UNSUPPORTED_API sin que haya que ocultar nada).
+//
+// El resultado se llama `panel-entry.js`, NO `panel-entry-chromium.js`.
+//
+// Antes se renombraba el fichero de Gecko a `panel-entry-chromium.js` para no
+// tener que reescribir el import. Funcionaba, pero dejaba el XPI con un fichero
+// llamado "chromium" que contiene código de Gecko: al auditar el paquete, un
+// revisor ve "chromium" y o bien busca una API de Chromium que no está, o peor,
+// da por hecho que la build de Firefox se parece a la de Chromium y no la mira.
+// Un nombre neutro hace imposible esa confusión, y reescribir un import no
+// cuesta nada.
 const chromiumEntry = "panel-entry-chromium.js";
 const geckoEntry = "panel-entry-gecko.js";
+const neutralEntry = "panel-entry.js";
 if (!existsSync(join(out, chromiumEntry)) || !existsSync(join(out, geckoEntry))) {
   throw new Error(`faltan ${chromiumEntry} o ${geckoEntry} en src/`);
 }
 rmSync(join(out, chromiumEntry), { force: true });
-renameSync(join(out, geckoEntry), join(out, chromiumEntry));
+rmSync(join(out, neutralEntry), { force: true });
+renameSync(join(out, geckoEntry), join(out, neutralEntry));
+
+// El import de background.js debe apuntar al nombre neutral.
+const bgPath = join(out, "background.js");
+const bg = readFileSync(bgPath, "utf8");
+const patched = bg.replace(
+  new RegExp(`["'\\./]*${chromiumEntry.replace(".", "\\.")}["']`, "g"),
+  `"./${neutralEntry}"`
+);
+if (patched === bg) {
+  throw new Error(
+    `background.js no importa ${chromiumEntry}: el paquete de Firefox se quedaría sin punto de entrada del panel.`
+  );
+}
+writeFileSync(bgPath, patched);
 
 writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
 console.log(
   "dist-firefox/ generado: background.scripts + sidebar_action " +
     "(side_panel y el permiso sidePanel eliminados; key eliminada; " +
-    "punto de entrada del panel sustituido por la variante de Gecko)."
+    `punto de entrada del panel sustituido por ${neutralEntry} (variante de Gecko).)`
 );

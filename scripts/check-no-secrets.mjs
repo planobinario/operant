@@ -32,16 +32,25 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MAX_BYTES = 4 * 1024 * 1024; // por encima: binario, no texto
 
-// El marcador se construye por partes a propósito: un archivo que menciona
-// "PRIVATE KEY" en su documentación (como este) no debe considerarse un
-// positivo, y escribirlo literal aquí dentro haría que este archivo lo fuera.
-const KEY_MARKER = ["BEGIN", "PRIVATE KEY"].join(" ").replace(" ", " ");
+// El marcador se construye POR PARTES, y todos los marcadores, no solo el
+// primero.
+//
+// La primera versión componía solo `BEGIN` + `PRIVATE KEY` y dejaba los otros
+// cuatro como literales. Resultado: el escáner se detectaba a sí mismo y la CI
+// quedaba roja permanentemente — un guard que se dispara solo es peor que no
+// tenerlo, porque entrena al equipo a ignorarlo.
+//
+// Ninguna de estas cadenas contiene la frase completa de forma contigua, así que
+// el script se puede escanear a sí mismo (lo hace: recorre `git ls-files`, y él
+// está versionado).
+const PEM_TAIL = ["PRIVATE", "KEY"].join(" ");
 const PEM_MARKERS = [
-  KEY_MARKER,
-  "BEGIN RSA PRIVATE",
-  "BEGIN EC PRIVATE",
-  "BEGIN OPENSSH PRIVATE",
-  "BEGIN PGP PRIVATE",
+  ["BEGIN", PEM_TAIL].join(" "),
+  ["BEGIN RSA", PEM_TAIL].join(" "),
+  ["BEGIN EC", PEM_TAIL].join(" "),
+  ["BEGIN OPENSSH", PEM_TAIL].join(" "),
+  ["BEGIN PGP", PEM_TAIL].join(" "),
+  ["BEGIN ENCRYPTED", PEM_TAIL].join(" "),
 ];
 
 const BINARY_EXT = /\.(exe|dll|so|dylib|msi|class|jar|apk|ipa|pdb)$/i;

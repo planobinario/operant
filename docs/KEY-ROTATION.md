@@ -35,11 +35,24 @@ host queda registrado contra un ID que ya no existe.
 Los pasos 1 y 3 no dependen del orden entre sí, pero el 4 sí: sin rehacer el
 registro, la extensión nueva no puede hablar con el host.
 
+### El host NO hay que reinstalarlo por el cambio de clave
+
+La rotación de clave cambia el **extension ID**, no el protocolo. El host nuevo
+sigue hablando v1 (objeto plano) y por eso una extensión antigua, ya instalada,
+sigue funcionando con el `.exe` nuevo sin tocar nada.
+
+Y al revés: la extensión nueva detecta un host viejo con un `ping` y sigue en v1.
+Ver la matriz de compatibilidad en [PROTOCOL-NATIVO.md](PROTOCOL-NATIVO.md).
+
+Lo que sí obliga a reinstalar el `.exe` es un cambio de **protocolo**, no de
+clave. Ese caso está documentado en PROTOCOL-NATIVO.md.
+
 ## Migración para desarrollo
 
 ```bash
 npm run host:build                      # compila el host y lo deja en native-host/
 npm run key:verify                      # comprueba que los 3 IDs coinciden
+npm run test:contract                   # comprueba el protocolo contra el binario real
 node scripts/check-version.mjs          # comprueba que las 6 versiones coinciden
 npm test
 ```

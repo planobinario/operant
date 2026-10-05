@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use protocol::{read_message, MessageSender};
+use protocol::{read_message, Incoming, MessageSender, PROTOCOLS, PROTOCOL_V2};
 use recorder::RecorderManager;
 use tools::tools_status;
 
@@ -79,16 +79,19 @@ fn main() {
     }
 
     // Modo Native Messaging (lanzado por el navegador)
-    let sender = MessageSender::new();
+    let base_sender = MessageSender::new();
     let recorder = RecorderManager::new();
     let installing: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     loop {
-        let msg = match read_message::<Value>() {
+        let raw = match read_message::<Value>() {
             Ok(Some(m)) => m,
             Ok(None) => break, // Fin de conexión del navegador
             Err(e) => {
-                let _ = sender.send(&json!({
+                // Todavía no hay petición que contextualizar, así que se usa el
+                // sender base y el mensaje sale en v1 plano. Un cliente v2 lo
+                // entiende igual: su envoltorio sabe desenvolver un objeto plano.
+                let _ = base_sender.send(&json!({
                     "type": "error",
                     "message": format!("Error leyendo mensaje: {}", e)
                 }));
@@ -96,12 +99,26 @@ fn main() {
             }
         };
 
-        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        // Normalización y contexto de respuesta. Todo lo que se envía desde este
+        // hilo, y desde los hilos que lanza, sale en la versión que pidió el
+        // cliente y con su `id` de correlación, sin tocar ytdl, ffmpeg_ops,
+        // recorder ni tools.
+        let incoming = Incoming::parse(&raw);
+        let sender = base_sender.for_request(&incoming);
+        let msg_type = incoming.kind.as_str();
         match msg_type {
             "ping" => {
                 let _ = sender.send(&json!({
                     "type": "pong",
-                    "tools": tools_status()
+                    "tools": tools_status(),
+                    // HANDSHAKE ADITIVO. Un cliente v1 ve un campo que no conoce y
+                    // lo ignora; uno v2 lee las capacidades y decide si habla v2.
+                    // Por eso el ping se puede hacer siempre en v1 plano: es la
+                    // unica peticion que no necesita envelopedarse para detectar
+                    // si el host la soporta.
+                    "protocols": PROTOCOLS,
+                    "protocol": PROTOCOL_V2,
+                    "host": env!("CARGO_PKG_VERSION"),
                 }));
             }
             "check-updates" => {
@@ -115,11 +132,7 @@ fn main() {
                 });
             }
             "install" | "update" => {
-                let tool = msg
-                    .get("tool")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let tool = incoming.arg_string("tool");
                 if tool != "yt-dlp" && tool != "ffmpeg" {
                     let _ = sender.send(&json!({
                         "type": "tool-error",
@@ -155,11 +168,7 @@ fn main() {
                 });
             }
             "uninstall" => {
-                let tool = msg
-                    .get("tool")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let tool = incoming.arg_string("tool");
                 let s_clone = sender.clone();
                 std::thread::spawn(move || {
                     let res = tools::uninstall_tool(&tool);
@@ -173,30 +182,19 @@ fn main() {
                 });
             }
             "ytdl" => {
-                let url = msg
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let url = incoming.arg_string("url");
                 if url.is_empty() {
                     let _ = sender.send(&json!({ "type": "error", "message": "URL vacía." }));
                     continue;
                 }
-                let fmt = msg
-                    .get("format")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                let fmt = incoming.arg("format").map(|s| s.to_string());
                 let s_clone = sender.clone();
                 std::thread::spawn(move || {
                     ytdl::run_download(&url, fmt, s_clone);
                 });
             }
             "ytdl-list-formats" => {
-                let url = msg
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let url = incoming.arg_string("url");
                 if url.is_empty() {
                     let _ =
                         sender.send(&json!({ "type": "formats-error", "message": "URL vacía." }));
@@ -208,22 +206,14 @@ fn main() {
                 });
             }
             "ffmpeg-op" => {
-                let url = msg
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let url = incoming.arg_string("url");
                 if url.is_empty() {
                     let _ =
                         sender.send(&json!({ "type": "ffmpeg-error", "message": "URL vacía." }));
                     continue;
                 }
-                let op = msg
-                    .get("op")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let options = msg.get("options").cloned().unwrap_or(json!({}));
+                let op = incoming.arg_string("op");
+                let options = incoming.arg_value("options");
                 let s_clone = sender.clone();
                 std::thread::spawn(move || {
                     ffmpeg_ops::run_ffmpeg_op(&url, &op, options, s_clone);
@@ -233,19 +223,23 @@ fn main() {
                 recorder.begin(&sender);
             }
             "rec-append" => {
-                let sess = msg.get("session").and_then(|v| v.as_str()).unwrap_or("");
-                let track = msg.get("track").and_then(|v| v.as_str()).unwrap_or("video");
-                let data = msg.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                recorder.append(sess, track, data, &sender);
+                // El recorder sigue hablando con &str: el envelope se resuelve
+                // en el borde (main.rs) y los módulos de dominio no necesitan
+                // saber que existe una v2. Acoplarlo al protocolo haría que
+                // cada firma tuviera que cambiar con cada versión.
+                let sess = incoming.arg_string("session");
+                let track = incoming.arg("track").unwrap_or("video");
+                let data = incoming.arg("data").unwrap_or("");
+                recorder.append(&sess, track, data, &sender);
             }
             "rec-end" => {
-                let sess = msg.get("session").and_then(|v| v.as_str()).unwrap_or("");
-                let filename = msg.get("filename").and_then(|v| v.as_str());
-                recorder.end(sess, filename, sender.clone());
+                let sess = incoming.arg_string("session");
+                let filename = incoming.arg("filename");
+                recorder.end(&sess, filename, sender.clone());
             }
             "rec-cancel" => {
-                let sess = msg.get("session").and_then(|v| v.as_str()).unwrap_or("");
-                recorder.cancel(sess, &sender);
+                let sess = incoming.arg_string("session");
+                recorder.cancel(&sess, &sender);
             }
             _ => {
                 let _ = sender.send(&json!({

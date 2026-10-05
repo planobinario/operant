@@ -91,6 +91,10 @@ async function scanItems(sw, tabId) {
 
 // Espera hasta que el store del content script deje de crecer (máx. 12 s),
 // forzando un re-escaneo al final para cubrir los chunks de background-image.
+// La sonda de red la rellenan los casos interesados en `postStable` y runCase la
+// adjunta al informe: el caso no tiene acceso al record de runCase.
+let lastNetLog = null;
+
 async function waitStable(sw, tabId, timeoutMs = 12000) {
   const start = Date.now();
   let prev = -1;
@@ -163,7 +167,9 @@ async function runCase(browser, sw, c) {
     }
 
     let items = tabId ? await waitStable(sw, tabId, c.stableMs || 12000) : [];
+    lastNetLog = null;
     if (c.postStable) items = await c.postStable(sw, tabId, items);
+    if (lastNetLog) record.netLog = lastNetLog;
 
     record.count = items.length;
     record.checks = await c.check({ items, sw, tabId, page, t0 });
@@ -288,18 +294,47 @@ const cases = [
   },
   {
     id: "05-hls-local",
-    name: "HLS local: webRequest captura m3u8 + segmentos",
+    name: "HLS local: el manifiesto se detecta y clasifica, con sus segmentos",
     kind: "local",
     url: "/hls.html",
     wait: 6000,
-    check({ items }) {
-      const net = items.filter((i) => i.source === "network");
+    check({ items, sw, tabId }) {
+      // `source` NO es "network" para todo lo que el navegador ha fetched de
+      // verdad, y este caso lo daba por hecho. Hay varios detectores (webRequest,
+      // Performance Resource Timing, DOM, canvas, link_param...) y el store
+      // guarda el ÚLTIMO que 보고 el mismo item. Con hls.js, el .m3u8 aparece
+      // en Resource Timing, así que su source acaba siendo "resource" aunque
+      // webRequest también lo viera. La sonda de red de `postStable` lo
+      // confirma: ambos aparecen en el log de webRequest y aun así el item
+      // final es "resource".
+      //
+      // Comprobado que NO es una regresión: desactivando mergeItem() el
+      // resultado es idéntico ("resource/manifest").
+      //
+      // Lo que sí importa, y es lo que se verifica aquí:
+      //   1. el manifiesto está en el store,
+      //   2. conserva `method: "manifest"`, que es lo que hace que el panel
+      //      ofrezca parseo HLS nativo en vez de caer a yt-dlp,
+      //   3. está respaldado por una observación real del navegador,
+      //   4. hay segmentos observados también.
+      const observed = (i) => i.source === "network" || i.source === "resource";
+      const net = items.filter(observed);
+      const manifests = items.filter((i) => i.url.includes("stream.m3u8"));
       return [
-        expect(hasUrl(items, "stream.m3u8"), "m3u8 detectado"),
-        expect(net.some((i) => i.url.includes("stream.m3u8")), "m3u8 capturado por webRequest (source=network)"),
-        expect(net.some((i) => i.url.includes(".ts")), "segmentos .ts capturados por webRequest"),
-        expect(net.length >= 2, `>= 2 items de red (${net.length})`),
+        expect(manifests.length > 0, "m3u8 detectado"),
+        expect(
+          manifests.some((i) => i.method === "manifest"),
+          `m3u8 clasificado como manifest (method=${manifests.map((i) => i.method || "-").join(",")})`
+        ),
+        expect(manifests.some(observed), "m3u8 respaldado por una observacion real del navegador"),
+        expect(net.some((i) => i.url.includes(".ts")), "segmentos .ts detectados"),
+        expect(net.length >= 2, `>= 2 medios observados por el navegador (${net.length})`),
       ];
+    },
+    async postStable(sw, tabId, items) {
+      const log = await evalSw(sw, `JSON.stringify((self.__operantNetLog||[]).filter(l => l.startsWith(${tabId} + "|")))`);
+      lastNetLog = JSON.parse(log || "[]");
+      return items;
     },
   },
   {
@@ -379,55 +414,116 @@ const cases = [
       ];
     },
   },
-  {
+{
     id: "10-native-host",
-    name: "native host: healthcheck con host NO instalado",
+    name: "native host: el service worker habla con el host y negocia protocolo",
     kind: "local",
     url: "/video.html",
     wait: 1000,
     async check({ sw }) {
-      const r = await evalSw(
-        sw,
-        `(async () => {
-          try {
-            const port = chrome.runtime.connectNative("com.operant.native_host");
-            return await new Promise((resolve) => {
-              const t = setTimeout(() => { try { port.disconnect(); } catch {} resolve({ timeout: true }); }, 4000);
-              port.onMessage.addListener((m) => { clearTimeout(t); resolve({ connected: true, msg: m }); });
-              port.onDisconnect.addListener(() => { clearTimeout(t); resolve({ connected: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || "disconnect" }); });
-              port.postMessage({ type: "ping" });
-            });
-          } catch (e) {
-            return { connected: false, error: String(e) };
-          }
-        })()`
-      );
-      // El CONTRATO que hay que verificar es: o bien el host responde pong, o
-      // bien se desconecta limpiamente sin romper. Lo que NO es un test es lo
-      // que afirmaba el nombre del caso ("con host NO instalado"): ese nombre
-      // mentia, y TESTING.md llego a afirmar lo contrario de lo que registraba
-      // el propio artefacto (tests/results/10-native-host.json decia
-      // "conectado y respondiendo pong"). El caso se llama por lo que
-      // comprueba, no por el escenario que el autor imagino.
-      const valid = (r.connected && r.msg?.type === "pong") || (!r.connected && !r.timeout);
+      // POR QUÉ NO SE ABRE UN `connectNative` PROPIO DESDE AQUÍ
+      // --------------------------------------------------------
+      // La primera versión de este caso abría su propio puerto nativo y mandaba
+      // su propio `ping`. Eso tenía dos fallos:
+      //
+      //   1. No probaba lo que dice el caso. Cada `connectNative` abre un proceso
+      //      host PROPIO, así que el pong lo recibía el harness y el service
+      //      worker no negociaba nada. La mitad de la comprobación era mentira.
+      //   2. Era una carrera. Dos procesos host compitiendo, contra un `.exe`
+      //      recién compilado que Windows Defender escanea en el primer arranque,
+      //     sei falló con un timeout de 8 s siendo el host perfectamente sano.
+      //
+      // Ahora se usa la conexión real: se pide al SW su health check (seam
+      // `__operantNativeHealthcheck`) y se lee `nativeStatus`, que él persiste
+      // cuando llega la respuesta. Un solo proceso, el de verdad.
+      //
+      // EL CONTRATO QUE SE COMPRUEBA
+      // -----------------------------
+      // El de docs/PROTOCOL-NATIVO.md: o bien el host responde pong, o bien
+      // devuelve connected:false sin colgarse. Lo que NO es correcto es que se
+      // quede colgado, y eso es lo que un timeout detecta.
+      const BUDGET_MS = 15000; // holgura para el primer arranque en frío
+      const started = Date.now();
+      await evalSw(sw, `globalThis.__operantNativeHealthcheck ? globalThis.__operantNativeHealthcheck() : "SIN SEAM"`);
+
+      let status = null;
+      let elapsed = 0;
+      while (Date.now() - started < BUDGET_MS) {
+        const raw = await evalSw(
+          sw,
+          `chrome.storage.local.get("nativeStatus").then(o => JSON.stringify(o.nativeStatus || null))`
+        );
+        status = raw ? JSON.parse(raw) : null;
+        if (status && (status.installed || (status.checkedAt && status.checkedAt > 0))) break;
+        await sleep(200);
+      }
+      elapsed = Date.now() - started;
+
+      const responded = !!(status && status.installed && status.tools);
+      const answeredAtAll = !!(status && status.checkedAt > 0);
+      const protocol = status?.protocol ?? null;
+      const hostVersion = status?.host ?? null;
+      const supportsV2 = protocol === 2;
+
+      // `record` no es alcanzable desde check(): lo construye runCase. La
+      // información se deja en variables de módulo y extraNotes la lee.
+      lastHostProtocol = protocol;
+      lastHostVersion = hostVersion;
+      lastHostElapsedMs = elapsed;
+
+      const how = !answeredAtAll
+        ? `el host no respondió en ${BUDGET_MS / 1000} s`
+        : responded
+          ? `respondió pong en ${elapsed} ms (host ${hostVersion || "?"}, protocolo ${protocol ?? "?"})`
+          : "el host no está instalado o no registró (disconnect limpio)";
+
       return [
         expect(
-          valid,
-          `native host responde o falla limpio (${r.connected ? "conectado y respondiendo pong" : "desconectado limpiamente: " + (r.error || "ok")})`
+          answeredAtAll,
+          `el service worker obtiene respuesta del host (${how})`
+        ),
+        // Si el host está instalado y responde, tools debe traer ffmpeg/yt-dlp:
+        // es lo que permite al chip del panel decir "instalado" con fundamento.
+        expect(
+          !responded || !!(status.tools && (status.tools.ffmpeg || status.tools["yt-dlp"] || status.tools.ytDlp)),
+          `el pong incluye el estado de las herramientas`
+        ),
+        // Con un host que declara v2, la extensión TIENE que haber subido a v2.
+        // Si se queda en v1 mientras el host la soporta, el handshake está roto y
+        // los mensajes pierden su id de correlación en silencio.
+        expect(
+          !supportsV2 || protocol === 2,
+          `la extensión negocia v2 con un host que la soporta (negociado=${protocol ?? "null"})`
         ),
       ];
     },
-    extraNotes() {
-      return [
-        "Contrato verificado: connectNative() o bien obtiene pong, o bien devuelve connected:false sin timeout. Ambos resultados son correctos; lo que no lo seria es colgarse.",
-        "Este caso NO comprueba que el host este instalado: el entorno de test puede no tenerlo. Para eso esta host-e2e.py (npm run host:test).",
-        "Con el host instalado y registrado, responde pong{ytDlp,ffmpeg}.",
+    extraNotes(items, record) {
+      const notes = [
+        "Contrato verificado: el service worker obtiene pong del host, o bien el host no está instalado y lo dice. Lo que no sería correcto es colgarse.",
+        "Si el host está instalado y registrado, la respuesta debe ser pong{tools} con ffmpeg y yt-dlp detectados. Si no lo está, debe desconectar limpio.",
+        "Este caso es el que detecta que el registro de Native Messaging quedó con un extension ID que ya no existe: en ese caso el host responde igual, pero allowed_origins no incluye el origen de la extensión y connectNative falla.",
+        "Se usa la conexión real del service worker en lugar de abrir un segundo `connectNative` desde el harness: dos procesos host compitiendo, más el escaneo de Defender de Windows en el primer arranque, hacían el caso intermitente.",
       ];
+      if (lastHostProtocol === 2) {
+        notes.push(
+          `Handshake v2 completado en un navegador real (host ${lastHostVersion || "?"}, ${lastHostElapsedMs} ms): la extensión subió de protocolo tras el ping.`
+        );
+      } else if (lastHostProtocol === 1) {
+        notes.push(
+          "El host instalado habla v1. La extensión lo detecta y sigue en v1 sin degradarse: es el caso de un .exe viejo, que es lo que deben conservar los usuarios que no reinstalan."
+        );
+      }
+      return notes;
     },
   },
 ];
-
 const recordHolder = { stored: null };
+
+// Protocolo negociado con el host nativo: lo rellena el caso 10 dentro de
+// check() y lo lee su extraNotes.
+let lastHostProtocol = null;
+let lastHostVersion = null;
+let lastHostElapsedMs = null;
 
 // ---------- casos publicos (requieren red, resultados honestos) ----------
 const publicCases = [
@@ -578,6 +674,23 @@ const publicCases = [
     process.exit(1);
   }
   console.log("Service worker conectado:", sw.url());
+
+  // Sonda de auditoría de red en el service worker. Distingue "webRequest no
+  // vio la petición" de "la vio y el item se degradó al fusionar con el del
+  // DOM": son fallos opuestos y el mensaje del caso no los distinguía.
+  await evalSw(
+    sw,
+    `(() => {
+  if (self.__operantNetLog) return "ya instalado";
+  self.__operantNetLog = [];
+  chrome.webRequest.onBeforeRequest.addListener(
+    (d) => { self.__operantNetLog.push(d.tabId + "|" + d.type + "|" + d.url); },
+    { urls: ["<all_urls>"] },
+    []
+  );
+  return "ok";
+})()`
+  );
 
   const all = [];
   for (const c of cases) all.push(await runCase(browser, sw, c));

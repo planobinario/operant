@@ -22,6 +22,12 @@ import {
 // Punto de entrada del panel lateral. La build de Firefox sustituye este
 // import por ./panel-entry-gecko.js (ver scripts/build-firefox.mjs).
 import { setupPanelOnInstalled } from "./panel-entry-chromium.js";
+import {
+  buildRequest,
+  negotiate,
+  nextRequestId,
+  parseResponse,
+} from "./shared/native-protocol.js";
 
 const NATIVE_HOST = "com.operant.native_host";
 const MAX_ITEMS_PER_TAB = 4000;
@@ -236,6 +242,41 @@ function nextSeq() {
 function withSeq(item) {
   if (item && item.seq === undefined) item.seq = nextSeq();
   return item;
+}
+
+// Fusiona el item entrante con el ya conocido SIN degradarlo.
+//
+// El orden de llegada importa: el mismo recurso puede llegar por `webRequest`
+// (source "network") y luego por el escaneo del DOM (source "dom"), porque
+// hls.js pide el .m3u8 por XHR y su URL también aparece referenciada en la
+// página. Antes la fusión era un `set` incondicional por URL, así que el
+// segundo arrival BORRABA al primero: el item se quedaba sin `method`,
+// sin tamaño, y con `source: "dom"`. Para un manifiesto HLS eso es peor que
+// perder información: `method: "manifest"` es lo que hace que el panel ofrezca
+// parseo nativo en vez de caer a yt-dlp.
+//
+// Regla: `network` es más rico que `dom` (demuestra que la descarga ocurrió de
+// verdad y trae tamaño y método). Gana el más rico; el otro solo rellena campos
+// que faltan.
+function mergeItem(existing, incoming) {
+  const a = existing || null;
+  const b = incoming || null;
+  if (!a) return withSeq(b);
+  if (!b) return a;
+  const netFirst = a.source === "network" && b.source !== "network";
+  const netSecond = b.source === "network" && a.source !== "network";
+  if (!netFirst && !netSecond) return withSeq(b);
+  const winner = netFirst ? a : b;
+  const loser = netFirst ? b : a;
+  // Se conservan los campos que el ganador tiene vacíos y el otro conoce.
+  const out = { ...loser, ...winner };
+  for (const k of ["sizeKB", "sizeUnknown", "ext", "domain", "method"]) {
+    if (out[k] === undefined || out[k] === null || out[k] === "") {
+      if (loser[k] !== undefined && loser[k] !== null && loser[k] !== "") out[k] = loser[k];
+    }
+  }
+  if (out.sizeKB === null && loser.sizeKB !== undefined) out.sizeKB = loser.sizeKB;
+  return withSeq(out);
 }
 
 function ensureTab(tabId) {
@@ -1122,7 +1163,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     console.log("[operant-sw] media-updated tabId=", tabId, "items=", msg.items?.length, "senderTab=", sender.tab?.id);
     const tab = ensureTab(tabId);
     const byUrl = new Map(tab.items.map((it) => [it.url.split("#")[0], it]));
-    for (const item of msg.items) byUrl.set(item.url.split("#")[0], withSeq(item));
+    for (const item of msg.items) {
+      const k = item.url.split("#")[0];
+      byUrl.set(k, mergeItem(byUrl.get(k), item));
+    }
     tab.items = [...byUrl.values()].slice(0, MAX_ITEMS_PER_TAB);
     updateBadge(tabId);
     persistTab(tabId);
@@ -1269,8 +1313,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!port) {
             return { ok: false, error: "Este stream lleva el audio en una pista separada (HLS): para unir vídeo+audio hace falta el companion (operant-host.exe)." };
           }
-          port.postMessage({
-            type: "ffmpeg-op",
+          nativeSend("ffmpeg-op", {
             url: found.variant.url,
             op: "hls-dash",
             options: { audioUrl: found.variant.audioUrl, filename: base },
@@ -1292,8 +1335,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         try {
           // Si el parser DASH generó init + media segments (fMP4 de X), pasar
           // las listas completas al host para que las descargue y concatene.
-          port.postMessage({
-            type: "ffmpeg-op",
+          nativeSend("ffmpeg-op", {
             url: bestVideo.url,
             op: "dash-merge",
             options: {
@@ -1327,8 +1369,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
           const best = videoSegs.reduce((a, b) => (Number(b.id) > Number(a.id) ? b : a));
           try {
-            port.postMessage({
-              type: "ffmpeg-op",
+            nativeSend("ffmpeg-op", {
               url: best.url,
               op: "hls-dash",
               options: { audioUrl: best.audioUrl, filename: base },
@@ -1344,7 +1385,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const port = connectNative();
           if (port) {
             try {
-              port.postMessage({ type: "ffmpeg-op", url, op: "hls-dash", options: { filename: base } });
+              nativeSend("ffmpeg-op", { url, op: "hls-dash", options: { filename: base } });
               return { ok: true, enqueued: true, note: `La ruta rápida falló (${String(eHls?.message || eHls)}). Encolado en el companion; el resultado se confirma en el panel.` };
             } catch { /* cae al fetch directo */ }
           }
@@ -1355,7 +1396,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const port = connectNative();
       if (port) {
         try {
-          port.postMessage({ type: "ffmpeg-op", url, op: "hls-dash", options: { filename: base } });
+          nativeSend("ffmpeg-op", { url, op: "hls-dash", options: { filename: base } });
           return { ok: true, enqueued: true, note: "Encolado en el companion (ffmpeg); el resultado se confirma en el panel." };
         } catch { /* cae al fetch directo */ }
       }
@@ -1598,7 +1639,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             sendResponse({ ok: false, error: "Este medio NO tiene pista de audio (es un GIF o un vídeo mudo). No hay audio que extraer." });
             return;
           }
-          port.postMessage({ type: "ffmpeg-op", url, op: "extract-mp3", options: {} });
+          nativeSend("ffmpeg-op", { url, op: "extract-mp3", options: {} });
           sendResponse({
             ok: true,
             note: audio === true
@@ -1612,7 +1653,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true; // respuesta asíncrona
     }
     try {
-      port.postMessage({ type: "ytdl", url, filename: msg.filename || "", format: "bestaudio/best" });
+      nativeSend("ytdl", { url, filename: msg.filename || "", format: "bestaudio/best" });
       sendResponse({ ok: true, note: "Extrayendo audio con yt-dlp (bestaudio)…" });
     } catch (e) {
       sendResponse({ ok: false, error: String(e) });
@@ -1637,7 +1678,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     try {
-      port.postMessage({ type: "ffmpeg-op", url, op: "convert-webm", options: {} });
+      nativeSend("ffmpeg-op", { url, op: "convert-webm", options: {} });
       sendResponse({ ok: true, note: "Convirtiendo GIF a vídeo con ffmpeg del host…" });
     } catch (e) {
       sendResponse({ ok: false, error: String(e) });
@@ -1793,7 +1834,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const port = connectNative();
     if (port) {
       try {
-        port.postMessage({ type: "check-updates" });
+        nativeSend("check-updates", {});
       } catch {
         /* host caido: se reporta con el estado cacheado */
       }
@@ -1816,7 +1857,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     recSession = { tabId: msg.tabId, session: null, filename: null };
-    port.postMessage({ type: "rec-begin" });
+    nativeSend("rec-begin", {}, "rec");
     chrome.tabs.sendMessage(
       msg.tabId,
       { type: "rec-start" },
@@ -1863,7 +1904,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     } else if (p.type === "track-chunk") {
       const port = connectNative();
       if (port && recSession.session) {
-        port.postMessage({ type: "rec-append", session: recSession.session, track: p.track, data: p.data });
+        nativeSend("rec-append", { session: recSession.session, track: p.track, data: p.data }, "rec");
       }
     } else if (p.type === "stopped") {
       const session = recSession;
@@ -1871,15 +1912,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.tabs.get(session.tabId, (tab) => {
         const filename = (tab?.title || "grabacion").slice(0, 120);
         if (port && session.session) {
-          port.postMessage({ type: "rec-end", session: session.session, filename });
-          recBroadcast({ state: "assembling" });
+          const jobId = nativeSend("rec-end", { session: session.session, filename }, "rec");
+          // El ensamblado lo lanza el host desde ESTA petición, así que hereda su
+          // id. El panel lo necesita para distinguir el progreso del ensamblado
+          // del progreso de una descarga normal: `ffmpeg-progress` significa
+          // cosas distintas y antes se escribían en los mismos widgets.
+          recSession.assembleJobId = jobId;
+          recBroadcast({ state: "assembling", jobId });
         } else {
           recFail(p.error || "La grabación terminó sin sesión del host nativo.");
         }
       });
     } else if (p.type === "cancelled") {
       const port = connectNative();
-      if (port && recSession.session) port.postMessage({ type: "rec-cancel", session: recSession.session });
+      if (port && recSession.session) nativeSend("rec-cancel", { session: recSession.session }, "rec");
       recSession = null;
       recBroadcast({ state: "idle" });
     }
@@ -1893,7 +1939,7 @@ async function handleYtdl(msg) {
     return { ok: false, error: "El host nativo no está instalado. Descarga operant-host.exe desde la página de Releases del repositorio y ejecútalo con doble clic." };
   }
   try {
-    port.postMessage({ type: "ytdl", url: msg.url, filename: msg.filename, format: msg.format || null });
+    nativeSend("ytdl", { url: msg.url, filename: msg.filename, format: msg.format || null });
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err) };
@@ -1914,8 +1960,7 @@ function recBroadcast(patch) {
 function recFail(message) {
   const session = recSession?.session || null;
   if (session) {
-    const port = connectNative();
-    port?.postMessage({ type: "rec-cancel", session });
+    nativeSend("rec-cancel", { session }, "rec");
   }
   recSession = null;
   recBroadcast({ state: "error", message });
@@ -2025,7 +2070,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     try {
-      port.postMessage({ type: "ffmpeg-op", url: msg.url, op: msg.op, options: msg.options || {} });
+      nativeSend("ffmpeg-op", { url: msg.url, op: msg.op, options: msg.options || {} });
       sendResponse({ ok: true });
     } catch (err) {
       sendResponse({ ok: false, error: String(err) });
@@ -2039,7 +2084,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     try {
-      port.postMessage({ type: "ytdl-list-formats", url: msg.url });
+      nativeSend("ytdl-list-formats", { url: msg.url });
       sendResponse({ ok: true });
     } catch (err) {
       sendResponse({ ok: false, error: String(err) });
@@ -2112,7 +2157,10 @@ async function handleGetState(tabId) {
     const res = await chrome.tabs.sendMessage(tabId, { type: "scan" });
     if (res?.items) {
       const byUrl = new Map(tab.items.map((it) => [it.url.split("#")[0], it]));
-      for (const item of res.items) byUrl.set(item.url.split("#")[0], withSeq(item));
+      for (const item of res.items) {
+        const k = item.url.split("#")[0];
+        byUrl.set(k, mergeItem(byUrl.get(k), item));
+      }
       tab.items = [...byUrl.values()].slice(0, MAX_ITEMS_PER_TAB);
     }
     updateBadge(tabId);
@@ -2133,7 +2181,10 @@ async function requestScan(tabId) {
     const tab = ensureTab(tabId);
     if (res?.items) {
       const byUrl = new Map(tab.items.map((it) => [it.url.split("#")[0], it]));
-      for (const item of res.items) byUrl.set(item.url.split("#")[0], withSeq(item));
+      for (const item of res.items) {
+        const k = item.url.split("#")[0];
+        byUrl.set(k, mergeItem(byUrl.get(k), item));
+      }
       tab.items = [...byUrl.values()].slice(0, MAX_ITEMS_PER_TAB);
     }
     updateBadge(tabId);
@@ -2149,16 +2200,41 @@ async function requestScan(tabId) {
 let nativePort = null;
 let nativeStatus = { installed: false, checkedAt: 0, tools: null };
 
+// --- Cliente del protocolo nativo (v1 plano / v2 envelope) --------------------
+//
+// `nativeProtocol` es la versión negociada. Empieza en null (solo v1) y sube a 2
+// cuando un `pong` declara `protocols: [1,2]`. Nada de esto rompe a un host
+// viejo: si no declara capacidades, se sigue hablando v1 indefinidamente.
+//
+// El handshake es ADITIVO y va siempre en v1 plano, precisamente para que un
+// cliente nuevo pueda hablar con un host viejo. Ver src/shared/native-protocol.js.
+let nativeProtocol = null;
+
 function connectNative() {
   if (nativePort) return nativePort;
   try {
     nativePort = chrome.runtime.connectNative(NATIVE_HOST);
-    nativePort.onMessage.addListener((msg) => {
-      if (msg?.type === "pong" || msg?.type === "tools-status" || msg?.type === "tool-uninstalled") {
+    nativePort.onMessage.addListener((raw) => {
+      // Se desenvuelve aquí, una sola vez, para que ni el service worker ni el
+      // panel tengan que conocer las dos formas. Tras esto, `type` y los campos
+      // están donde siempre se buscaron.
+      const res = parseResponse(raw);
+      const msg = { ...res.fields, type: res.type };
+      const reqId = res.id;
+
+      if (res.type === "pong" || res.type === "tools-status" || res.type === "tool-uninstalled") {
+        // Solo el `pong` negocia: `tools-status` puede llegar de un hilo en
+        // segundo plano y no debe reescribir el protocolo en mitad de un job.
+        if (res.type === "pong") {
+          const negotiated = negotiate(res.fields);
+          if (negotiated !== nativeProtocol) nativeProtocol = negotiated;
+        }
         nativeStatus = {
           installed: true,
           checkedAt: Date.now(),
           tools: msg.tools || null,
+          protocol: nativeProtocol,
+          host: res.fields.host || nativeStatus.host || null,
         };
         chrome.storage.local.set({ nativeStatus });
       }
@@ -2170,15 +2246,42 @@ function connectNative() {
       }
       // El mensaje se envuelve (no se hace spread): el spread machacaba el
       // tipo con el del host y los progresos/formatos nunca llegaban al panel.
-      chrome.runtime.sendMessage({ type: "native", msg }).catch(() => {});
+      // `id` viaja para que el panel pueda atribuir el mensaje a su job; sin él
+      // dos descargas concurrentes se pisan el estado.
+      chrome.runtime.sendMessage({ type: "native", msg, id: reqId }).catch(() => {});
     });
     nativePort.onDisconnect.addListener(() => {
       nativePort = null;
+      // El protocolo se olvida: el host puede haber cambiado (por ejemplo tras
+      // instalar una versión nueva) y hay que volver a negociar.
+      nativeProtocol = null;
     });
   } catch {
     nativePort = null;
   }
   return nativePort;
+}
+
+/**
+ * Envía una petición al host y devuelve el `id` de correlación.
+ *
+ * Se usa en lugar de `port.postMessage({type, …})` porque el id lo genera aquí,
+ * que es el único sitio que sabe qué petición es cuál. Un `postMessage` directo
+ * seguiría funcionando, pero su id sería `null` y sus mensajes no se podrían
+ * atribuir.
+ *
+ * @returns {string|null} el id, o null si no hay host o no se puede enviar.
+ */
+function nativeSend(type, args, prefix) {
+  const port = connectNative();
+  if (!port) return null;
+  const id = nextRequestId(prefix || type.replace(/[^a-z0-9]+/gi, "").slice(0, 8) || "j");
+  try {
+    port.postMessage(buildRequest(type, args, nativeProtocol, id));
+    return id;
+  } catch {
+    return null;
+  }
 }
 
 async function nativeHealthcheck() {
@@ -2192,7 +2295,9 @@ async function nativeHealthcheck() {
     return { status: nativeStatus };
   }
   try {
-    port.postMessage({ type: "ping" });
+    // El ping SIEMPRE en v1 plano: es la única petición que no necesita
+    // envelope para detectar si el host soporta v2.
+    nativeSend("ping", {});
   } catch {
     nativeStatus = { installed: false, checkedAt: Date.now(), tools: null };
     return { status: nativeStatus };
@@ -2200,13 +2305,27 @@ async function nativeHealthcheck() {
   return { status: nativeStatus };
 }
 
+// Seam de test para el health check nativo.
+//
+// `nativeHealthcheck` es una función de módulo, así que no es alcanzable desde
+// una sesión de CDP, y `chrome.runtime.sendMessage` NO se entrega al propio
+// service worker: solo a otros contextos de la extensión. Es decir, que el
+// harness no puede pedirle su propio ping al SW por mensaje, que es
+// precisamente lo que hace el panel al abrirse.
+//
+// Exponer la función en `globalThis` cuesta una línea y hace comprobable la
+// negociación de protocolo en un navegador real: el harness la llama, y luego
+// lee `chrome.storage.local.nativeStatus.protocol` para ver con qué versión
+// se quedó. No cambia el comportamiento: si nadie la llama, no pasa nada.
+globalThis.__operantNativeHealthcheck = nativeHealthcheck;
+
 function sendNativeToolAction(action, tool) {
   const port = connectNative();
   if (!port) {
     return { ok: false, error: "El host nativo no está instalado. Descarga operant-host.exe desde la página de Releases del repositorio y ejecútalo con doble clic." };
   }
   try {
-    port.postMessage({ type: action, tool });
+    nativeSend(action, { tool });
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err) };
