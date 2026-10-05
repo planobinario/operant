@@ -6,7 +6,6 @@
   "description": "Panel lateral avanzado para inspección, extracción y procesado de medios con ffmpeg, yt-dlp y Native Messaging.",
   "permissions": [
     "storage",
-    "activeTab",
     "sidePanel",
     "downloads",
     "webRequest",
@@ -21,6 +20,7 @@
   "host_permissions": [
     "<all_urls>"
   ],
+  "minimum_chrome_version": "114",
   "background": {
     "service_worker": "background.js",
     "type": "module"

@@ -143,7 +143,13 @@ operant/
 | `npm run build` | Empaqueta la extensión para producción en `web-ext-artifacts/operant_*.zip`. |
 | `npm run test:verify` | Ejecuta la batería de pruebas locales deterministas (10 suites en Chrome for Testing). |
 | `npm run test:verify:public` | Ejecuta las pruebas locales más 5 validaciones sobre sitios web públicos reales. |
+| `npm test` | Puerta rápida y **hermética**: sintaxis, 210 tests unitarios, coherencia del manifest, escaneo de secretos, coherencia del extension ID y de la versión. No necesita ningún build previo. |
 | `npm run host:build` | Compila el host nativo en Rust con optimizaciones de release y copia el ejecutable a `native-host/`. |
+| `npm run test:contract` | Verifica el contrato con el host contra el **binario real**, no contra una reimplementación en JS. |
+| `npm run test:firefox` | Ejecuta la build de Firefox en un **Gecko real** y comprueba que instala el add-on sin errores de JS. |
+| `npm run check:manifest` | Comprueba que los permisos declarados se usan, que `minimum_chrome_version` no miente y que el paquete de Firefox no declara APIs de Chromium. |
+| `npm run check:secrets` | Escanea el índice por material de claves privadas y binarios compilados. |
+| `npm run key:verify` | Comprueba que el extension ID coincide en el manifest, en `key_info.json` y en el instalador del host. |
 | `npm run host:test` | Ejecuta la suite de verificación de protocolo, herramientas y ffmpeg del host nativo. |
 
 ---
@@ -167,16 +173,53 @@ Operant utiliza los tokens de diseño oficiales de **Warm Ink Neutrals**:
 
 ## Permisos del Navegador
 
+Cada permiso está **usado en el código**, y eso se comprueba:
+`npm run check:manifest` falla si algún permiso declarado no se usa, si falta
+alguno que sí se usa, o si `minimum_chrome_version` promete menos de lo que el
+código exige. Un permiso sin usar infla lo que le enseñas al usuario y es
+material de revisión para las tiendas.
+
 | Permiso | Justificación Técnica |
 |---|---|
 | `sidePanel` | Panel lateral persistente que no interrumpe la navegación del usuario. |
 | `webRequest` | Detección pasiva de flujos multimedia de red (`m3u8`, `mpd`) que no existen en el DOM. |
 | `downloads` | Gestión y guardado de descargas individuales y archivos ZIP consolidados. |
 | `storage` | Persistencia de preferencias del usuario y estado de medios por pestaña (`storage.session`). |
-| `activeTab` | Enlace seguro a la pestaña activa para solicitar re-escaneos. |
 | `nativeMessaging` | Canal de comunicación bidireccional con el Operant Companion (`operant-host.exe`). |
-| `declarativeNetRequest` | Reglas efímeras de cabeceras para descargas protegidas por anti-hotlinking. |
+| `declarativeNetRequest` | Reglas efímeras de cabeceras para descargas protegidas por anti-hotlinking. **Solo Chromium**: el paquete de Firefox no lo declara porque Gecko no tiene esa API. |
+| `scripting` | Reinyección del script de contenido cuando la extensión se recarga, para no dejar pestañas a medias. |
+| `webNavigation` | Detectar cambios de URL y recargas, que es cuando hay que re-escanear. |
 | `host_permissions: <all_urls>` | Inyección del content script y análisis universal sin listas blancas restrictivas. |
+| `cookies` (**opcional**) | Reenviar tus cookies al descargar cuando el sitio exige sesión. **Solo si lo aceptas**, y se puede retirar sin dejar de usar la extensión. |
+
+### `activeTab` se eliminó
+
+La 0.4.1 declaraba `activeTab` sin usarlo en ninguna parte del código. Se
+quitó en 0.5.0 y ahora la CI falla si vuelve a aparecer.
+
+### Compatibilidad
+
+| Navegador | Versión mínima | Motivo |
+|---|---|---|
+| Chrome / Edge / Brave / Opera | **114** | `chrome.sidePanel` |
+| Firefox | **121** | `sidebar_action`, `strict_min_version` |
+
+El mínimo no es una suposición: `scripts/check-manifest.mjs` mantiene una tabla
+de API → versión y falla si el manifest declara menos de lo que el código usa.
+
+---
+
+## Privacidad
+
+Ver **[PRIVACY.md](PRIVACY.md)**. Resumen: no hay telemetría ni analítica, no
+hay servidor, el host nativo no lee tu perfil de navegador, y la única función
+que envía contenido a un tercero —la búsqueda inversa de imagen— pide
+confirmación explícita y usa un alojamiento temporal de una hora.
+
+Las afirmaciones de esa política están **comprobadas por tests**
+(`tests/unit/privacy-claims.test.js`): si alguien introduce telemetría, o el host
+empieza a leer perfiles del navegador, o aparece un destino de red sin
+documentar, la CI se pone roja.
 
 ---
 

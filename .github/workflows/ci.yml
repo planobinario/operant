@@ -78,6 +78,16 @@ jobs:
         # dice "host no instalado" para siempre, sin ninguna pista de por qué.
         run: npm run key:verify
 
+      - name: Coherencia del manifest (permisos y versión mínima)
+        # `activeTab` estaba declarado y sin usarse en ninguna parte del código:
+        # el tipo de permiso que la revisión de la tienda marca y que nadie quita
+        # porque "no hace daño". Aquí no hacía daño; en la tienda sí.
+        #
+        # También comprueba que `minimum_chrome_version` no prometa menos de lo que
+        # el código exige. Es una promesa: si alguien usa una API más nueva y no la
+        # actualiza, el fallo aparece en el navegador de un usuario.
+        run: npm run check:manifest
+
       - name: Sin claves privadas ni binarios en el índice
         # native-host/key_info.json llegó a contener la clave PRIVADA RSA de la
         # extensión: con ella, cualquiera podía publicar actualizaciones de la

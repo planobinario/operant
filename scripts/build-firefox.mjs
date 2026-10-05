@@ -59,6 +59,30 @@ if (manifest.side_panel?.default_path) {
 
 // Firefox no conoce el permiso `sidePanel`: declararlo es ruido que el
 // linter marca como inválido.
+// --- Permisos que no existen en Gecko ---
+//
+// `declarativeNetRequest` es exclusivo de Chromium. Declararlo en el paquete de
+// Firefox no es inocuo: AMO lo cuenta como permiso no implementado, y un
+// revisor lo lee como "el autor no sabe qué está soportado donde". El código ya
+// lo protege (`if (!chrome.declarativeNetRequest)`), así que quitarlo del
+// paquete es seguro: no cambia el comportamiento, solo deja de prometer algo que
+// Gecko no tiene.
+const CHROMIUM_ONLY_PERMISSIONS = ["declarativeNetRequest"];
+if (Array.isArray(manifest.permissions)) {
+  manifest.permissions = manifest.permissions.filter((p) => !CHROMIUM_ONLY_PERMISSIONS.includes(p));
+}
+if (Array.isArray(manifest.optional_permissions)) {
+  manifest.optional_permissions = manifest.optional_permissions.filter(
+    (p) => !CHROMIUM_ONLY_PERMISSIONS.includes(p)
+  );
+}
+
+// `activeTab` se eliminó de src por no usarse en ninguna parte. Si alguien lo
+// reintrodujera para Chromium pero no hiciera nada con él en Firefox, aquí se
+// filtra también: un permiso que no se usa no debe viajar en ningún paquete.
+manifest.permissions = manifest.permissions.filter((p) => p !== "activeTab");
+manifest.optional_permissions = manifest.optional_permissions.filter((p) => p !== "activeTab");
+
 if (Array.isArray(manifest.permissions)) {
   manifest.permissions = manifest.permissions.filter((p) => p !== "sidePanel");
 }

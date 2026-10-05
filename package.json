@@ -11,8 +11,8 @@
     "build:firefox": "node scripts/build-firefox.mjs && web-ext build --source-dir=./dist-firefox --artifacts-dir=./web-ext-artifacts/firefox --overwrite-dest",
     "lint": "node scripts/check-syntax.mjs",
     "lint:web-ext": "web-ext lint --source-dir=./src --warnings-as-errors",
-    "test:unit": "node --test tests/unit/filename.test.js tests/unit/icons.test.js tests/unit/media-core.test.js tests/unit/hls-fast.test.js tests/unit/extension-id.test.js tests/unit/native-protocol.test.js tests/unit/packaging.test.js",
-    "test": "npm run lint && npm run test:unit && npm run check:secrets && npm run key:verify && node scripts/check-version.mjs",
+    "test:unit": "node --test tests/unit/filename.test.js tests/unit/icons.test.js tests/unit/media-core.test.js tests/unit/hls-fast.test.js tests/unit/extension-id.test.js tests/unit/native-protocol.test.js tests/unit/privacy-claims.test.js tests/unit/packaging.test.js",
+    "test": "npm run lint && npm run test:unit && npm run check:manifest && npm run check:secrets && npm run key:verify && node scripts/check-version.mjs",
     "test:verify": "node tests/run-verification.js",
     "test:verify:public": "node tests/run-verification.js --public",
     "test:verify:strict": "node tests/run-verification.js --strict",
@@ -25,7 +25,8 @@
     "key:verify": "node scripts/gen-extension-key.mjs --verify",
     "check:secrets": "node scripts/check-no-secrets.mjs",
     "test:contract": "node tests/native/contract.mjs",
-    "test:firefox": "node tests/firefox/run-gecko.mjs"
+    "test:firefox": "node tests/firefox/run-gecko.mjs",
+    "check:manifest": "node scripts/check-manifest.mjs"
   },
   "devDependencies": {
     "acorn": "8.18.0",
